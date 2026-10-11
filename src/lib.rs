@@ -1,0 +1,48 @@
+//! `LakeScan` is a high-throughput S3 audit tool. It enumerates the objects in a
+//! bucket, evaluates each one against a set of stateless rules, folds the
+//! resulting findings into bounded summaries, and streams a report out. The
+//! design constraint that shapes every module is that memory must not grow
+//! with the size of the bucket: a scan of ten objects and a scan of ten
+//! billion must occupy the same resident set, so each stage below carries a
+//! fixed memory budget and nothing between stages is ever fully materialized.
+//!
+//! The pipeline:
+//!
+//! ```text
+//!   bucket + prefix
+//!         |
+//!         v
+//!   +-------------+   ObjectMeta   +-------------+   Finding   +-------------+
+//!   |   scanner   | -------------> |    rules    | ----------> |  aggregate  |
+//!   |    1 MB     |   (streamed)   |    2 MB     | (streamed)  |    18 MB    |
+//!   +-------------+                +-------------+             +-------------+
+//!   one page live                  stateless per               bounded sketches
+//!   at a time                      object, no                  only, static
+//!                                  accumulation                bound each
+//!                                                                    |
+//!                                                                    | summaries
+//!                                                                    v
+//!                                                             +-------------+
+//!                                                             |   report    |
+//!                                                             |    1 MB     |
+//!                                                             +-------------+
+//!                                                             64 KB buffered
+//!                                                             streaming writer
+//!                                                                    |
+//!                                                                    v
+//!                                                             stdout / file
+//!                                                             + ExitCode
+//! ```
+//!
+//! All domain types are defined once, in [`model`]. All failures are expressed
+//! as [`LakeScanError`], and each maps to exactly one [`ExitCode`], whose
+//! integer values are a frozen public contract.
+
+pub mod aggregate;
+pub mod error;
+pub mod model;
+pub mod report;
+pub mod rules;
+pub mod scanner;
+
+pub use crate::error::{ExitCode, LakeScanError};

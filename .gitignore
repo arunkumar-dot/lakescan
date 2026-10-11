@@ -1,0 +1,15 @@
+# Build output
+/target
+
+# NOTE: Cargo.lock is intentionally COMMITTED. LakeScan ships as a binary,
+# so the exact dependency graph must be reproducible from the repository.
+
+# Local environment and credentials
+.env
+
+# Logs
+*.log
+
+# Editor / IDE state
+/.idea
+/.vscode

@@ -1,0 +1,50 @@
+[package]
+name = "lakescan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "High-throughput S3 audit tool"
+license = "FSL-1.1-ALv2"
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lib]
+name = "lakescan"
+
+[[bin]]
+name = "lakescan"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+float_cmp = "deny"
+module_name_repetitions = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# `panic` is deliberately NOT set for the `test` and `bench` profiles. Cargo
+# ignores the key there unconditionally and always builds those targets with
+# unwind, because the test and bench harnesses must be able to catch panics.
+# Setting it explicitly only produces a "`panic` setting is ignored" manifest
+# warning. The invariant the release profile must never leak into a harness is
+# therefore enforced by Cargo itself; do not add `panic` below.
+[profile.bench]
+
+[profile.test]
