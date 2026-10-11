@@ -6,10 +6,8 @@
 //! vocabulary, which is what keeps the pipeline a pipeline rather than four
 //! programs that translate between each other.
 //!
-//! As of M1, [`Severity`], [`ObjectMeta`], and [`StorageClass`] are complete.
-//! [`Finding`] remains a reserved name with its fields deliberately
-//! unspecified; it is filled in by the rule-engine milestone, from that
-//! milestone's spec rather than guessed at here.
+//! As of M2, every type in this module is complete: [`Severity`],
+//! [`ObjectMeta`], [`StorageClass`], [`RuleId`], and [`Finding`].
 
 /// Metadata for a single S3 object, as returned by one `ListObjectsV2` entry.
 ///
@@ -108,12 +106,92 @@ impl StorageClass {
     }
 }
 
+/// Identifies which rule raised a [`Finding`].
+///
+/// Fieldless, one variant per `rules` v1 check, declared in the order
+/// [`crate::rules::evaluate`] runs them — the same order materialized as
+/// [`RuleId::ALL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuleId {
+    /// The key's basename or path looks like a credential or secret file.
+    SensitiveKey,
+    /// The object sits in the deprecated `REDUCED_REDUNDANCY` storage class.
+    ReducedRedundancy,
+    /// A large `STANDARD` object has gone a long time unmodified.
+    StaleStandard,
+    /// A small object sits in a cold tier that bills a minimum object size.
+    SmallObjectColdTier,
+    /// A zero-byte object that is not a folder marker.
+    ZeroByteObject,
+    /// The storage class is one this build of `LakeScan` does not recognize.
+    UnknownStorageClass,
+}
+
+impl RuleId {
+    /// Every rule, in the order [`crate::rules::evaluate`] checks them.
+    pub const ALL: [Self; 6] = [
+        Self::SensitiveKey,
+        Self::ReducedRedundancy,
+        Self::StaleStandard,
+        Self::SmallObjectColdTier,
+        Self::ZeroByteObject,
+        Self::UnknownStorageClass,
+    ];
+
+    /// The rule's stable, machine-readable code, e.g. `"sensitive-key"`.
+    ///
+    /// **Frozen contract**, like [`crate::error::ExitCode`]'s integer
+    /// values: reports and dashboards key off these strings, so an existing
+    /// code must never change once shipped. Add new rules with new codes.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::SensitiveKey => "sensitive-key",
+            Self::ReducedRedundancy => "reduced-redundancy",
+            Self::StaleStandard => "stale-standard",
+            Self::SmallObjectColdTier => "small-object-cold-tier",
+            Self::ZeroByteObject => "zero-byte-object",
+            Self::UnknownStorageClass => "unknown-storage-class",
+        }
+    }
+
+    /// A one-line human description of what the rule flags.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::SensitiveKey => "Key looks like a credential or secret file",
+            Self::ReducedRedundancy => {
+                "Object uses the deprecated REDUCED_REDUNDANCY storage class"
+            }
+            Self::StaleStandard => "Large STANDARD object has gone unmodified for a long time",
+            Self::SmallObjectColdTier => {
+                "Small object sits in a cold storage tier that bills a size minimum"
+            }
+            Self::ZeroByteObject => "Zero-byte object that is not a folder marker",
+            Self::UnknownStorageClass => {
+                "Object reports a storage class this build of LakeScan does not recognize"
+            }
+        }
+    }
+}
+
 /// One rule violation observed against one object.
 ///
-/// Fields are defined by the rule-engine spec and arrive in M2.
-// M2
-#[derive(Debug)]
-pub struct Finding {}
+/// Borrows the [`ObjectMeta`] it was raised against rather than copying any
+/// of its fields, so a `Finding` can never outlive the scanner page it came
+/// from. Anything downstream that needs to keep a finding past the current
+/// page — [`crate::aggregate`], [`crate::report`] — must copy out whatever
+/// fields it actually needs (the key, say) before the page is dropped;
+/// nothing here extends the borrow for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Finding<'a> {
+    /// Which rule raised this finding.
+    pub rule: RuleId,
+    /// How serious this particular violation is.
+    pub severity: Severity,
+    /// The object the finding was raised against.
+    pub object: &'a ObjectMeta,
+}
 
 /// How much a [`Finding`] matters, ordered `Info < Low < Medium < High < Critical`.
 ///
@@ -136,7 +214,31 @@ pub enum Severity {
 
 #[cfg(test)]
 mod tests {
-    use super::{Severity, StorageClass};
+    use super::{RuleId, Severity, StorageClass};
+
+    /// The frozen contract. If this test is edited, the contract is broken.
+    #[test]
+    fn rule_id_codes_match_the_frozen_contract() {
+        assert_eq!(RuleId::SensitiveKey.code(), "sensitive-key");
+        assert_eq!(RuleId::ReducedRedundancy.code(), "reduced-redundancy");
+        assert_eq!(RuleId::StaleStandard.code(), "stale-standard");
+        assert_eq!(RuleId::SmallObjectColdTier.code(), "small-object-cold-tier");
+        assert_eq!(RuleId::ZeroByteObject.code(), "zero-byte-object");
+        assert_eq!(RuleId::UnknownStorageClass.code(), "unknown-storage-class");
+    }
+
+    #[test]
+    fn every_rule_id_code_is_unique() {
+        let codes: Vec<&str> = RuleId::ALL.iter().map(|rule| rule.code()).collect();
+        for (index, code) in codes.iter().enumerate() {
+            let first_occurrence = codes.iter().position(|other| other == code);
+            assert_eq!(
+                first_occurrence,
+                Some(index),
+                "code {code:?} is not unique across RuleId::ALL"
+            );
+        }
+    }
 
     #[test]
     fn from_wire_maps_every_known_value() {
