@@ -18,10 +18,17 @@ pub enum LakeScanError {
     Auth(String),
 
     /// The network or the remote service failed: DNS, TLS, timeout, or 5xx.
+    /// Often worth retrying, since the remote end or the path to it may
+    /// recover on its own.
     #[error("transport: {0}")]
     Transport(String),
 
-    /// The report could not be written to its destination.
+    /// The report could not be written to its destination: a full disk, a
+    /// missing directory, a permissions error, or a closed pipe. Distinct
+    /// from [`Self::Transport`] because retrying without fixing the
+    /// destination will not help; the remote S3 side of the scan already
+    /// succeeded, and nothing about retrying the network changes the local
+    /// write failing again.
     #[error("report: {0}")]
     Report(#[source] std::io::Error),
 }
@@ -38,6 +45,7 @@ pub enum LakeScanError {
 /// | `Usage`                   | 2    |
 /// | `Auth`                    | 3    |
 /// | `Transport`               | 4    |
+/// | `Report`                  | 5    |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum ExitCode {
@@ -54,9 +62,14 @@ pub enum ExitCode {
     /// Credentials were missing or rejected. Maps from [`LakeScanError::Auth`].
     Auth = 3,
 
-    /// An I/O boundary failed. Maps from both [`LakeScanError::Transport`] and
-    /// [`LakeScanError::Report`], since both are failures to move bytes.
+    /// The network or the remote service failed. Maps from
+    /// [`LakeScanError::Transport`]. Often worth retrying.
     Transport = 4,
+
+    /// The report could not be written to its destination. Maps from
+    /// [`LakeScanError::Report`]. Retrying without fixing the destination
+    /// will not help.
+    Report = 5,
 }
 
 impl ExitCode {
@@ -72,20 +85,15 @@ impl From<&LakeScanError> for ExitCode {
         match error {
             LakeScanError::Usage(_) => Self::Usage,
             LakeScanError::Auth(_) => Self::Auth,
-            LakeScanError::Transport(_) | LakeScanError::Report(_) => Self::Transport,
+            LakeScanError::Transport(_) => Self::Transport,
+            LakeScanError::Report(_) => Self::Report,
         }
     }
 }
 
 impl From<ExitCode> for std::process::ExitCode {
     fn from(code: ExitCode) -> Self {
-        match code {
-            ExitCode::Ok => Self::from(0_u8),
-            ExitCode::FindingsExceedThreshold => Self::from(1_u8),
-            ExitCode::Usage => Self::from(2_u8),
-            ExitCode::Auth => Self::from(3_u8),
-            ExitCode::Transport => Self::from(4_u8),
-        }
+        Self::from(u8::try_from(code.as_i32()).unwrap_or(u8::MAX))
     }
 }
 
@@ -101,6 +109,7 @@ mod tests {
         assert_eq!(ExitCode::Usage.as_i32(), 2);
         assert_eq!(ExitCode::Auth.as_i32(), 3);
         assert_eq!(ExitCode::Transport.as_i32(), 4);
+        assert_eq!(ExitCode::Report.as_i32(), 5);
     }
 
     #[test]
@@ -111,12 +120,28 @@ mod tests {
             (LakeScanError::Transport(String::new()), ExitCode::Transport),
             (
                 LakeScanError::Report(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-                ExitCode::Transport,
+                ExitCode::Report,
             ),
         ];
 
         for (error, expected) in &cases {
             assert_eq!(ExitCode::from(error), *expected);
+        }
+    }
+
+    #[test]
+    fn every_discriminant_fits_in_a_process_status_byte() {
+        const ALL: [ExitCode; 6] = [
+            ExitCode::Ok,
+            ExitCode::FindingsExceedThreshold,
+            ExitCode::Usage,
+            ExitCode::Auth,
+            ExitCode::Transport,
+            ExitCode::Report,
+        ];
+
+        for code in ALL {
+            assert!(u8::try_from(code.as_i32()).is_ok());
         }
     }
 }
