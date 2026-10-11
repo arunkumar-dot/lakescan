@@ -13,3 +13,6 @@
 # Editor / IDE state
 /.idea
 /.vscode
+
+# macOS Finder metadata
+.DS_Store

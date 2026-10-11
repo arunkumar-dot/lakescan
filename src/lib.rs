@@ -14,7 +14,7 @@
 //!         v
 //!   +-------------+   ObjectMeta   +-------------+   Finding   +-------------+
 //!   |   scanner   | -------------> |    rules    | ----------> |  aggregate  |
-//!   |    1 MB     |   (streamed)   |    2 MB     | (streamed)  |    18 MB    |
+//!   |    4 MB     |   (streamed)   |    2 MB     | (streamed)  |    18 MB    |
 //!   +-------------+                +-------------+             +-------------+
 //!   one page live                  stateless per               bounded sketches
 //!   at a time                      object, no                  only, static
@@ -33,6 +33,10 @@
 //!                                                             stdout / file
 //!                                                             + ExitCode
 //! ```
+//!
+//! The scanner's 4 MB is a worst case, not a guess: a page of 1000 keys of up
+//! to 1 KiB each is held twice at once, once as the raw response body and
+//! once as parsed `ObjectMeta` entries.
 //!
 //! All domain types are defined once, in [`model`]. All failures are expressed
 //! as [`LakeScanError`], and each maps to exactly one [`ExitCode`], whose

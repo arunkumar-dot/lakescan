@@ -2,13 +2,15 @@
 name = "lakescan"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.94.1"
 description = "High-throughput S3 audit tool"
 license = "FSL-1.1-ALv2"
 
 [dependencies]
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
 
 [lib]
 name = "lakescan"
