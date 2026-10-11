@@ -104,6 +104,34 @@ impl StorageClass {
             other => Self::Other(other.to_owned()),
         }
     }
+
+    /// This storage class's position among the *known* (non-[`Self::Other`])
+    /// variants, in declaration order, or `None` for [`Self::Other`].
+    ///
+    /// Lets `aggregate` index a fixed per-known-class array for the
+    /// inventory summary, with [`Self::Other`] handled separately since it
+    /// has no fixed slot.
+    #[must_use]
+    pub fn known_index(&self) -> Option<usize> {
+        match self {
+            Self::Standard => Some(0),
+            Self::ReducedRedundancy => Some(1),
+            Self::StandardIa => Some(2),
+            Self::OnezoneIa => Some(3),
+            Self::IntelligentTiering => Some(4),
+            Self::Glacier => Some(5),
+            Self::GlacierIr => Some(6),
+            Self::DeepArchive => Some(7),
+            Self::Outposts => Some(8),
+            Self::Snow => Some(9),
+            Self::ExpressOnezone => Some(10),
+            Self::AwsBackupLowCostWarm => Some(11),
+            Self::AwsBackupWarm => Some(12),
+            Self::FsxOntap => Some(13),
+            Self::FsxOpenzfs => Some(14),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 /// Identifies which rule raised a [`Finding`].
@@ -152,6 +180,23 @@ impl RuleId {
             Self::SmallObjectColdTier => "small-object-cold-tier",
             Self::ZeroByteObject => "zero-byte-object",
             Self::UnknownStorageClass => "unknown-storage-class",
+        }
+    }
+
+    /// This rule's position in [`RuleId::ALL`].
+    ///
+    /// Lets `aggregate` index fixed-size per-rule arrays (the findings
+    /// matrix, the per-rule sample slots) without ever depending on the
+    /// enum's underlying discriminant values.
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::SensitiveKey => 0,
+            Self::ReducedRedundancy => 1,
+            Self::StaleStandard => 2,
+            Self::SmallObjectColdTier => 3,
+            Self::ZeroByteObject => 4,
+            Self::UnknownStorageClass => 5,
         }
     }
 
@@ -212,6 +257,33 @@ pub enum Severity {
     Critical,
 }
 
+impl Severity {
+    /// Every severity, ascending — the same order the derived [`Ord`] uses.
+    pub const ALL: [Self; 5] = [
+        Self::Info,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Critical,
+    ];
+
+    /// This severity's position in [`Severity::ALL`].
+    ///
+    /// Lets `aggregate` index fixed-size per-severity arrays (the findings
+    /// matrix) without depending on the enum's underlying discriminant
+    /// values.
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Info => 0,
+            Self::Low => 1,
+            Self::Medium => 2,
+            Self::High => 3,
+            Self::Critical => 4,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RuleId, Severity, StorageClass};
@@ -238,6 +310,60 @@ mod tests {
                 "code {code:?} is not unique across RuleId::ALL"
             );
         }
+    }
+
+    #[test]
+    fn rule_id_index_matches_declaration_order_in_all() {
+        for (expected_index, rule) in RuleId::ALL.iter().enumerate() {
+            assert_eq!(rule.index(), expected_index, "{rule:?}");
+        }
+    }
+
+    #[test]
+    fn severity_index_matches_declaration_order_in_all() {
+        for (expected_index, severity) in Severity::ALL.iter().enumerate() {
+            assert_eq!(severity.index(), expected_index, "{severity:?}");
+        }
+    }
+
+    #[test]
+    fn severity_all_is_every_variant_exactly_once_in_ascending_order() {
+        let mut all = Severity::ALL;
+        all.sort_unstable();
+        assert_eq!(all, Severity::ALL, "Severity::ALL is not already ascending");
+    }
+
+    #[test]
+    fn storage_class_known_index_matches_declaration_order() {
+        let known_in_order = [
+            StorageClass::Standard,
+            StorageClass::ReducedRedundancy,
+            StorageClass::StandardIa,
+            StorageClass::OnezoneIa,
+            StorageClass::IntelligentTiering,
+            StorageClass::Glacier,
+            StorageClass::GlacierIr,
+            StorageClass::DeepArchive,
+            StorageClass::Outposts,
+            StorageClass::Snow,
+            StorageClass::ExpressOnezone,
+            StorageClass::AwsBackupLowCostWarm,
+            StorageClass::AwsBackupWarm,
+            StorageClass::FsxOntap,
+            StorageClass::FsxOpenzfs,
+        ];
+
+        for (expected_index, class) in known_in_order.iter().enumerate() {
+            assert_eq!(class.known_index(), Some(expected_index), "{class:?}");
+        }
+    }
+
+    #[test]
+    fn storage_class_other_has_no_known_index() {
+        assert_eq!(
+            StorageClass::Other("NEW_CLASS".to_owned()).known_index(),
+            None
+        );
     }
 
     #[test]
