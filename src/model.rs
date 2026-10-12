@@ -105,6 +105,33 @@ impl StorageClass {
         }
     }
 
+    /// The S3 wire string for this storage class, e.g. `"STANDARD"`. For
+    /// [`Self::Other`], returns the wire value it was built from verbatim.
+    ///
+    /// The exact inverse of [`Self::from_wire`]: `from_wire(c.as_wire()) ==
+    /// c` for every `c`, known or not, which the tests below check.
+    #[must_use]
+    pub fn as_wire(&self) -> &str {
+        match self {
+            Self::Standard => "STANDARD",
+            Self::ReducedRedundancy => "REDUCED_REDUNDANCY",
+            Self::StandardIa => "STANDARD_IA",
+            Self::OnezoneIa => "ONEZONE_IA",
+            Self::IntelligentTiering => "INTELLIGENT_TIERING",
+            Self::Glacier => "GLACIER",
+            Self::GlacierIr => "GLACIER_IR",
+            Self::DeepArchive => "DEEP_ARCHIVE",
+            Self::Outposts => "OUTPOSTS",
+            Self::Snow => "SNOW",
+            Self::ExpressOnezone => "EXPRESS_ONEZONE",
+            Self::AwsBackupLowCostWarm => "AWS_BACKUP_LOW_COST_WARM",
+            Self::AwsBackupWarm => "AWS_BACKUP_WARM",
+            Self::FsxOntap => "FSX_ONTAP",
+            Self::FsxOpenzfs => "FSX_OPENZFS",
+            Self::Other(wire) => wire,
+        }
+    }
+
     /// This storage class's position among the *known* (non-[`Self::Other`])
     /// variants, in declaration order, or `None` for [`Self::Other`].
     ///
@@ -132,6 +159,30 @@ impl StorageClass {
             Self::Other(_) => None,
         }
     }
+
+    /// Every known (non-[`Self::Other`]) storage class, in
+    /// [`Self::known_index`] order: `KNOWN[i].known_index() == Some(i)`.
+    ///
+    /// The single source of truth for "every known class" — `aggregate`
+    /// sizes its per-class inventory slots from `KNOWN.len()`, and nothing
+    /// else in the crate may keep its own copy of this list.
+    pub const KNOWN: [Self; 15] = [
+        Self::Standard,
+        Self::ReducedRedundancy,
+        Self::StandardIa,
+        Self::OnezoneIa,
+        Self::IntelligentTiering,
+        Self::Glacier,
+        Self::GlacierIr,
+        Self::DeepArchive,
+        Self::Outposts,
+        Self::Snow,
+        Self::ExpressOnezone,
+        Self::AwsBackupLowCostWarm,
+        Self::AwsBackupWarm,
+        Self::FsxOntap,
+        Self::FsxOpenzfs,
+    ];
 }
 
 /// Identifies which rule raised a [`Finding`].
@@ -282,6 +333,22 @@ impl Severity {
             Self::Critical => 4,
         }
     }
+
+    /// This severity's stable, machine-readable code, e.g. `"high"`.
+    ///
+    /// **Frozen contract**, like [`RuleId::code`] and
+    /// [`crate::error::ExitCode`]'s integer values: reports key off these
+    /// strings, so an existing code must never change once shipped.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,8 +401,36 @@ mod tests {
     }
 
     #[test]
-    fn storage_class_known_index_matches_declaration_order() {
-        let known_in_order = [
+    fn storage_class_known_index_matches_known_array_order() {
+        for (expected_index, class) in StorageClass::KNOWN.iter().enumerate() {
+            assert_eq!(class.known_index(), Some(expected_index), "{class:?}");
+        }
+    }
+
+    #[test]
+    fn storage_class_known_index_is_none_only_for_other() {
+        for class in &StorageClass::KNOWN {
+            assert!(class.known_index().is_some(), "{class:?} should be known");
+        }
+        assert_eq!(
+            StorageClass::Other("NEW_CLASS".to_owned()).known_index(),
+            None
+        );
+    }
+
+    /// The frozen contract. If this test is edited, the contract is broken.
+    #[test]
+    fn severity_codes_match_the_frozen_contract() {
+        assert_eq!(Severity::Info.code(), "info");
+        assert_eq!(Severity::Low.code(), "low");
+        assert_eq!(Severity::Medium.code(), "medium");
+        assert_eq!(Severity::High.code(), "high");
+        assert_eq!(Severity::Critical.code(), "critical");
+    }
+
+    #[test]
+    fn as_wire_is_the_exact_inverse_of_from_wire_for_every_known_class() {
+        for class in [
             StorageClass::Standard,
             StorageClass::ReducedRedundancy,
             StorageClass::StandardIa,
@@ -351,19 +446,15 @@ mod tests {
             StorageClass::AwsBackupWarm,
             StorageClass::FsxOntap,
             StorageClass::FsxOpenzfs,
-        ];
-
-        for (expected_index, class) in known_in_order.iter().enumerate() {
-            assert_eq!(class.known_index(), Some(expected_index), "{class:?}");
+        ] {
+            assert_eq!(StorageClass::from_wire(class.as_wire()), class, "{class:?}");
         }
     }
 
     #[test]
-    fn storage_class_other_has_no_known_index() {
-        assert_eq!(
-            StorageClass::Other("NEW_CLASS".to_owned()).known_index(),
-            None
-        );
+    fn as_wire_is_the_exact_inverse_of_from_wire_for_other() {
+        let other = StorageClass::Other("SOME_FUTURE_CLASS".to_owned());
+        assert_eq!(StorageClass::from_wire(other.as_wire()), other);
     }
 
     #[test]

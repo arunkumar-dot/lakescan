@@ -38,6 +38,30 @@ fn age_of(last_modified: SystemTime, now: SystemTime) -> Duration {
     now.duration_since(last_modified).unwrap_or_default()
 }
 
+/// The `[lower, upper)` age range bucket `index` covers. `upper` is `None`
+/// for the last bucket, which has no finite top. Out-of-range indices get
+/// the empty `(Duration::ZERO, Some(Duration::ZERO))` range.
+///
+/// The reporter renders these bounds; it never recomputes them, so this is
+/// the one place the bucket layout is spelled out as actual values rather
+/// than just a comparison (`bucket_of`).
+#[must_use]
+pub(super) fn bucket_bounds(index: usize) -> (Duration, Option<Duration>) {
+    if index == 0 {
+        return (Duration::ZERO, EDGES.first().copied());
+    }
+    if index == BUCKETS - 1 {
+        return (EDGES.last().copied().unwrap_or(Duration::ZERO), None);
+    }
+    match (
+        index.checked_sub(1).and_then(|i| EDGES.get(i)),
+        EDGES.get(index),
+    ) {
+        (Some(&lower), Some(&upper)) => (lower, Some(upper)),
+        _ => (Duration::ZERO, Some(Duration::ZERO)),
+    }
+}
+
 /// A fixed, 8-bucket histogram of object age.
 ///
 /// No heap: every bucket lives inline, so [`AgeHistogram::MAX_BYTES`] is
@@ -92,7 +116,7 @@ impl AgeHistogram {
 mod tests {
     use std::time::Duration;
 
-    use super::{AgeHistogram, bucket_of};
+    use super::{AgeHistogram, bucket_bounds, bucket_of};
 
     #[test]
     fn boundaries_are_inclusive_on_the_lower_edge() {
@@ -150,5 +174,25 @@ mod tests {
         a.merge(&b);
         assert_eq!(a.bucket(0).count, 2);
         assert_eq!(a.bucket(7).count, 1);
+    }
+
+    #[test]
+    fn bucket_bounds_cover_every_bucket_contiguously() {
+        let day = Duration::from_hours(24);
+        assert_eq!(bucket_bounds(0), (Duration::ZERO, Some(day)));
+        assert_eq!(bucket_bounds(1), (day, Some(day * 7)));
+        assert_eq!(bucket_bounds(7), (day * 730, None));
+
+        // Every bucket's upper bound equals the next bucket's lower bound.
+        for index in 0..6 {
+            let (_, upper) = bucket_bounds(index);
+            let (next_lower, _) = bucket_bounds(index + 1);
+            assert_eq!(upper, Some(next_lower), "bucket {index} -> {}", index + 1);
+        }
+    }
+
+    #[test]
+    fn bucket_bounds_out_of_range_is_the_empty_range() {
+        assert_eq!(bucket_bounds(100), (Duration::ZERO, Some(Duration::ZERO)));
     }
 }

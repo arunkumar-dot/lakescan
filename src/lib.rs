@@ -6,7 +6,10 @@
 //! billion must occupy the same resident set, so each stage below carries a
 //! fixed memory budget and nothing between stages is ever fully materialized.
 //!
-//! The pipeline:
+//! The pipeline. [`report`] has two inputs: the whole-bucket summaries
+//! [`aggregate`] builds, and an optional per-finding stream straight from
+//! [`rules`] — a live JSON Lines feed, independent of whether a summary is
+//! written at all.
 //!
 //! ```text
 //!   bucket + prefix
@@ -16,22 +19,23 @@
 //!   |   scanner   | -------------> |    rules    | ----------> |  aggregate  |
 //!   |    4 MB     |   (streamed)   |    2 MB     | (streamed)  |    18 MB    |
 //!   +-------------+                +-------------+             +-------------+
-//!   one page live                  stateless per               bounded sketches
-//!   at a time                      object, no                  only, static
-//!                                  accumulation                bound each
-//!                                                                    |
-//!                                                                    | summaries
-//!                                                                    v
-//!                                                             +-------------+
-//!                                                             |   report    |
-//!                                                             |    1 MB     |
-//!                                                             +-------------+
-//!                                                             64 KB buffered
-//!                                                             streaming writer
-//!                                                                    |
-//!                                                                    v
-//!                                                             stdout / file
-//!                                                             + ExitCode
+//!   one page live                  stateless per    |          bounded sketches
+//!   at a time                      object, no       |          only, static
+//!                                  accumulation      |          bound each
+//!                                                     \                 |
+//!                                       Finding,        \                | summaries
+//!                                 optional, streamed      \               |
+//!                                  as JSON Lines            v              v
+//!                                                   +-----------------------+
+//!                                                   |         report        |
+//!                                                   |          1 MB         |
+//!                                                   +-----------------------+
+//!                                                   64 KB buffered streaming
+//!                                                             writer
+//!                                                               |
+//!                                                               v
+//!                                                        stdout / file
+//!                                                        + ExitCode
 //! ```
 //!
 //! The scanner's 4 MB is a worst case, not a guess: a page of 1000 keys of up

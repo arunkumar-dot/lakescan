@@ -1,0 +1,95 @@
+//! Escapes attacker-controlled text (object keys) for the text report.
+//!
+//! An S3 key is whatever the uploader named it; this crate never assumes it
+//! is well-behaved. Written raw, a key could contain a control character
+//! that moves the cursor or clears the screen, a newline that forges an
+//! extra report line, or a bidirectional-override character that makes one
+//! key *display* as a different one. [`write_escaped`] renders every
+//! [`char::is_control`] character and the bidi-override/isolate controls
+//! (`U+202A`–`U+202E`, `U+2066`–`U+2069`) as `\u{XXXX}` instead of passing
+//! them through, and leaves everything else — including other scripts and
+//! emoji — untouched. JSON output needs none of this: `serde_json` already
+//! escapes control characters on its own.
+
+use std::io::{self, Write};
+
+/// `true` for exactly the characters [`write_escaped`] renders as
+/// `\u{XXXX}` instead of passing through.
+fn is_escaped(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Writes `s` to `out`, escaping every character [`is_escaped`] flags as
+/// `\u{XXXX}` (lowercase hex, e.g. `\u{000a}` for a newline) and passing
+/// everything else through unchanged. Streams character by character
+/// rather than building an escaped copy of `s` first.
+pub(super) fn write_escaped<W: Write>(out: &mut W, s: &str) -> io::Result<()> {
+    for c in s.chars() {
+        if is_escaped(c) {
+            write!(out, "\\u{{{:04x}}}", u32::from(c))?;
+        } else {
+            write!(out, "{c}")?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::write_escaped;
+
+    fn escaped(s: &str) -> Result<String, io::Error> {
+        let mut buf = Vec::new();
+        write_escaped(&mut buf, s)?;
+        String::from_utf8(buf).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
+    #[test]
+    fn plain_ascii_passes_through_unchanged() -> Result<(), io::Error> {
+        assert_eq!(escaped("reports/summary.csv")?, "reports/summary.csv");
+        Ok(())
+    }
+
+    #[test]
+    fn control_characters_are_escaped() -> Result<(), io::Error> {
+        assert_eq!(escaped("\x1b")?, "\\u{001b}"); // ESC
+        assert_eq!(escaped("\n")?, "\\u{000a}");
+        assert_eq!(escaped("\r")?, "\\u{000d}");
+        assert_eq!(escaped("\t")?, "\\u{0009}");
+        assert_eq!(escaped("\0")?, "\\u{0000}");
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_override_is_escaped() -> Result<(), io::Error> {
+        // U+202E RIGHT-TO-LEFT OVERRIDE.
+        assert_eq!(escaped("\u{202E}")?, "\\u{202e}");
+        Ok(())
+    }
+
+    #[test]
+    fn bidi_isolate_is_escaped() -> Result<(), io::Error> {
+        // U+2066 LEFT-TO-RIGHT ISOLATE.
+        assert_eq!(escaped("\u{2066}")?, "\\u{2066}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_emoji_passes_through_untouched() -> Result<(), io::Error> {
+        assert_eq!(escaped("📦")?, "📦");
+        Ok(())
+    }
+
+    #[test]
+    fn a_mixed_key_escapes_only_the_dangerous_characters() -> Result<(), io::Error> {
+        let input = "evil\x1b[31mred\n\u{202E}gnp.exe\u{2069}.png";
+        let output = escaped(input)?;
+        assert_eq!(
+            output,
+            "evil\\u{001b}[31mred\\u{000a}\\u{202e}gnp.exe\\u{2069}.png"
+        );
+        Ok(())
+    }
+}

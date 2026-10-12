@@ -1,0 +1,69 @@
+lakescan 0.1.0
+s3://example-bucket/logs/
+started:  2023-11-14T22:13:20Z
+elapsed:  1.234s
+
+VERDICT
+  worst severity: high
+
+INVENTORY
+  objects:     8
+  total bytes: 2147492081 (2.0 GiB)
+  by storage class:
+    STANDARD                 count=5          bytes=2147486208 (2.0 GiB)
+    REDUCED_REDUNDANCY       count=1          bytes=4096 (4.0 KiB)
+    GLACIER                  count=1          bytes=1000 (1000 B)
+    FUTURE_TIER              count=1          bytes=777 (777 B)
+
+FINDINGS
+  sensitive-key - Key looks like a credential or secret file
+    high: 1 (512 B)
+  reduced-redundancy - Object uses the deprecated REDUCED_REDUNDANCY storage class
+    medium: 1 (4.0 KiB)
+  stale-standard - Large STANDARD object has gone unmodified for a long time
+    medium: 1 (2.0 GiB)
+  small-object-cold-tier - Small object sits in a cold storage tier that bills a size minimum
+    low: 1 (1000 B)
+  zero-byte-object - Zero-byte object that is not a folder marker
+    info: 1 (0 B)
+  unknown-storage-class - Object reports a storage class this build of LakeScan does not recognize
+    info: 1 (777 B)
+
+SAMPLES
+  [sensitive-key]
+    id_rsa  severity=high size=512 (512 B) class=STANDARD modified=2023-11-14T22:13:20Z
+  [reduced-redundancy]
+    backups/archive.tar  severity=medium size=4096 (4.0 KiB) class=REDUCED_REDUNDANCY modified=2023-11-14T22:13:20Z
+  [stale-standard]
+    old/dataset.bin  severity=medium size=2147483648 (2.0 GiB) class=STANDARD modified=2023-04-28T22:13:20Z
+  [small-object-cold-tier]
+    cold/thumbnail.jpg  severity=low size=1000 (1000 B) class=GLACIER modified=2023-11-14T22:13:20Z
+  [zero-byte-object]
+    placeholder/empty.txt  severity=info size=0 (0 B) class=STANDARD modified=2023-11-14T22:13:20Z
+  [unknown-storage-class]
+    unknown/object.dat  severity=info size=777 (777 B) class=FUTURE_TIER modified=2023-11-14T22:13:20Z
+
+LARGEST OBJECTS
+  old/dataset.bin  size=2147483648 (2.0 GiB) class=STANDARD modified=2023-04-28T22:13:20Z
+  backups/archive.tar  size=4096 (4.0 KiB) class=REDUCED_REDUNDANCY modified=2023-11-14T22:13:20Z
+  reports/2024/summary.csv  size=2048 (2.0 KiB) class=STANDARD modified=2023-11-14T22:13:20Z
+  cold/thumbnail.jpg  size=1000 (1000 B) class=GLACIER modified=2023-11-14T22:13:20Z
+  unknown/object.dat  size=777 (777 B) class=FUTURE_TIER modified=2023-11-14T22:13:20Z
+  id_rsa  size=512 (512 B) class=STANDARD modified=2023-11-14T22:13:20Z
+  folder-marker/  size=0 (0 B) class=STANDARD modified=2023-11-14T22:13:20Z
+  placeholder/empty.txt  size=0 (0 B) class=STANDARD modified=2023-11-14T22:13:20Z
+
+SIZE HISTOGRAM
+  [0, 1)                   count=2          bytes=0 (0 B)
+  [512, 1024)              count=3          bytes=2289 (2.2 KiB)
+  [2048, 4096)             count=1          bytes=2048 (2.0 KiB)
+  [4096, 8192)             count=1          bytes=4096 (4.0 KiB)
+  [2147483648, 4294967296) count=1          bytes=2147483648 (2.0 GiB)
+
+AGE HISTOGRAM
+  [0d, 1d)                 count=7          bytes=8433 (8.2 KiB)
+  [180d, 365d)             count=1          bytes=2147483648 (2.0 GiB)
+
+DISTINCT CONTENT
+  ~8 distinct (etag, size) values across 8 objects; at least ~0 duplicates
+  (re-uploaded or re-encrypted content gets a new ETag and is not detected; ~1% estimator error)

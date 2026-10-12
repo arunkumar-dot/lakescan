@@ -30,7 +30,7 @@ mod size_histogram;
 mod stats;
 mod topk;
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use age_histogram::AgeHistogram;
 use hyperloglog::Hll;
@@ -169,6 +169,35 @@ impl Aggregates {
         self.inventory.other_classes()
     }
 
+    /// The combined count and bytes of *every* unrecognized object —
+    /// exact, unlike [`Aggregates::other_classes`], which only names the 8
+    /// lexicographically smallest distinct unrecognized class names and
+    /// would undercount this total if summed directly once a 9th distinct
+    /// name has ever displaced one.
+    #[must_use]
+    pub fn unrecognized_totals(&self) -> CountBytes {
+        self.inventory.unrecognized_totals()
+    }
+
+    /// Every storage class with at least one object, known or not: the
+    /// wire name of each class in [`StorageClass::KNOWN`] that has a
+    /// non-zero count, followed by the tracked unrecognized class names
+    /// (already non-zero by construction — see [`Aggregates::other_classes`]).
+    ///
+    /// The one accessor a reporter needs for "storage class breakdown,
+    /// skip the empty ones": it holds no list of classes of its own,
+    /// since [`StorageClass::KNOWN`] is the single source of truth for
+    /// that.
+    pub fn nonzero_storage_classes(&self) -> impl Iterator<Item = (&str, CountBytes)> {
+        StorageClass::KNOWN
+            .iter()
+            .filter_map(|class| {
+                let stats = self.inventory.known_class(class)?;
+                (stats.count > 0).then_some((class.as_wire(), stats))
+            })
+            .chain(self.other_classes())
+    }
+
     /// The count and bytes of findings for this exact `(rule, severity)`.
     #[must_use]
     pub fn matrix_cell(&self, rule: RuleId, severity: Severity) -> CountBytes {
@@ -212,6 +241,14 @@ impl Aggregates {
         self.size_histogram.bucket_count()
     }
 
+    /// The `[lower, upper)` byte-size range size-histogram bucket `index`
+    /// covers; `upper` is `None` for the last bucket, which has no finite
+    /// top. The reporter renders these; it never recomputes them.
+    #[must_use]
+    pub fn size_bucket_bounds(index: usize) -> (u64, Option<u64>) {
+        size_histogram::bucket_bounds(index)
+    }
+
     /// The count and bytes in age-histogram bucket `index`; see
     /// `aggregate::age_histogram` for the bucket layout.
     #[must_use]
@@ -225,12 +262,32 @@ impl Aggregates {
         self.age_histogram.bucket_count()
     }
 
+    /// The `[lower, upper)` age range age-histogram bucket `index` covers;
+    /// `upper` is `None` for the last bucket, which has no finite top. The
+    /// reporter renders these; it never recomputes them.
+    #[must_use]
+    pub fn age_bucket_bounds(index: usize) -> (Duration, Option<Duration>) {
+        age_histogram::bucket_bounds(index)
+    }
+
     /// The estimated number of distinct object contents observed. See
     /// `aggregate::hyperloglog` for the `ETag` caveat that makes this a lower
     /// bound on duplicates, not an exact count.
     #[must_use]
     pub fn distinct_content_estimate(&self) -> f64 {
         self.hll.estimate()
+    }
+
+    /// A lower bound on how many objects share content with some other
+    /// object: `total_objects - distinct_content_estimate`, floored at
+    /// `0.0` (the estimate can exceed the true count by a little, being an
+    /// estimate). See `aggregate::hyperloglog`'s doc for why this is a
+    /// *lower* bound — identical content re-uploaded with a different
+    /// encryption or upload method gets a different `ETag` — and is only
+    /// meaningful when well above the estimator's own ~1% error.
+    #[must_use]
+    pub fn duplicate_lower_bound(&self) -> f64 {
+        (u64_to_f64(self.total_objects()) - self.distinct_content_estimate()).max(0.0)
     }
 
     /// The heap this summary currently occupies, across every field that
@@ -247,6 +304,25 @@ impl Aggregates {
 }
 
 const _: () = assert!(Aggregates::MAX_BYTES <= 18 * 1024 * 1024);
+
+/// Converts `value` to the nearest `f64`, exactly when `value` fits in a
+/// `u32` and otherwise by reconstructing it from its high and low 32-bit
+/// halves (each of which *does* fit, and so converts exactly via
+/// `f64::from`).
+///
+/// `f64` has no `From<u64>`/`TryFrom<u64>` in `std` — a `u64` can exceed
+/// the mantissa's 53 bits of precision, so neither trait's contract fits —
+/// and an `as` cast is a clippy pedantic error under this crate's lints.
+/// This is the honest alternative: it loses precision only where an `as`
+/// cast would lose exactly the same precision, never more.
+fn u64_to_f64(value: u64) -> f64 {
+    if let Ok(small) = u32::try_from(value) {
+        return f64::from(small);
+    }
+    let high = u32::try_from(value >> 32).unwrap_or(0);
+    let low = u32::try_from(value & 0xFFFF_FFFF).unwrap_or(0);
+    f64::from(high).mul_add(4_294_967_296.0, f64::from(low))
+}
 
 #[cfg(test)]
 mod tests {
@@ -388,6 +464,25 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_storage_classes_lists_known_then_unrecognized_skipping_empty_ones() {
+        let aggregates = observe_all(&fixture_objects());
+
+        let classes: Vec<(&str, u64)> = aggregates
+            .nonzero_storage_classes()
+            .map(|(name, stats)| (name, stats.count))
+            .collect();
+
+        // Standard (5 objects) and ReducedRedundancy (1) are known classes,
+        // in StorageClass::KNOWN order; NEW_CLASS is the one unrecognized
+        // class, appended after. Every other known class has zero objects
+        // and must not appear at all.
+        assert_eq!(
+            classes,
+            [("STANDARD", 5), ("REDUCED_REDUNDANCY", 1), ("NEW_CLASS", 1)]
+        );
+    }
+
+    #[test]
     fn adversarial_scan_stays_within_max_bytes() {
         let ctx = EvalContext { now: now() };
         let mut aggregates = Aggregates::new(now());
@@ -416,6 +511,70 @@ mod tests {
             size_of::<Aggregates>(),
             aggregates.heap_bytes(),
             Aggregates::MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn duplicate_lower_bound_is_total_objects_minus_estimate_floored_at_zero() {
+        // Every object has a distinct etag+size, so the HLL estimate should
+        // land close to the true count and the lower bound close to zero.
+        let mut aggregates = Aggregates::new(now());
+        for n in 0..500_u64 {
+            aggregates.observe_object(&ObjectMeta {
+                key: format!("key-{n}"),
+                size: n,
+                last_modified: now(),
+                etag: format!("etag-{n}"),
+                storage_class: StorageClass::Standard,
+            });
+        }
+
+        let bound = aggregates.duplicate_lower_bound();
+        assert!(bound >= 0.0, "must never be negative: {bound}");
+        assert!(
+            bound < 50.0,
+            "distinct content should show ~no duplicates: {bound}"
+        );
+    }
+
+    #[test]
+    fn duplicate_lower_bound_is_zero_when_the_estimate_exceeds_the_count() {
+        // A handful of objects all sharing one etag+size: the true distinct
+        // count is 1, but the HLL could in principle round up slightly;
+        // either way the bound must never go negative.
+        let mut aggregates = Aggregates::new(now());
+        for n in 0..3_u64 {
+            aggregates.observe_object(&ObjectMeta {
+                key: format!("key-{n}"),
+                size: 1,
+                last_modified: now(),
+                etag: "same-etag".to_owned(),
+                storage_class: StorageClass::Standard,
+            });
+        }
+
+        assert!(aggregates.duplicate_lower_bound() >= 0.0);
+    }
+
+    /// `clippy::float_cmp` is denied crate-wide, so these compare bit
+    /// patterns (`to_bits`) rather than the `f64` values with `==`
+    /// directly; every case here is an exact conversion, so the bit
+    /// patterns are expected to match exactly, not just approximately.
+    #[test]
+    fn u64_to_f64_is_exact_for_values_that_fit_in_u32_and_close_for_larger_ones() {
+        assert_eq!(super::u64_to_f64(0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(super::u64_to_f64(1).to_bits(), 1.0_f64.to_bits());
+        assert_eq!(
+            super::u64_to_f64(u64::from(u32::MAX)).to_bits(),
+            f64::from(u32::MAX).to_bits()
+        );
+
+        // Beyond u32::MAX: reconstructed from high/low halves, exact at
+        // this particular magnitude (a round number well within the
+        // mantissa's 53 bits of precision).
+        assert_eq!(
+            super::u64_to_f64(1 << 40).to_bits(),
+            2.0_f64.powi(40).to_bits()
         );
     }
 }

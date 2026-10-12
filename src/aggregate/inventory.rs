@@ -6,8 +6,9 @@ use super::stats::{CountBytes, truncate_at_char_boundary};
 use crate::model::{ObjectMeta, StorageClass};
 
 /// The number of storage classes [`StorageClass::known_index`] assigns a
-/// slot to (every variant except [`StorageClass::Other`]).
-const KNOWN_CLASSES: usize = 15;
+/// slot to. Sized from [`StorageClass::KNOWN`] — the single source of
+/// truth for "every known class" — not restated as its own number.
+const KNOWN_CLASSES: usize = StorageClass::KNOWN.len();
 
 /// At most this many distinct unrecognized storage-class names are tracked
 /// individually: the lexicographically smallest, independent of the order
@@ -169,6 +170,24 @@ impl Inventory {
             .iter()
             .flatten()
             .map(|slot| (slot.name.as_str(), slot.stats))
+    }
+
+    /// The combined count and bytes of *every* unrecognized object,
+    /// regardless of how many distinct unrecognized class names there
+    /// are: computed as `overall` minus the sum of every known class's
+    /// slot, not by summing [`Inventory::other_classes`] (which only
+    /// tracks the 8 lexicographically smallest names and would undercount
+    /// once a 9th distinct name has ever displaced one).
+    #[must_use]
+    pub(super) fn unrecognized_totals(&self) -> CountBytes {
+        let mut known = CountBytes::default();
+        for slot in self.known {
+            known.merge(slot);
+        }
+        CountBytes {
+            count: self.overall.count.saturating_sub(known.count),
+            bytes: self.overall.bytes.saturating_sub(known.bytes),
+        }
     }
 
     /// The heap this inventory currently occupies: just the unrecognized
@@ -343,5 +362,42 @@ mod tests {
             inv.heap_bytes(),
             Inventory::MAX_BYTES
         );
+    }
+
+    #[test]
+    fn unrecognized_totals_is_zero_when_there_are_none() {
+        let mut inv = Inventory::default();
+        inv.observe(&object(10, StorageClass::Standard));
+        assert_eq!(inv.unrecognized_totals(), CountBytes::default());
+    }
+
+    #[test]
+    fn unrecognized_totals_sums_a_single_class() {
+        let mut inv = Inventory::default();
+        inv.observe(&object(10, StorageClass::Standard));
+        inv.observe(&object(30, StorageClass::Other("A".to_owned())));
+        inv.observe(&object(40, StorageClass::Other("A".to_owned())));
+
+        assert_eq!(
+            inv.unrecognized_totals(),
+            CountBytes {
+                count: 2,
+                bytes: 70
+            }
+        );
+    }
+
+    #[test]
+    fn unrecognized_totals_stays_exact_past_the_eight_tracked_names() {
+        // Nine distinct unrecognized names, one past MAX_OTHER_CLASSES: the
+        // ninth (lexicographically largest) is evicted from the per-name
+        // tracker, but the *total* must still count every one of them.
+        let mut inv = Inventory::default();
+        for n in 0..9 {
+            inv.observe(&object(1, StorageClass::Other(format!("class-{n}"))));
+        }
+
+        assert_eq!(inv.other_classes().count(), MAX_OTHER_CLASSES);
+        assert_eq!(inv.unrecognized_totals(), CountBytes { count: 9, bytes: 9 });
     }
 }

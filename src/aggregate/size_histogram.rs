@@ -17,6 +17,24 @@ fn bucket_of(size: u64) -> usize {
     usize::try_from(size.ilog2()).unwrap_or(0) + 1
 }
 
+/// The `[lower, upper)` size range bucket `index` covers. `upper` is `None`
+/// for the last bucket (`[2^63, u64::MAX]`, since `2^64` does not fit in a
+/// `u64`). Out-of-range indices get the empty `(0, Some(0))` range.
+///
+/// The reporter renders these bounds; it never recomputes them, so this is
+/// the one place the bucket layout is spelled out as actual values rather
+/// than just a comparison (`bucket_of`).
+#[must_use]
+pub(super) fn bucket_bounds(index: usize) -> (u64, Option<u64>) {
+    const LAST_BUCKET: usize = BUCKETS - 1;
+    match index {
+        0 => (0, Some(1)),
+        LAST_BUCKET => (1_u64 << 63, None),
+        1..LAST_BUCKET => (1_u64 << (index - 1), Some(1_u64 << index)),
+        _ => (0, Some(0)),
+    }
+}
+
 /// A fixed, 65-bucket log2 histogram of object sizes.
 ///
 /// No heap: every bucket lives inline, so [`SizeHistogram::MAX_BYTES`] is
@@ -68,7 +86,7 @@ impl SizeHistogram {
 
 #[cfg(test)]
 mod tests {
-    use super::{SizeHistogram, bucket_of};
+    use super::{SizeHistogram, bucket_bounds, bucket_of};
 
     #[test]
     fn zero_falls_in_bucket_zero() {
@@ -122,5 +140,23 @@ mod tests {
         a.merge(&b);
         assert_eq!(a.bucket(bucket_of(5)).count, 2);
         assert_eq!(a.bucket(0).count, 1);
+    }
+
+    #[test]
+    fn bucket_bounds_cover_every_bucket_contiguously() {
+        assert_eq!(bucket_bounds(0), (0, Some(1)));
+        assert_eq!(bucket_bounds(1), (1, Some(2)));
+        assert_eq!(bucket_bounds(64), (1_u64 << 63, None));
+
+        for index in 0..63 {
+            let (_, upper) = bucket_bounds(index);
+            let (next_lower, _) = bucket_bounds(index + 1);
+            assert_eq!(upper, Some(next_lower), "bucket {index} -> {}", index + 1);
+        }
+    }
+
+    #[test]
+    fn bucket_bounds_out_of_range_is_the_empty_range() {
+        assert_eq!(bucket_bounds(100), (0, Some(0)));
     }
 }
