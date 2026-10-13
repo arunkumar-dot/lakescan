@@ -104,9 +104,12 @@ impl OtherClasses {
 
 /// Object count and total bytes, overall and broken down by storage class.
 ///
-/// One fixed slot per class [`StorageClass::known_index`] recognizes, plus
-/// up to [`MAX_OTHER_CLASSES`] distinct unrecognized class names tracked by
-/// name (see [`OtherClasses`]). No per-object allocation: the only heap
+/// One fixed slot per class [`StorageClass::known_index`] recognizes, one
+/// shared slot counting every unrecognized object, plus up to
+/// [`MAX_OTHER_CLASSES`] distinct unrecognized class names tracked by name
+/// (see [`OtherClasses`]). Every observed object lands in exactly one of
+/// the known slots or the shared unrecognized slot, so those slots always
+/// sum to `overall`. No per-object allocation: the only heap
 /// this type ever owns is the (bounded, truncated) unrecognized class
 /// names.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -114,6 +117,9 @@ pub(super) struct Inventory {
     /// Count and bytes across every object, regardless of storage class.
     pub overall: CountBytes,
     known: [CountBytes; KNOWN_CLASSES],
+    /// Count and bytes across every unrecognized object, whatever its
+    /// class name and whether or not [`Inventory::other`] still tracks it.
+    unrecognized: CountBytes,
     other: OtherClasses,
 }
 
@@ -127,17 +133,15 @@ impl Inventory {
     /// slot.
     pub(super) fn observe(&mut self, object: &ObjectMeta) {
         self.overall.observe(object.size);
-        match object.storage_class.known_index() {
-            Some(index) => {
-                if let Some(slot) = self.known.get_mut(index) {
-                    slot.observe(object.size);
-                }
-            }
-            None => {
-                if let StorageClass::Other(name) = &object.storage_class {
-                    self.other.observe(name, object.size);
-                }
-            }
+        if let StorageClass::Other(name) = &object.storage_class {
+            self.unrecognized.observe(object.size);
+            self.other.observe(name, object.size);
+        } else if let Some(slot) = object
+            .storage_class
+            .known_index()
+            .and_then(|index| self.known.get_mut(index))
+        {
+            slot.observe(object.size);
         }
     }
 
@@ -147,6 +151,7 @@ impl Inventory {
         for (slot, other_slot) in self.known.iter_mut().zip(other.known) {
             slot.merge(other_slot);
         }
+        self.unrecognized.merge(other.unrecognized);
         self.other.merge(other.other);
     }
 
@@ -174,20 +179,13 @@ impl Inventory {
 
     /// The combined count and bytes of *every* unrecognized object,
     /// regardless of how many distinct unrecognized class names there
-    /// are: computed as `overall` minus the sum of every known class's
-    /// slot, not by summing [`Inventory::other_classes`] (which only
-    /// tracks the 8 lexicographically smallest names and would undercount
-    /// once a 9th distinct name has ever displaced one).
+    /// are: counted directly as each unrecognized object is observed, not
+    /// by summing [`Inventory::other_classes`] (which only tracks the 8
+    /// lexicographically smallest names and would undercount once a 9th
+    /// distinct name has ever displaced one).
     #[must_use]
     pub(super) fn unrecognized_totals(&self) -> CountBytes {
-        let mut known = CountBytes::default();
-        for slot in self.known {
-            known.merge(slot);
-        }
-        CountBytes {
-            count: self.overall.count.saturating_sub(known.count),
-            bytes: self.overall.bytes.saturating_sub(known.bytes),
-        }
+        self.unrecognized
     }
 
     /// The heap this inventory currently occupies: just the unrecognized
@@ -399,5 +397,29 @@ mod tests {
 
         assert_eq!(inv.other_classes().count(), MAX_OTHER_CLASSES);
         assert_eq!(inv.unrecognized_totals(), CountBytes { count: 9, bytes: 9 });
+    }
+
+    #[test]
+    fn known_slots_plus_unrecognized_equal_overall() {
+        // Every known class once, plus more distinct unrecognized names
+        // than are tracked individually, with distinct sizes so a
+        // double-counted or dropped object would change the byte sum.
+        let mut inv = Inventory::default();
+        let mut size = 1;
+        for class in StorageClass::KNOWN {
+            inv.observe(&object(size, class));
+            size += 1;
+        }
+        for n in 0..12 {
+            inv.observe(&object(size, StorageClass::Other(format!("other-{n}"))));
+            size += 1;
+        }
+
+        let mut sum = inv.unrecognized_totals();
+        for class in &StorageClass::KNOWN {
+            sum.merge(inv.known_class(class).unwrap_or_default());
+        }
+        assert_eq!(sum, inv.overall);
+        assert_eq!(inv.unrecognized_totals().count, 12);
     }
 }

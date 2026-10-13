@@ -10,7 +10,7 @@
 //! objects, which is exactly why its bound is explicit and checked.
 //!
 //! [`Aggregates::MAX_BYTES`] is a compile-time-checked sum of every summary's
-//! own `MAX_BYTES`: **112,728 bytes (~110 KiB)** as of this milestone,
+//! own `MAX_BYTES`: **112,744 bytes (~110 KiB)** as of this milestone,
 //! asserted below to be no more than 18 MiB. The real total is far smaller
 //! than that ceiling, because every fixed capacity here (10 samples per
 //! rule, 20 largest objects, 16 KiB of `Hll` registers) is sized for what a
@@ -70,7 +70,7 @@ pub struct Aggregates {
 
 impl Aggregates {
     /// The combined worst-case size of every summary this struct holds:
-    /// the plain sum of each summary type's own `MAX_BYTES`. 112,728 bytes
+    /// the plain sum of each summary type's own `MAX_BYTES`. 112,744 bytes
     /// as of this milestone (see this module's doc); checked below to be
     /// within the 18 MiB module budget.
     pub const MAX_BYTES: usize = Inventory::MAX_BYTES

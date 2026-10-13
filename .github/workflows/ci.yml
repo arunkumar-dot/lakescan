@@ -41,4 +41,58 @@ jobs:
       - name: Gate 5 - release build and smoke run
         run: |
           cargo build --release
-          ./target/release/lakescan
+          ./target/release/lakescan --version
+
+  msrv:
+    name: MSRV (1.94.1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      # `+1.94.1` is required: rust-toolchain.toml pins stable, which would
+      # otherwise win over the toolchain installed above.
+      - name: Check on the minimum supported Rust version
+        run: cargo +1.94.1 check --all-targets
+
+  e2e:
+    name: End-to-end (moto)
+    runs-on: ubuntu-latest
+    services:
+      moto:
+        # Pinned: an in-memory S3 fake that accepts any credentials and
+        # stores storage classes. Keep in step with tests/e2e.rs.
+        image: motoserver/moto:5.2.3
+        ports:
+          - 5000:5000
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      LAKESCAN_E2E_ENDPOINT: http://localhost:5000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+
+      - name: Wait for moto
+        run: curl --silent --output /dev/null --retry 30 --retry-delay 1 --retry-connrefused "$LAKESCAN_E2E_ENDPOINT"
+
+      - name: Seed the demo bucket
+        run: cargo run --example seed_local -- "$LAKESCAN_E2E_ENDPOINT"
+
+      - name: End-to-end tests
+        run: cargo test --test e2e -- --ignored

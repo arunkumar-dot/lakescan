@@ -1,13 +1,10 @@
 //! Thin binary wrapper around the `lakescan` library.
 //!
-//! All behavior lives in the library; this entry point exists only to run it
-//! and to translate the result into a process exit status. For M0 it prints
-//! the version and succeeds. Argument parsing arrives with the CLI milestone.
-
-use lakescan::ExitCode;
+//! All behavior, argument parsing included, lives in [`lakescan::cli`]; this
+//! entry point only collects the process arguments, runs the CLI, and hands
+//! its [`lakescan::ExitCode`] back to the operating system.
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    println!("lakescan {}", env!("CARGO_PKG_VERSION"));
-    ExitCode::Ok.into()
+    lakescan::cli::run(std::env::args_os()).await.into()
 }

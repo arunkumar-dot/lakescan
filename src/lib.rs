@@ -42,11 +42,16 @@
 //! to 1 KiB each is held twice at once, once as the raw response body and
 //! once as parsed `ObjectMeta` entries.
 //!
+//! [`cli`] is the driver that wires the four stages together for one run:
+//! it parses the command line, opens the destinations, feeds every page
+//! through the pipeline above, and turns the result into an [`ExitCode`].
+//!
 //! All domain types are defined once, in [`model`]. All failures are expressed
 //! as [`LakeScanError`], and each maps to exactly one [`ExitCode`], whose
 //! integer values are a frozen public contract.
 
 pub mod aggregate;
+pub mod cli;
 pub mod error;
 pub mod model;
 pub mod report;
