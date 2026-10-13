@@ -1,13 +1,15 @@
 //! The plain-text summary writer.
 //!
-//! Section order, always: header, verdict, inventory, findings, samples
-//! (per rule), largest objects, size histogram, age histogram,
-//! distinct-content. Every section but the header is skipped entirely when
-//! it would be empty (no findings, no non-zero storage classes, no
-//! non-empty histogram buckets), rather than printed as an empty table. A
-//! rule's findings print one line per severity it actually raised, worst
-//! first, and skip the rest — a rule with a single High finding is one
-//! line, not a zero-padded row across every severity.
+//! Section order, always: header, verdict, inventory, findings,
+//! suppressions, samples (per rule), largest objects, size histogram, age
+//! histogram, distinct-content. A section with nothing to list says so in
+//! one line, except suppressions, which is omitted entirely unless some
+//! `--config` entry expired or went unused. A rule's findings print one
+//! line per severity it actually raised, worst first, and skip the rest —
+//! a rule with a single High finding is one line, not a zero-padded row
+//! across every severity — followed by its suppressed count when it has
+//! any. A rule whose findings were all suppressed is still listed, with
+//! only that line.
 //!
 //! No color, no box-drawing: this is meant to be `grep`-able and safe to
 //! pipe. Every object key is attacker-controlled, so every key is written
@@ -24,6 +26,7 @@ use super::{ScanInfo, TOOL_NAME, TOOL_VERSION};
 use crate::aggregate::{Aggregates, Sample};
 use crate::error::LakeScanError;
 use crate::model::{RuleId, Severity};
+use crate::suppress::{Entry, Pattern};
 
 /// `write!`/`writeln!` to `out`, mapping any I/O error to
 /// [`LakeScanError::Report`] — every text-writing call in this file goes
@@ -115,9 +118,10 @@ fn write_findings<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), 
     let rows: Vec<RuleId> = RuleId::ALL
         .into_iter()
         .filter(|&rule| {
-            Severity::ALL
-                .into_iter()
-                .any(|severity| aggregates.matrix_cell(rule, severity).count > 0)
+            aggregates.suppressed(rule).count > 0
+                || Severity::ALL
+                    .into_iter()
+                    .any(|severity| aggregates.matrix_cell(rule, severity).count > 0)
         })
         .collect();
 
@@ -143,6 +147,57 @@ fn write_findings<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), 
                 cell.count,
                 human_bytes(cell.bytes)
             )?;
+        }
+        let suppressed = aggregates.suppressed(rule);
+        if suppressed.count > 0 {
+            wl!(
+                out,
+                "    suppressed: {} ({})",
+                suppressed.count,
+                human_bytes(suppressed.bytes)
+            )?;
+        }
+    }
+    wl_empty!(out)
+}
+
+/// One `--config` entry: rule, key or prefix (escaped, like any key), the
+/// expiry date if it has one, and the reason (escaped too: it is free text
+/// from a file).
+fn write_entry<W: Write>(out: &mut W, entry: &Entry) -> Result<(), LakeScanError> {
+    w!(out, "    {}  ", entry.rule.code())?;
+    let (label, value) = match &entry.pattern {
+        Pattern::Key(key) => ("key", key),
+        Pattern::Prefix(prefix) => ("prefix", prefix),
+    };
+    w!(out, "{label}=")?;
+    if value.is_empty() {
+        // Spelled out: a bare `prefix=` would read as a formatting slip.
+        w!(out, "\"\" (every key)")?;
+    } else {
+        write_escaped(out, value).map_err(LakeScanError::Report)?;
+    }
+    if let Some(expires) = entry.expires {
+        w!(out, "  expires={expires}")?;
+    }
+    w!(out, "  reason: ")?;
+    write_escaped(out, &entry.reason).map_err(LakeScanError::Report)?;
+    wl_empty!(out)
+}
+
+fn write_suppressions<W: Write>(out: &mut W, info: &ScanInfo) -> Result<(), LakeScanError> {
+    let outcome = &info.suppressions;
+    if outcome.expired.is_empty() && outcome.unused.is_empty() {
+        return Ok(());
+    }
+    wl!(out, "SUPPRESSIONS")?;
+    for (heading, entries) in [("expired", &outcome.expired), ("unused", &outcome.unused)] {
+        if entries.is_empty() {
+            continue;
+        }
+        wl!(out, "  {heading}:")?;
+        for entry in entries {
+            write_entry(out, entry)?;
         }
     }
     wl_empty!(out)
@@ -274,17 +329,27 @@ fn write_distinct_content<W: Write>(
     aggregates: &Aggregates,
 ) -> Result<(), LakeScanError> {
     wl!(out, "DISTINCT CONTENT")?;
-    wl!(
+    w!(
         out,
-        "  ~{:.0} distinct (etag, size) values across {} objects; at least ~{:.0} duplicates",
+        "  ~{:.0} distinct (etag, size) values across {} objects; ",
         aggregates.distinct_content_estimate(),
         aggregates.total_objects(),
-        aggregates.duplicate_lower_bound()
     )?;
+    if aggregates.duplicates_significant() {
+        wl!(
+            out,
+            "at least ~{:.0} duplicates",
+            aggregates.duplicate_lower_bound()
+        )?;
+    } else {
+        wl!(
+            out,
+            "no duplicates detected (differences under ~2% are within estimator error)"
+        )?;
+    }
     wl!(
         out,
-        "  (re-uploaded or re-encrypted content gets a new ETag and is not detected; ~1% \
-         estimator error)"
+        "  (re-uploaded or re-encrypted content gets a new ETag and is not detected)"
     )
 }
 
@@ -298,6 +363,7 @@ pub(super) fn write<W: Write>(
     write_verdict(out, aggregates)?;
     write_inventory(out, aggregates)?;
     write_findings(out, aggregates)?;
+    write_suppressions(out, info)?;
     write_samples(out, aggregates)?;
     write_largest_objects(out, aggregates)?;
     write_size_histogram(out, aggregates)?;
@@ -315,6 +381,24 @@ mod tests {
     /// this file, so the comparison does not depend on the test runner's
     /// working directory. On mismatch, `assert_eq!` reports exactly where
     /// the two strings first diverge.
+    #[test]
+    fn an_empty_prefix_is_spelled_out() -> Result<(), Box<dyn std::error::Error>> {
+        let entry = crate::suppress::Entry {
+            rule: crate::model::RuleId::StaleStandard,
+            pattern: crate::suppress::Pattern::Prefix(String::new()),
+            reason: "r".to_owned(),
+            expires: None,
+            bucket: None,
+        };
+        let mut buf = Vec::new();
+        super::write_entry(&mut buf, &entry)?;
+        assert_eq!(
+            String::from_utf8(buf)?,
+            "    stale-standard  prefix=\"\" (every key)  reason: r\n"
+        );
+        Ok(())
+    }
+
     #[test]
     fn matches_the_golden_file() -> Result<(), crate::error::LakeScanError> {
         let golden = include_str!("../../tests/golden/summary.txt");

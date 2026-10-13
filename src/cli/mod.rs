@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! lakescan scan <TARGET> [OPTIONS]   scan s3://bucket[/prefix]
+//!                                    (--config <PATH> for suppressions)
 //! lakescan rules                     list every rule's code and title
 //! ```
 //!
@@ -31,6 +32,7 @@ use crate::error::{ExitCode, LakeScanError};
 use crate::model::{RuleId, Severity};
 use crate::report::Format;
 use crate::scanner::S3Source;
+use crate::suppress::Config;
 
 /// High-throughput S3 audit tool.
 #[derive(Parser, Debug)]
@@ -81,7 +83,11 @@ struct ScanArgs {
     #[arg(long, value_name = "URL")]
     endpoint_url: Option<String>,
 
-    /// No progress output.
+    /// Suppression config file (TOML); see the README for the format.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// No progress output and no suppression warnings.
     #[arg(long)]
     quiet: bool,
 }
@@ -135,7 +141,11 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    match execute(args).await {
+    let stdout = io::stdout();
+    // Help is colored only where clap itself would color it: on a
+    // terminal, and not with NO_COLOR set.
+    let color = stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    match execute(args, stdout, color).await {
         Ok(code) => code,
         Err(err) => {
             // If stderr itself is gone there is nowhere left to report to;
@@ -146,34 +156,49 @@ where
     }
 }
 
-async fn execute<I, T>(args: I) -> Result<ExitCode, LakeScanError>
+/// Parses `args` and runs the chosen command. `--help`, `--version`, and
+/// `lakescan rules` write to `out` (stdout, outside tests), with help in
+/// ANSI color when `color`; a scan opens its own destinations.
+async fn execute<I, T, W>(args: I, out: W, color: bool) -> Result<ExitCode, LakeScanError>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
+    W: Write,
 {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
-        Err(err) => return clap_outcome(&err),
+        Err(err) => return clap_outcome(&err, out, color),
     };
 
     match cli.command {
         Command::Scan(args) => scan(args).await,
         Command::Rules => {
-            write_rules(io::stdout())?;
+            write_rules(out)?;
             Ok(ExitCode::Ok)
         }
     }
 }
 
-/// `--help` and `--version` arrive from clap as errors; they print and
-/// succeed. Every other clap error is a [`LakeScanError::Usage`] carrying
-/// the first paragraph of clap's message, joined onto one line.
-fn clap_outcome(err: &clap::Error) -> Result<ExitCode, LakeScanError> {
+/// `--help` and `--version` arrive from clap as errors; they are written to
+/// `out` and succeed. Every other clap error is a
+/// [`LakeScanError::Usage`] carrying the first paragraph of clap's
+/// message, joined onto one line.
+fn clap_outcome<W: Write>(
+    err: &clap::Error,
+    mut out: W,
+    color: bool,
+) -> Result<ExitCode, LakeScanError> {
     if matches!(
         err.kind(),
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     ) {
-        ignore_broken_pipe(err.print())?;
+        let rendered = err.render();
+        let written = if color {
+            write!(out, "{}", rendered.ansi())
+        } else {
+            write!(out, "{rendered}")
+        };
+        ignore_broken_pipe(written.and_then(|()| out.flush()))?;
         return Ok(ExitCode::Ok);
     }
 
@@ -192,6 +217,12 @@ fn clap_outcome(err: &clap::Error) -> Result<ExitCode, LakeScanError> {
 
 async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
     let target: Target = args.target.parse()?;
+    let config = args
+        .config
+        .as_deref()
+        .map(Config::load)
+        .transpose()?
+        .unwrap_or_default();
 
     let summary_to_stdout = args.output.as_deref().is_none_or(is_stdout);
     let findings_to_stdout = args.findings.as_deref().is_some_and(is_stdout);
@@ -231,17 +262,20 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         .transpose()?;
 
     let stderr = io::stderr();
-    let progress = (!args.quiet && stderr.is_terminal()).then_some(stderr);
+    let progress = (!args.quiet && stderr.is_terminal()).then_some(io::stderr());
+    let warnings = (!args.quiet).then_some(stderr);
 
     driver::scan(
         source,
         target,
+        config,
         args.format.into(),
         args.fail_on.threshold(),
         Outputs {
             summary,
             findings,
             progress,
+            warnings,
         },
     )
     .await
@@ -299,7 +333,7 @@ mod tests {
     use crate::model::RuleId;
 
     async fn usage_error(args: &[&str]) -> Option<String> {
-        match execute(args.iter().copied()).await {
+        match execute(args.iter().copied(), Vec::new(), false).await {
             Err(LakeScanError::Usage(message)) => Some(message),
             _ => None,
         }
@@ -321,19 +355,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn help_and_version_succeed() -> Result<(), LakeScanError> {
-        for args in [
-            ["lakescan", "--help"].as_slice(),
-            &["lakescan", "--version"],
-            &["lakescan", "scan", "--help"],
+    async fn help_and_version_succeed_and_write_to_the_given_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (args, expected) in [
+            (["lakescan", "--help"].as_slice(), "Usage: lakescan"),
+            (&["lakescan", "--version"], "lakescan 0.1.0"),
+            (&["lakescan", "scan", "--help"], "--config <PATH>"),
         ] {
+            let mut out = Vec::new();
             assert_eq!(
-                execute(args.iter().copied()).await?,
+                execute(args.iter().copied(), &mut out, false).await?,
                 ExitCode::Ok,
                 "{args:?}"
             );
+            let out = String::from_utf8(out)?;
+            assert!(out.contains(expected), "{args:?} printed {out:?}");
+            assert!(!out.contains('\x1b'), "uncolored output has no ANSI codes");
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bad_config_is_a_usage_error_before_any_network_call() {
+        for config in ["/nonexistent/lakescan.toml", "Cargo.toml"] {
+            let message = usage_error(&["lakescan", "scan", "s3://b", "--config", config]).await;
+            assert!(
+                message.as_ref().is_some_and(|m| m.contains("config")),
+                "{config}: {message:?}"
+            );
+        }
     }
 
     #[tokio::test]

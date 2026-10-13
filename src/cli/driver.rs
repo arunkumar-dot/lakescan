@@ -1,8 +1,9 @@
-//! The scan driver: wires `scanner` → `rules` → `aggregate` → `report` for
-//! one run and decides the run's [`ExitCode`].
+//! The scan driver: wires `scanner` → `rules` → `suppress` → `aggregate` →
+//! `report` for one run and decides the run's [`ExitCode`].
 //!
 //! The driver never opens a destination itself. The summary, the optional
-//! findings stream, and the optional progress line all arrive as writers,
+//! findings stream, the optional progress line, and the optional
+//! suppression warnings all arrive as writers,
 //! which is what lets the tests below run a whole scan against in-memory
 //! buffers and a scripted [`PageSource`].
 
@@ -16,13 +17,14 @@ use crate::model::Severity;
 use crate::report::{self, FindingsWriter, Format, ScanInfo};
 use crate::rules::{self, EvalContext};
 use crate::scanner::{PageSource, Scanner};
+use crate::suppress::{Config, Date, Entry, Outcome, Suppressor};
 
 /// Clears the current terminal line: carriage return, then ANSI "erase
 /// entire line".
 const CLEAR_LINE: &str = "\r\x1b[2K";
 
 /// Where one scan's output goes.
-pub(crate) struct Outputs<O, F, P> {
+pub(crate) struct Outputs<O, F, P, D> {
     /// The summary destination, written once after the scan.
     pub(crate) summary: O,
     /// The JSON Lines findings stream, if one was requested.
@@ -31,6 +33,9 @@ pub(crate) struct Outputs<O, F, P> {
     /// The caller decides (terminal or not, `--quiet` or not); the driver
     /// only writes to it.
     pub(crate) progress: Option<P>,
+    /// Where to warn about expired and unused suppression entries after
+    /// the scan, or `None` (`--quiet`) for no warnings.
+    pub(crate) warnings: Option<D>,
 }
 
 /// Runs one scan of `source` to completion and returns its verdict:
@@ -38,28 +43,35 @@ pub(crate) struct Outputs<O, F, P> {
 /// is at or above `fail_on`, otherwise [`ExitCode::Ok`]. `fail_on` of
 /// `None` never fails on findings.
 ///
-/// "Now" is captured once, at the start, and shared by the rule engine and
-/// the aggregates, so age-based rules and the age histogram agree on it.
+/// "Now" is captured once, at the start, and shared by the rule engine, the
+/// aggregates, and the suppressor (whose expiry check uses its UTC date),
+/// so every stage agrees on it. Every finding passes through the
+/// suppressor: a suppressed one is counted by
+/// [`Aggregates::observe_suppressed`] and goes nowhere else — not the
+/// findings matrix, not the verdict, not the findings stream.
+///
 /// The findings stream is finished before the summary is written, and the
 /// progress line is cleared before either, whether the scan succeeded or
-/// not.
+/// not. Suppression warnings follow the summary.
 ///
 /// # Errors
 /// Returns whatever the scanner returns for a failed listing, and
 /// [`LakeScanError::Report`] if the findings stream or the summary cannot
 /// be written.
-pub(crate) async fn scan<S, O, F, P>(
+pub(crate) async fn scan<S, O, F, P, D>(
     source: S,
     target: Target,
+    config: Config,
     format: Format,
     fail_on: Option<Severity>,
-    outputs: Outputs<O, F, P>,
+    outputs: Outputs<O, F, P, D>,
 ) -> Result<ExitCode, LakeScanError>
 where
     S: PageSource,
     O: Write,
     F: Write,
     P: Write,
+    D: Write,
 {
     let started_at = SystemTime::now();
     let clock = Instant::now();
@@ -67,11 +79,13 @@ where
     // Boxed: `Aggregates` is ~110 KiB of fixed-size summaries, which would
     // otherwise sit inline in this function's future.
     let mut aggregates = Box::new(Aggregates::new(started_at));
+    let mut suppressor = Suppressor::new(config, &target.bucket, Date::utc_of(started_at));
 
     let Outputs {
         summary,
         findings,
         mut progress,
+        warnings,
     } = outputs;
     let mut findings = findings.map(FindingsWriter::new);
 
@@ -79,6 +93,7 @@ where
         &mut Scanner::new(source),
         &ctx,
         &mut aggregates,
+        &mut suppressor,
         findings.as_mut(),
         progress.as_mut(),
     )
@@ -102,19 +117,51 @@ where
         prefix: target.prefix,
         started_at,
         elapsed,
+        suppressions: suppressor.finish(),
     };
     report::write_summary(summary, format, &info, &aggregates)?;
+
+    if let Some(mut out) = warnings {
+        // Best effort, like progress: the summary already carries these.
+        let _ = write_warnings(&mut out, &info.suppressions);
+    }
 
     Ok(verdict(aggregates.worst_severity(), fail_on))
 }
 
-/// Pulls every page from `scanner`, feeding each object and each finding
-/// it raises into `aggregates` (and each finding into `findings`, if
-/// given), and rewrites the progress line after every page.
+/// One line per expired, then per unused, suppression entry.
+fn write_warnings<D: Write>(out: &mut D, outcome: &Outcome) -> std::io::Result<()> {
+    let line = |out: &mut D, state: &str, entry: &Entry| {
+        let expires = entry
+            .expires
+            .map(|date| format!(" (expires {date})"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "lakescan: warning: {state} suppression for {}, {}{expires}: {:?}",
+            entry.rule.code(),
+            entry.pattern,
+            entry.reason
+        )
+    };
+    for entry in &outcome.expired {
+        line(out, "expired", entry)?;
+    }
+    for entry in &outcome.unused {
+        line(out, "unused", entry)?;
+    }
+    out.flush()
+}
+
+/// Pulls every page from `scanner`, feeding each object into `aggregates`
+/// and each finding it raises through `suppressor` — suppressed ones to
+/// [`Aggregates::observe_suppressed`], the rest to the findings matrix and
+/// `findings`, if given — and rewrites the progress line after every page.
 async fn walk<S, F, P>(
     scanner: &mut Scanner<S>,
     ctx: &EvalContext,
     aggregates: &mut Aggregates,
+    suppressor: &mut Suppressor,
     mut findings: Option<&mut FindingsWriter<F>>,
     mut progress: Option<&mut P>,
 ) -> Result<(), LakeScanError>
@@ -130,6 +177,10 @@ where
         for object in page {
             aggregates.observe_object(object);
             for finding in rules::evaluate(object, ctx) {
+                if suppressor.suppresses(&finding) {
+                    aggregates.observe_suppressed(finding);
+                    continue;
+                }
                 aggregates.observe_finding(finding);
                 if let Some(writer) = findings.as_deref_mut() {
                     writer.write(finding)?;
@@ -173,6 +224,7 @@ mod tests {
     use crate::model::{ObjectMeta, Severity, StorageClass};
     use crate::report::Format;
     use crate::scanner::PageSource;
+    use crate::suppress::Config;
 
     /// One scripted response to a single `fetch_page` call.
     enum Step {
@@ -270,12 +322,14 @@ mod tests {
         let code = scan(
             two_pages(),
             target(),
+            Config::default(),
             Format::Json,
             Some(Severity::High),
             Outputs {
                 summary: &mut summary,
                 findings: Some(&mut findings),
                 progress: None::<Vec<u8>>,
+                warnings: None::<Vec<u8>>,
             },
         )
         .await?;
@@ -316,12 +370,14 @@ mod tests {
             let code = scan(
                 two_pages(),
                 target(),
+                Config::default(),
                 Format::Text,
                 fail_on,
                 Outputs {
                     summary: Vec::new(),
                     findings: None::<Vec<u8>>,
                     progress: None::<Vec<u8>>,
+                    warnings: None::<Vec<u8>>,
                 },
             )
             .await?;
@@ -337,12 +393,14 @@ mod tests {
         scan(
             two_pages(),
             target(),
+            Config::default(),
             Format::Text,
             None,
             Outputs {
                 summary: Vec::new(),
                 findings: None::<Vec<u8>>,
                 progress: Some(&mut progress),
+                warnings: None::<Vec<u8>>,
             },
         )
         .await?;
@@ -372,12 +430,14 @@ mod tests {
                 Step::Err(LakeScanError::Transport("boom".to_owned())),
             ]),
             target(),
+            Config::default(),
             Format::Text,
             Some(Severity::High),
             Outputs {
                 summary: &mut summary,
                 findings: None::<Vec<u8>>,
                 progress: Some(&mut progress),
+                warnings: None::<Vec<u8>>,
             },
         )
         .await;
@@ -385,5 +445,85 @@ mod tests {
         assert!(matches!(result, Err(LakeScanError::Transport(_))));
         assert_eq!(summary, Vec::<u8>::new());
         assert!(progress.ends_with(CLEAR_LINE.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_high_finding_no_longer_fails_the_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = Config::parse(
+            r#"
+version = 1
+
+[[suppress]]
+rule = "sensitive-key"
+key = "id_rsa"
+reason = "Test key"
+
+[[suppress]]
+rule = "stale-standard"
+prefix = ""
+reason = "Never matches anything in this scan"
+"#,
+            "test.toml",
+        )?;
+
+        let mut summary = Vec::new();
+        let mut findings = Vec::new();
+        let mut warnings = Vec::new();
+        let code = scan(
+            two_pages(),
+            target(),
+            config,
+            Format::Json,
+            Some(Severity::High),
+            Outputs {
+                summary: &mut summary,
+                findings: Some(&mut findings),
+                progress: None::<Vec<u8>>,
+                warnings: Some(&mut warnings),
+            },
+        )
+        .await?;
+
+        // The only High finding was suppressed; the zero-byte Info remains.
+        assert_eq!(code, ExitCode::Ok);
+
+        let findings = String::from_utf8(findings)?;
+        assert!(!findings.contains("id_rsa"), "{findings}");
+        assert_eq!(findings.lines().count(), 1);
+
+        let summary: serde_json::Value = serde_json::from_slice(&summary)?;
+        assert_eq!(
+            summary.pointer("/verdict/worst_severity"),
+            Some(&serde_json::json!("info"))
+        );
+        let sensitive = summary
+            .get("findings")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|all| {
+                all.iter()
+                    .find(|entry| entry.get("rule") == Some(&serde_json::json!("sensitive-key")))
+            })
+            .ok_or("sensitive-key missing from the summary")?;
+        assert_eq!(
+            sensitive.pointer("/counts/high"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            sensitive.get("suppressed"),
+            Some(&serde_json::json!({ "count": 1, "bytes": 512 }))
+        );
+        assert_eq!(
+            summary.pointer("/suppressions/unused/0/rule"),
+            Some(&serde_json::json!("stale-standard"))
+        );
+
+        let warnings = String::from_utf8(warnings)?;
+        assert_eq!(
+            warnings,
+            "lakescan: warning: unused suppression for stale-standard, prefix \"\": \
+             \"Never matches anything in this scan\"\n"
+        );
+        Ok(())
     }
 }

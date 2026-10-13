@@ -2,6 +2,8 @@
 //!
 //! Single responsibility: answer whole-bucket questions — totals, top-k,
 //! distributions, cardinalities — without ever holding the bucket in memory.
+//! Findings that `suppress` set aside arrive separately, through
+//! [`Aggregates::observe_suppressed`], and are only counted per rule.
 //!
 //! **Memory budget: 18 MB.** Bounded sketches only. Every aggregator declares
 //! a `const` upper bound on its own footprint, and no aggregator may use a
@@ -10,7 +12,7 @@
 //! objects, which is exactly why its bound is explicit and checked.
 //!
 //! [`Aggregates::MAX_BYTES`] is a compile-time-checked sum of every summary's
-//! own `MAX_BYTES`: **112,744 bytes (~110 KiB)** as of this milestone,
+//! own `MAX_BYTES`: **112,840 bytes (~110 KiB)** as of this milestone,
 //! asserted below to be no more than 18 MiB. The real total is far smaller
 //! than that ceiling, because every fixed capacity here (10 samples per
 //! rule, 20 largest objects, 16 KiB of `Hll` registers) is sized for what a
@@ -53,6 +55,10 @@ const SAMPLES_PER_RULE: usize = 10;
 /// How many objects are kept in the largest-objects list.
 const LARGEST_OBJECTS: usize = 20;
 
+/// The fraction of the object count the duplicate lower bound must reach
+/// before [`Aggregates::duplicates_significant`] calls it real.
+const SIGNIFICANT_DUPLICATE_FRACTION: f64 = 0.02;
+
 /// The whole-bucket summary this pipeline stage builds: one of each
 /// summary described in this module's doc, folded from every object and
 /// finding observed.
@@ -63,6 +69,9 @@ pub struct Aggregates {
     matrix: FindingsMatrix,
     samples: [TopK<Sample, SAMPLES_PER_RULE>; NUM_RULES],
     largest: TopK<Sample, LARGEST_OBJECTS>,
+    /// Per rule (indexed by [`RuleId::index`]): findings a suppression
+    /// entry covered, which appear nowhere else in this summary.
+    suppressed: [CountBytes; NUM_RULES],
     size_histogram: SizeHistogram,
     age_histogram: AgeHistogram,
     hll: Hll,
@@ -70,13 +79,14 @@ pub struct Aggregates {
 
 impl Aggregates {
     /// The combined worst-case size of every summary this struct holds:
-    /// the plain sum of each summary type's own `MAX_BYTES`. 112,744 bytes
+    /// the plain sum of each summary type's own `MAX_BYTES`. 112,840 bytes
     /// as of this milestone (see this module's doc); checked below to be
     /// within the 18 MiB module budget.
     pub const MAX_BYTES: usize = Inventory::MAX_BYTES
         + FindingsMatrix::MAX_BYTES
         + NUM_RULES * TopK::<Sample, SAMPLES_PER_RULE>::MAX_BYTES
         + TopK::<Sample, LARGEST_OBJECTS>::MAX_BYTES
+        + size_of::<[CountBytes; NUM_RULES]>()
         + SizeHistogram::MAX_BYTES
         + AgeHistogram::MAX_BYTES
         + Hll::MAX_BYTES;
@@ -93,6 +103,7 @@ impl Aggregates {
             matrix: FindingsMatrix::default(),
             samples: std::array::from_fn(|_| TopK::default()),
             largest: TopK::default(),
+            suppressed: [CountBytes::default(); NUM_RULES],
             size_histogram: SizeHistogram::default(),
             age_histogram: AgeHistogram::default(),
             hll: Hll::default(),
@@ -131,6 +142,15 @@ impl Aggregates {
         }
     }
 
+    /// Records one suppressed finding: its rule's suppressed count and
+    /// bytes, and nothing else. A suppressed finding never reaches the
+    /// findings matrix (so never the verdict) or a rule's samples.
+    pub fn observe_suppressed(&mut self, finding: Finding<'_>) {
+        if let Some(cell) = self.suppressed.get_mut(finding.rule.index()) {
+            cell.observe(finding.object.size);
+        }
+    }
+
     /// Folds `other` into `self`. Order-independent: see this module's doc.
     pub fn merge(&mut self, other: Self) {
         self.inventory.merge(other.inventory);
@@ -139,6 +159,9 @@ impl Aggregates {
             slot.merge(other_slot);
         }
         self.largest.merge(other.largest);
+        for (cell, other_cell) in self.suppressed.iter_mut().zip(other.suppressed) {
+            cell.merge(other_cell);
+        }
         self.size_histogram.merge(&other.size_histogram);
         self.age_histogram.merge(&other.age_histogram);
         self.hll.merge(&other.hll);
@@ -202,6 +225,15 @@ impl Aggregates {
     #[must_use]
     pub fn matrix_cell(&self, rule: RuleId, severity: Severity) -> CountBytes {
         self.matrix.cell(rule, severity)
+    }
+
+    /// The count and bytes of `rule`'s suppressed findings.
+    #[must_use]
+    pub fn suppressed(&self, rule: RuleId) -> CountBytes {
+        self.suppressed
+            .get(rule.index())
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The highest severity seen across every finding, or `None` if no
@@ -270,12 +302,14 @@ impl Aggregates {
         age_histogram::bucket_bounds(index)
     }
 
-    /// The estimated number of distinct object contents observed. See
-    /// `aggregate::hyperloglog` for the `ETag` caveat that makes this a lower
-    /// bound on duplicates, not an exact count.
+    /// The estimated number of distinct object contents observed, clamped
+    /// to [`Aggregates::total_objects`]: the raw estimate can overshoot the
+    /// true count slightly, but there can never be more distinct contents
+    /// than objects. See `aggregate::hyperloglog` for the `ETag` caveat
+    /// that makes this a lower bound on duplicates, not an exact count.
     #[must_use]
     pub fn distinct_content_estimate(&self) -> f64 {
-        self.hll.estimate()
+        self.hll.estimate().min(u64_to_f64(self.total_objects()))
     }
 
     /// A lower bound on how many objects share content with some other
@@ -288,6 +322,17 @@ impl Aggregates {
     #[must_use]
     pub fn duplicate_lower_bound(&self) -> f64 {
         (u64_to_f64(self.total_objects()) - self.distinct_content_estimate()).max(0.0)
+    }
+
+    /// Whether [`Aggregates::duplicate_lower_bound`] is large enough to
+    /// report as real duplication rather than estimator noise: non-zero
+    /// and at least [`SIGNIFICANT_DUPLICATE_FRACTION`] of the object count.
+    /// The estimator's standard error is ~1%, so 2% is about two standard
+    /// errors. Decided here so the reporter never has to.
+    #[must_use]
+    pub fn duplicates_significant(&self) -> bool {
+        let bound = self.duplicate_lower_bound();
+        bound > 0.0 && bound >= SIGNIFICANT_DUPLICATE_FRACTION * u64_to_f64(self.total_objects())
     }
 
     /// The heap this summary currently occupies, across every field that
@@ -554,6 +599,88 @@ mod tests {
         }
 
         assert!(aggregates.duplicate_lower_bound() >= 0.0);
+    }
+
+    #[test]
+    fn the_distinct_estimate_never_exceeds_the_object_count() {
+        // Small counts are where the raw estimate overshoots most visibly.
+        for count in 1..=40_u64 {
+            let mut aggregates = Aggregates::new(now());
+            for n in 0..count {
+                aggregates.observe_object(&ObjectMeta {
+                    key: format!("key-{n}"),
+                    size: n,
+                    last_modified: now(),
+                    etag: format!("etag-{n}"),
+                    storage_class: StorageClass::Standard,
+                });
+            }
+            assert!(
+                aggregates.distinct_content_estimate() <= super::u64_to_f64(count),
+                "{count} objects estimated as {}",
+                aggregates.distinct_content_estimate()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicates_are_significant_only_at_two_percent_or_more() {
+        let observe = |distinct: u64, copies: u64| {
+            let mut aggregates = Aggregates::new(now());
+            for n in 0..distinct {
+                for copy in 0..copies {
+                    aggregates.observe_object(&ObjectMeta {
+                        key: format!("key-{n}-{copy}"),
+                        size: 100,
+                        last_modified: now(),
+                        etag: format!("etag-{n}"),
+                        storage_class: StorageClass::Standard,
+                    });
+                }
+            }
+            aggregates
+        };
+
+        // Every object distinct: nothing to report.
+        assert!(!observe(1000, 1).duplicates_significant());
+        // Every object stored twice: half the objects are duplicates.
+        assert!(observe(500, 2).duplicates_significant());
+        // No objects at all.
+        assert!(!Aggregates::new(now()).duplicates_significant());
+    }
+
+    #[test]
+    fn suppressed_findings_are_counted_per_rule_and_nowhere_else() {
+        let ctx = EvalContext { now: now() };
+        let mut aggregates = Aggregates::new(now());
+        let object = ObjectMeta {
+            key: "id_rsa".to_owned(),
+            size: 300,
+            last_modified: now(),
+            etag: "etag".to_owned(),
+            storage_class: StorageClass::Standard,
+        };
+        aggregates.observe_object(&object);
+        for finding in rules::evaluate(&object, &ctx) {
+            aggregates.observe_suppressed(finding);
+        }
+
+        let suppressed = aggregates.suppressed(RuleId::SensitiveKey);
+        assert_eq!((suppressed.count, suppressed.bytes), (1, 300));
+        assert_eq!(aggregates.suppressed(RuleId::ZeroByteObject).count, 0);
+        assert_eq!(
+            aggregates
+                .matrix_cell(RuleId::SensitiveKey, Severity::High)
+                .count,
+            0
+        );
+        assert_eq!(aggregates.worst_severity(), None);
+        assert_eq!(aggregates.samples_for(RuleId::SensitiveKey).len(), 0);
+
+        let mut merged = Aggregates::new(now());
+        merged.merge(aggregates.clone());
+        merged.merge(aggregates);
+        assert_eq!(merged.suppressed(RuleId::SensitiveKey).count, 2);
     }
 
     /// `clippy::float_cmp` is denied crate-wide, so these compare bit

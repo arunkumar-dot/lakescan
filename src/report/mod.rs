@@ -32,8 +32,16 @@
 //! # JSON summary schema
 //!
 //! [`write_summary`] with [`Format::Json`] writes one JSON object.
-//! `schema_version` is a frozen field: existing fields keep their meaning
-//! and type across versions; a breaking change bumps it.
+//!
+//! ## Compatibility policy
+//!
+//! `schema_version` is frozen at its current value for as long as every
+//! change is **additive**: a new field, a new object in a list, a new
+//! section. Consumers must ignore fields they do not recognize. Removing
+//! or renaming a field, changing its type, or changing what an existing
+//! field means is **breaking** and bumps `schema_version`. The
+//! `suppressed`, `suppressions`, and `distinct_content.duplicates_significant`
+//! fields below were added under this policy, so the version is still 1.
 //!
 //! ```text
 //! {
@@ -63,16 +71,26 @@
 //!                                 // than 8 distinct unrecognized classes
 //!                                 // exist
 //!   },
-//!   "findings": [                  // one entry per rule with >=1 finding,
-//!     {                            // in RuleId::ALL order
-//!       "rule": string,            // RuleId::code()
+//!   "findings": [                  // one entry per rule with >=1 finding
+//!     {                            // or >=1 suppressed finding, in
+//!       "rule": string,            // RuleId::ALL order; RuleId::code()
 //!       "title": string,           // RuleId::title()
 //!       "counts": { "critical": integer, "high": integer, "medium": integer,
 //!                   "low": integer, "info": integer },
 //!       "bytes":  { "critical": integer, "high": integer, "medium": integer,
-//!                   "low": integer, "info": integer }
+//!                   "low": integer, "info": integer },
+//!       "suppressed": { "count": integer, "bytes": integer }
+//!                                  // findings a --config entry covered;
+//!                                  // not included in counts/bytes above
 //!     }
 //!   ],
+//!   "suppressions": {              // --config entries worth attention,
+//!     "expired": [ entry ],        // each list in file order; both empty
+//!     "unused":  [ entry ]         // without --config
+//!   },                             // entry: { "rule": string,
+//!                                  //   "key": string  OR  "prefix": string,
+//!                                  //   "reason": string,
+//!                                  //   "expires": string | null }  // YYYY-MM-DD
 //!   "samples": {                   // one key per rule with >=1 finding,
 //!     "<rule code>": [             // keys unordered (plain JSON object);
 //!       {                         // each list is best-first (severity
@@ -93,7 +111,14 @@
 //!     { "lower_seconds": integer, "upper_seconds": integer | null,
 //!       "count": integer, "bytes": integer }
 //!   ],
-//!   "distinct_content": { "estimate": number, "duplicate_lower_bound": number }
+//!   "distinct_content": {
+//!     "estimate": number,           // clamped to object_count
+//!     "duplicate_lower_bound": number,
+//!     "duplicates_significant": bool  // Aggregates::duplicates_significant:
+//!                                     // the bound is non-zero and at least
+//!                                     // 2% of object_count; below that it
+//!                                     // is within estimator error
+//!   }
 //! }
 //! ```
 //!
@@ -122,6 +147,7 @@ use sink::Sink;
 
 use crate::aggregate::Aggregates;
 use crate::error::LakeScanError;
+use crate::suppress::Outcome;
 
 /// This build's name and version, for the report's `tool` section —
 /// `env!` constants from `Cargo.toml`, not configuration: there is exactly
@@ -144,6 +170,9 @@ pub struct ScanInfo {
     pub started_at: SystemTime,
     /// How long the scan took, start to finish.
     pub elapsed: Duration,
+    /// The `--config` entries that expired or went unused during this
+    /// scan; empty without `--config`.
+    pub suppressions: Outcome,
 }
 
 /// Which shape [`write_summary`] renders: machine-readable or human-readable.

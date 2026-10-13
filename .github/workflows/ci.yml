@@ -8,21 +8,26 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Every third-party action is pinned to a full commit SHA, with the release
+# it corresponds to in a trailing comment. dtolnay/rust-toolchain is pinned to
+# a commit on master, so the toolchain is chosen with `with: toolchain:` rather
+# than by the ref.
 jobs:
   quality-gates:
     name: Quality gates
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install stable Rust with rustfmt and clippy
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo registry and target directory
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # The five acceptance gates, in order. `shell: bash` runs with -e, so the
       # first non-zero exit fails the step and therefore the job.
@@ -45,18 +50,18 @@ jobs:
 
   msrv:
     name: MSRV (1.94.1)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust 1.94.1
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: 1.94.1
 
       - name: Cache cargo registry and target directory
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # `+1.94.1` is required: rust-toolchain.toml pins stable, which would
       # otherwise win over the toolchain installed above.
@@ -65,7 +70,7 @@ jobs:
 
   e2e:
     name: End-to-end (moto)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       moto:
         # Pinned: an in-memory S3 fake that accepts any credentials and
@@ -80,16 +85,18 @@ jobs:
       LAKESCAN_E2E_ENDPOINT: http://localhost:5000
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry and target directory
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Wait for moto
-        run: curl --silent --output /dev/null --retry 30 --retry-delay 1 --retry-connrefused "$LAKESCAN_E2E_ENDPOINT"
+        run: curl --silent --output /dev/null --retry 30 --retry-delay 1 --retry-all-errors "$LAKESCAN_E2E_ENDPOINT"
 
       - name: Seed the demo bucket
         run: cargo run --example seed_local -- "$LAKESCAN_E2E_ENDPOINT"

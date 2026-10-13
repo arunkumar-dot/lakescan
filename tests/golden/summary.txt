@@ -7,10 +7,10 @@ VERDICT
   worst severity: high
 
 INVENTORY
-  objects:     8
-  total bytes: 2147492081 (2.0 GiB)
+  objects:     9
+  total bytes: 2147492481 (2.0 GiB)
   by storage class:
-    STANDARD                 count=5          bytes=2147486208 (2.0 GiB)
+    STANDARD                 count=6          bytes=2147486608 (2.0 GiB)
     REDUCED_REDUNDANCY       count=1          bytes=4096 (4.0 KiB)
     GLACIER                  count=1          bytes=1000 (1000 B)
     FUTURE_TIER              count=1          bytes=777 (777 B)
@@ -18,6 +18,7 @@ INVENTORY
 FINDINGS
   sensitive-key - Key looks like a credential or secret file
     high: 1 (512 B)
+    suppressed: 1 (400 B)
   reduced-redundancy - Object uses the deprecated REDUCED_REDUNDANCY storage class
     medium: 1 (4.0 KiB)
   stale-standard - Large STANDARD object has gone unmodified for a long time
@@ -28,6 +29,12 @@ FINDINGS
     info: 1 (0 B)
   unknown-storage-class - Object reports a storage class this build of LakeScan does not recognize
     info: 1 (777 B)
+
+SUPPRESSIONS
+  expired:
+    zero-byte-object  prefix=tmp/  expires=2023-10-01  reason: Scratch space for the nightly job
+  unused:
+    reduced-redundancy  key=backups/2019.tar  reason: Legacy archive, migration tracked in OPS-142
 
 SAMPLES
   [sensitive-key]
@@ -50,20 +57,22 @@ LARGEST OBJECTS
   cold/thumbnail.jpg  size=1000 (1000 B) class=GLACIER modified=2023-11-14T22:13:20Z
   unknown/object.dat  size=777 (777 B) class=FUTURE_TIER modified=2023-11-14T22:13:20Z
   id_rsa  size=512 (512 B) class=STANDARD modified=2023-11-14T22:13:20Z
+  docs/examples/id_rsa  size=400 (400 B) class=STANDARD modified=2023-11-14T22:13:20Z
   folder-marker/  size=0 (0 B) class=STANDARD modified=2023-11-14T22:13:20Z
   placeholder/empty.txt  size=0 (0 B) class=STANDARD modified=2023-11-14T22:13:20Z
 
 SIZE HISTOGRAM
   [0, 1)                   count=2          bytes=0 (0 B)
+  [256, 512)               count=1          bytes=400 (400 B)
   [512, 1024)              count=3          bytes=2289 (2.2 KiB)
   [2048, 4096)             count=1          bytes=2048 (2.0 KiB)
   [4096, 8192)             count=1          bytes=4096 (4.0 KiB)
   [2147483648, 4294967296) count=1          bytes=2147483648 (2.0 GiB)
 
 AGE HISTOGRAM
-  [0d, 1d)                 count=7          bytes=8433 (8.2 KiB)
+  [0d, 1d)                 count=8          bytes=8833 (8.6 KiB)
   [180d, 365d)             count=1          bytes=2147483648 (2.0 GiB)
 
 DISTINCT CONTENT
-  ~8 distinct (etag, size) values across 8 objects; at least ~0 duplicates
-  (re-uploaded or re-encrypted content gets a new ETag and is not detected; ~1% estimator error)
+  ~9 distinct (etag, size) values across 9 objects; no duplicates detected (differences under ~2% are within estimator error)
+  (re-uploaded or re-encrypted content gets a new ETag and is not detected)

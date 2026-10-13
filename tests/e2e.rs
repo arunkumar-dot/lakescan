@@ -66,14 +66,14 @@ struct DemoScan {
     findings: Vec<Value>,
 }
 
-/// Scans the demo bucket with a JSON summary and a findings file.
-fn scan_demo_bucket(test: &str) -> Result<DemoScan, Box<dyn Error>> {
+/// Scans the demo bucket with a JSON summary, a findings file, and any
+/// `extra` arguments.
+fn scan_demo_bucket(test: &str, extra: &[&str]) -> Result<DemoScan, Box<dyn Error>> {
     let path = findings_path(test);
     let path_arg = path.to_str().ok_or("temp path is not UTF-8")?;
-    let output = scan(
-        &format!("s3://{BUCKET}"),
-        &["--format", "json", "--findings", path_arg],
-    )?;
+    let mut args = vec!["--format", "json", "--findings", path_arg];
+    args.extend_from_slice(extra);
+    let output = scan(&format!("s3://{BUCKET}"), &args)?;
     let findings_text = std::fs::read_to_string(&path);
     std::fs::remove_file(&path).ok();
 
@@ -149,7 +149,7 @@ fn the_default_scan_fails_and_accounts_for_every_object_and_finding() -> TestRes
         code,
         summary,
         findings,
-    } = scan_demo_bucket("default")?;
+    } = scan_demo_bucket("default", &[])?;
     assert_eq!(code, Some(1), "default --fail-on high should fail");
 
     let objects = seed_manifest::objects();
@@ -225,7 +225,7 @@ fn the_default_scan_fails_and_accounts_for_every_object_and_finding() -> TestRes
 #[test]
 #[ignore = "needs a seeded S3-compatible server; see this file's header"]
 fn every_hostile_key_round_trips_byte_for_byte() -> TestResult {
-    let DemoScan { findings, .. } = scan_demo_bucket("hostile")?;
+    let DemoScan { findings, .. } = scan_demo_bucket("hostile", &[])?;
 
     let zero_byte_keys: Vec<&str> = findings
         .iter()
@@ -265,5 +265,68 @@ fn a_nonexistent_bucket_exits_two() -> TestResult {
     assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.starts_with("lakescan: usage: "), "stderr: {stderr}");
     assert_eq!(stderr.lines().count(), 1, "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs a seeded S3-compatible server; see this file's header"]
+fn a_config_suppressing_id_rsa_lowers_high_by_one_but_still_fails() -> TestResult {
+    let config_path =
+        std::env::temp_dir().join(format!("lakescan-e2e-{}-suppress.toml", std::process::id()));
+    std::fs::write(
+        &config_path,
+        format!(
+            "version = 1\n\n[[suppress]]\nrule = \"sensitive-key\"\nkey = \"id_rsa\"\n\
+             reason = \"Demo key, not a real secret\"\nbucket = \"{BUCKET}\"\n"
+        ),
+    )?;
+    let config_arg = config_path.to_str().ok_or("temp path is not UTF-8")?;
+    let result = scan_demo_bucket("suppressed", &["--config", config_arg]);
+    std::fs::remove_file(&config_path).ok();
+    let DemoScan {
+        code,
+        summary,
+        findings,
+    } = result?;
+
+    // Two High sensitive-key findings remain (.env.production and
+    // infra/terraform.tfstate), so the default --fail-on high still fails.
+    assert_eq!(code, Some(1));
+
+    let sensitive = array_field(&summary, "findings")?
+        .iter()
+        .find(|entry| str_field(entry, "rule").ok() == Some("sensitive-key"))
+        .ok_or("sensitive-key missing from the summary")?;
+    let counts = sensitive.get("counts").ok_or("no counts")?;
+    assert_eq!(u64_field(counts, "high")?, 2);
+    assert_eq!(u64_field(counts, "medium")?, 2);
+
+    let id_rsa_bytes = seed_manifest::objects()
+        .iter()
+        .find(|object| object.key == "id_rsa")
+        .map(|object| object.body.len())
+        .ok_or("id_rsa missing from the manifest")?;
+    let suppressed = sensitive.get("suppressed").ok_or("no suppressed field")?;
+    assert_eq!(u64_field(suppressed, "count")?, 1);
+    assert_eq!(
+        u64_field(suppressed, "bytes")?,
+        u64::try_from(id_rsa_bytes)?
+    );
+
+    // The one entry was used and has not expired.
+    assert_eq!(
+        summary.get("suppressions"),
+        Some(&serde_json::json!({ "expired": [], "unused": [] }))
+    );
+
+    // Suppressed findings never reach the stream.
+    assert!(
+        findings
+            .iter()
+            .all(|finding| str_field(finding, "key").ok() != Some("id_rsa")),
+        "id_rsa was suppressed but still streamed"
+    );
+    // 12 findings in the demo bucket, minus the suppressed one.
+    assert_eq!(findings.len(), 11);
     Ok(())
 }

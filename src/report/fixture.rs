@@ -8,6 +8,7 @@ use super::ScanInfo;
 use crate::aggregate::Aggregates;
 use crate::model::{ObjectMeta, StorageClass};
 use crate::rules::{self, EvalContext};
+use crate::suppress::{Config, Date, Outcome, Suppressor};
 
 /// The fixed "now" every fixture object and the fixture [`ScanInfo`] are
 /// built relative to.
@@ -45,6 +46,13 @@ pub(super) fn objects() -> Vec<ObjectMeta> {
             StorageClass::Standard,
         ),
         object("id_rsa", 512, 0, "etag-2", StorageClass::Standard),
+        object(
+            "docs/examples/id_rsa",
+            400,
+            0,
+            "etag-9",
+            StorageClass::Standard,
+        ),
         object(
             "backups/archive.tar",
             4096,
@@ -84,26 +92,70 @@ pub(super) fn objects() -> Vec<ObjectMeta> {
     ]
 }
 
-/// Builds the fixture [`Aggregates`] by observing every fixture object
-/// (and every finding it raises) once.
-pub(super) fn aggregates() -> Aggregates {
+/// The fixture suppression config: one entry that suppresses
+/// `docs/examples/id_rsa`, one that expired before [`now`] (2023-11-14),
+/// and one that matches nothing.
+const CONFIG: &str = r#"
+version = 1
+
+[[suppress]]
+rule = "sensitive-key"
+key = "docs/examples/id_rsa"
+reason = "Public example key used in our docs"
+expires = 2024-06-30
+
+[[suppress]]
+rule = "zero-byte-object"
+prefix = "tmp/"
+reason = "Scratch space for the nightly job"
+expires = 2023-10-01
+
+[[suppress]]
+rule = "reduced-redundancy"
+key = "backups/2019.tar"
+reason = "Legacy archive, migration tracked in OPS-142"
+"#;
+
+/// Runs the fixture objects through rules, the fixture suppressions, and
+/// aggregation, exactly as the driver does.
+fn run() -> (Aggregates, Outcome) {
     let ctx = EvalContext { now: now() };
     let mut aggregates = Aggregates::new(now());
+    // The fixture config is a constant, checked by the golden test; an
+    // invalid one would show up there as a missing suppression.
+    let config = Config::parse(CONFIG, "fixture.toml").unwrap_or_default();
+    let mut suppressor = Suppressor::new(config, &scan_info_bucket(), Date::utc_of(now()));
     for object in &objects() {
         aggregates.observe_object(object);
         for finding in rules::evaluate(object, &ctx) {
-            aggregates.observe_finding(finding);
+            if suppressor.suppresses(&finding) {
+                aggregates.observe_suppressed(finding);
+            } else {
+                aggregates.observe_finding(finding);
+            }
         }
     }
-    aggregates
+    (aggregates, suppressor.finish())
 }
 
-/// The fixed [`ScanInfo`] every fixture summary is rendered with.
+fn scan_info_bucket() -> String {
+    "example-bucket".to_owned()
+}
+
+/// Builds the fixture [`Aggregates`] by observing every fixture object
+/// (and every finding it raises, suppressed or not) once.
+pub(super) fn aggregates() -> Aggregates {
+    run().0
+}
+
+/// The fixed [`ScanInfo`] every fixture summary is rendered with,
+/// including the fixture config's expired and unused entries.
 pub(super) fn scan_info() -> ScanInfo {
     ScanInfo {
-        bucket: "example-bucket".to_owned(),
+        bucket: scan_info_bucket(),
         prefix: Some("logs/".to_owned()),
         started_at: now(),
         elapsed: Duration::from_millis(1234),
+        suppressions: run().1,
     }
 }

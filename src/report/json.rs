@@ -9,9 +9,10 @@ use serde::Serialize;
 
 use super::rfc3339::format_rfc3339;
 use super::{TOOL_NAME, TOOL_VERSION};
-use crate::aggregate::{Aggregates, Sample};
+use crate::aggregate::{Aggregates, CountBytes, Sample};
 use crate::error::LakeScanError;
 use crate::model::{RuleId, Severity};
+use crate::suppress::{Entry, Outcome, Pattern};
 
 #[derive(Serialize)]
 struct ToolSection {
@@ -100,12 +101,80 @@ impl SeverityTotals {
     }
 }
 
+/// A plain `{count, bytes}` pair.
+#[derive(Serialize)]
+struct Totals {
+    count: u64,
+    bytes: u64,
+}
+
+impl From<CountBytes> for Totals {
+    fn from(cell: CountBytes) -> Self {
+        Self {
+            count: cell.count,
+            bytes: cell.bytes,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct FindingSummary {
     rule: &'static str,
     title: &'static str,
     counts: SeverityTotals,
     bytes: SeverityTotals,
+    suppressed: Totals,
+}
+
+/// One `--config` entry: exactly one of `key` or `prefix` is present.
+#[derive(Serialize)]
+struct SuppressionEntry<'a> {
+    rule: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix: Option<&'a str>,
+    reason: &'a str,
+    expires: Option<String>,
+}
+
+impl<'a> SuppressionEntry<'a> {
+    fn from_entry(entry: &'a Entry) -> Self {
+        let (key, prefix) = match &entry.pattern {
+            Pattern::Key(key) => (Some(key.as_str()), None),
+            Pattern::Prefix(prefix) => (None, Some(prefix.as_str())),
+        };
+        Self {
+            rule: entry.rule.code(),
+            key,
+            prefix,
+            reason: &entry.reason,
+            expires: entry.expires.map(|date| date.to_string()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SuppressionsSection<'a> {
+    expired: Vec<SuppressionEntry<'a>>,
+    unused: Vec<SuppressionEntry<'a>>,
+}
+
+impl<'a> SuppressionsSection<'a> {
+    fn from_outcome(outcome: &'a Outcome) -> Self {
+        Self {
+            expired: outcome
+                .expired
+                .iter()
+                .map(SuppressionEntry::from_entry)
+                .collect(),
+            unused: outcome
+                .unused
+                .iter()
+                .map(SuppressionEntry::from_entry)
+                .collect(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -151,6 +220,7 @@ struct AgeBucket {
 struct DistinctContentSection {
     estimate: f64,
     duplicate_lower_bound: f64,
+    duplicates_significant: bool,
 }
 
 /// The `samples` section: a map from rule code to that rule's samples.
@@ -171,6 +241,7 @@ struct Summary<'a> {
     verdict: VerdictSection,
     inventory: InventorySection<'a>,
     findings: Vec<FindingSummary>,
+    suppressions: SuppressionsSection<'a>,
     samples: SamplesSection<'a>,
     largest_objects: Vec<SampleEntry<'a>>,
     size_histogram: Vec<SizeBucket>,
@@ -216,7 +287,8 @@ fn findings_section(aggregates: &Aggregates) -> Vec<FindingSummary> {
         .into_iter()
         .filter_map(|rule| {
             let counts = SeverityTotals::counts(aggregates, rule);
-            if counts.is_all_zero() {
+            let suppressed = aggregates.suppressed(rule);
+            if counts.is_all_zero() && suppressed.count == 0 {
                 return None;
             }
             Some(FindingSummary {
@@ -224,6 +296,7 @@ fn findings_section(aggregates: &Aggregates) -> Vec<FindingSummary> {
                 title: rule.title(),
                 counts,
                 bytes: SeverityTotals::bytes(aggregates, rule),
+                suppressed: suppressed.into(),
             })
         })
         .collect()
@@ -298,6 +371,7 @@ fn build<'a>(info: &'a super::ScanInfo, aggregates: &'a Aggregates) -> Summary<'
         },
         inventory: inventory_section(aggregates),
         findings: findings_section(aggregates),
+        suppressions: SuppressionsSection::from_outcome(&info.suppressions),
         samples: samples_section(aggregates),
         largest_objects: aggregates
             .largest_objects()
@@ -309,6 +383,7 @@ fn build<'a>(info: &'a super::ScanInfo, aggregates: &'a Aggregates) -> Summary<'
         distinct_content: DistinctContentSection {
             estimate: aggregates.distinct_content_estimate(),
             duplicate_lower_bound: aggregates.duplicate_lower_bound(),
+            duplicates_significant: aggregates.duplicates_significant(),
         },
     }
 }
@@ -366,7 +441,7 @@ mod tests {
 
         assert_eq!(
             value.get("inventory").and_then(|i| i.get("object_count")),
-            Some(&Value::from(8))
+            Some(&Value::from(9))
         );
         assert_eq!(
             value
@@ -418,6 +493,99 @@ mod tests {
         assert_eq!(
             Some(&Value::from(known_bytes + unrecognized_bytes)),
             inventory.get("total_bytes")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_findings_entry_carries_its_suppressed_totals() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let value = render()?;
+        let findings = value
+            .get("findings")
+            .and_then(Value::as_array)
+            .ok_or("no findings array")?;
+        for entry in findings {
+            let suppressed = entry.get("suppressed").ok_or("no suppressed field")?;
+            let expected = if entry.get("rule") == Some(&Value::from("sensitive-key")) {
+                serde_json::json!({ "count": 1, "bytes": 400 })
+            } else {
+                serde_json::json!({ "count": 0, "bytes": 0 })
+            };
+            assert_eq!(suppressed, &expected, "{entry}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn suppressions_lists_expired_and_unused_entries() -> Result<(), Box<dyn std::error::Error>> {
+        let value = render()?;
+        assert_eq!(
+            value.get("suppressions"),
+            Some(&serde_json::json!({
+                "expired": [{
+                    "rule": "zero-byte-object",
+                    "prefix": "tmp/",
+                    "reason": "Scratch space for the nightly job",
+                    "expires": "2023-10-01"
+                }],
+                "unused": [{
+                    "rule": "reduced-redundancy",
+                    "key": "backups/2019.tar",
+                    "reason": "Legacy archive, migration tracked in OPS-142",
+                    "expires": null
+                }]
+            }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rule_whose_findings_were_all_suppressed_is_still_listed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = fixture::now();
+        let object = crate::model::ObjectMeta {
+            key: "id_rsa".to_owned(),
+            size: 64,
+            last_modified: now,
+            etag: "etag".to_owned(),
+            storage_class: crate::model::StorageClass::Standard,
+        };
+        let mut aggregates = crate::aggregate::Aggregates::new(now);
+        aggregates.observe_object(&object);
+        let ctx = crate::rules::EvalContext { now };
+        for finding in crate::rules::evaluate(&object, &ctx) {
+            aggregates.observe_suppressed(finding);
+        }
+
+        let mut buf = Vec::new();
+        write(&mut buf, &fixture::scan_info(), &aggregates)?;
+        let value: Value = serde_json::from_slice(&buf)?;
+
+        assert_eq!(
+            value.get("verdict").and_then(|v| v.get("worst_severity")),
+            Some(&Value::Null)
+        );
+        let findings = value.get("findings").and_then(Value::as_array);
+        let entry = findings.and_then(|f| f.first()).ok_or("rule not listed")?;
+        assert_eq!(findings.map(Vec::len), Some(1));
+        assert_eq!(entry.get("rule"), Some(&Value::from("sensitive-key")));
+        assert_eq!(entry.pointer("/counts/high"), Some(&Value::from(0)));
+        assert_eq!(
+            entry.get("suppressed"),
+            Some(&serde_json::json!({ "count": 1, "bytes": 64 }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_content_reports_whether_duplicates_are_significant()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = render()?;
+        // Every fixture object has its own etag: nothing significant.
+        assert_eq!(
+            value.pointer("/distinct_content/duplicates_significant"),
+            Some(&Value::Bool(false))
         );
         Ok(())
     }

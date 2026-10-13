@@ -73,6 +73,16 @@ pub enum ExitCode {
 }
 
 impl ExitCode {
+    /// Every exit code, in ascending numeric order.
+    pub const ALL: [Self; 6] = [
+        Self::Ok,
+        Self::FindingsExceedThreshold,
+        Self::Usage,
+        Self::Auth,
+        Self::Transport,
+        Self::Report,
+    ];
+
     /// Returns the integer this code hands back to the operating system.
     #[must_use]
     pub fn as_i32(self) -> i32 {
@@ -131,17 +141,28 @@ mod tests {
 
     #[test]
     fn every_discriminant_fits_in_a_process_status_byte() {
-        const ALL: [ExitCode; 6] = [
-            ExitCode::Ok,
-            ExitCode::FindingsExceedThreshold,
-            ExitCode::Usage,
-            ExitCode::Auth,
-            ExitCode::Transport,
-            ExitCode::Report,
-        ];
-
-        for code in ALL {
+        for code in ExitCode::ALL {
             assert!(u8::try_from(code.as_i32()).is_ok());
+        }
+    }
+
+    /// `ALL` lists every variant once, in ascending order. The exhaustive
+    /// `match` makes adding a variant a compile error here until it is
+    /// given a position, and the assertion then requires it in `ALL`.
+    #[test]
+    fn all_lists_every_variant_once_in_order() {
+        fn position(code: ExitCode) -> usize {
+            match code {
+                ExitCode::Ok => 0,
+                ExitCode::FindingsExceedThreshold => 1,
+                ExitCode::Usage => 2,
+                ExitCode::Auth => 3,
+                ExitCode::Transport => 4,
+                ExitCode::Report => 5,
+            }
+        }
+        for (index, code) in ExitCode::ALL.into_iter().enumerate() {
+            assert_eq!(position(code), index, "{code:?}");
         }
     }
 }
