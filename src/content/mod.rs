@@ -29,8 +29,11 @@
 //! most [`PAGE_CAP`], 8 MiB): [`memory_bound`] is the larger of the two.
 //! On top of that: the 64 KiB tail read; page headers (at most 1 MiB
 //! each); one decompressed page, at most 8 MiB, because every header is
-//! checked against the page cap before `parquet` allocates for it; a
-//! dictionary's value slots, at most 1,048,576 of them (~32 MiB); and each
+//! checked against the page cap before `parquet` allocates for it (for
+//! GZIP and BROTLI, which `LakeScan` decompresses itself, the dictionary
+//! and data page are both held decompressed, at most 16 MiB, plus a
+//! Brotli window of at most 16 MiB); a dictionary's value slots, at most
+//! 1,048,576 of them (~32 MiB); and each
 //! column's sample, at most 3 row groups × 2,000 values × 257 bytes
 //! (~1.5 MB). None of it depends on what a file merely declares, and
 //! nothing here grows with the bucket.
@@ -107,6 +110,9 @@ pub struct FileStats {
     pub skipped_page_too_large: u64,
     /// Columns whose pages could not be decoded.
     pub skipped_unreadable: u64,
+    /// Columns compressed with a codec `LakeScan` cannot decode safely
+    /// (LZO).
+    pub skipped_unsupported_codec: u64,
     /// Bytes returned by every read of this file.
     pub bytes_read: u64,
     /// `GetObject` requests made for this file.
@@ -175,19 +181,23 @@ pub async fn scan_file<R: ObjectReader>(
                 session
                     .scan(&metadata, &opened)
                     .await
-                    .map(|columns| (whole, columns))
+                    .map(|scanned| (whole, scanned))
             }
             Err(reason) => Err(reason),
         }
     };
     match result {
-        Ok((whole, columns)) => FileScan {
-            outcome: if whole {
+        Ok((whole, scanned)) => FileScan {
+            // Findings from column names alone (dates of birth) stand even
+            // when no value could be read.
+            outcome: if scanned.nothing_examined {
+                FileOutcome::NotScanned(NotScannedReason::NoColumnExamined)
+            } else if whole {
                 FileOutcome::ScannedWhole
             } else {
                 FileOutcome::ScannedPartially
             },
-            columns,
+            columns: scanned.findings,
             stats,
         },
         Err(reason) => FileScan {

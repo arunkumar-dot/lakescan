@@ -449,16 +449,21 @@ pub enum NotScannedReason {
     Encrypted,
     /// The footer is larger than the footer cap.
     FooterTooLarge,
+    /// The file has columns whose values could be read, but every one of
+    /// them was skipped (page too large, unreadable, unsupported codec), so
+    /// no value was examined.
+    NoColumnExamined,
 }
 
 impl NotScannedReason {
     /// Every reason, in declaration order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::NotParquet,
         Self::Unreadable,
         Self::AccessDenied,
         Self::Encrypted,
         Self::FooterTooLarge,
+        Self::NoColumnExamined,
     ];
 
     /// The stable code, e.g. `"not-parquet"`. **Frozen contract**.
@@ -470,6 +475,7 @@ impl NotScannedReason {
             Self::AccessDenied => "access-denied",
             Self::Encrypted => "encrypted",
             Self::FooterTooLarge => "footer-too-large",
+            Self::NoColumnExamined => "no-column-examined",
         }
     }
 
@@ -482,6 +488,7 @@ impl NotScannedReason {
             Self::AccessDenied => 2,
             Self::Encrypted => 3,
             Self::FooterTooLarge => 4,
+            Self::NoColumnExamined => 5,
         }
     }
 }
@@ -701,6 +708,10 @@ mod tests {
         assert_eq!(NotScannedReason::AccessDenied.code(), "access-denied");
         assert_eq!(NotScannedReason::Encrypted.code(), "encrypted");
         assert_eq!(NotScannedReason::FooterTooLarge.code(), "footer-too-large");
+        assert_eq!(
+            NotScannedReason::NoColumnExamined.code(),
+            "no-column-examined"
+        );
         assert_eq!(Evidence::ColumnName.code(), "column-name");
         assert_eq!(
             Evidence::Values {

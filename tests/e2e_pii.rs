@@ -29,7 +29,17 @@ type TestResult = Result<(), Box<dyn Error>>;
 /// `(key, rule, column, confidence)` of one finding.
 type Found = (String, String, String, String);
 
-const WRITERS: [&str; 4] = ["pyarrow", "polars", "duckdb", "spark"];
+/// Every `customers.parquet` under `lake/`: four writers at their default
+/// codecs, then GZIP (pyarrow, Spark) and BROTLI (pyarrow).
+const WRITERS: [&str; 7] = [
+    "pyarrow",
+    "polars",
+    "duckdb",
+    "spark",
+    "gzip/pyarrow",
+    "gzip/spark",
+    "brotli/pyarrow",
+];
 
 /// What every writer's `customers.parquet` truly holds, with the
 /// confidence expected: `(column, rule, confidence)`.
@@ -161,10 +171,15 @@ fn every_writer_s_pii_is_found_at_the_expected_confidence() -> TestResult {
         run.stderr
     );
     assert_eq!(pii_found(&run), expected_lake());
-    assert_eq!(content_u64(&run, "files_eligible")?, 5);
-    assert_eq!(content_u64(&run, "scanned_whole")?, 5);
-    // One repeated column (tags) per customers file.
-    assert_eq!(content_u64(&run, "columns_skipped/repeated")?, 4);
+    assert_eq!(content_u64(&run, "files_eligible")?, 8);
+    assert_eq!(content_u64(&run, "scanned_whole")?, 8);
+    // One repeated column (tags) per customers file, and nothing else
+    // skipped but the one double (amount) in each.
+    assert_eq!(content_u64(&run, "columns_skipped/repeated")?, 7);
+    assert_eq!(content_u64(&run, "columns_skipped/unsupported_type")?, 8);
+    for reason in ["page_too_large", "unreadable", "unsupported_codec"] {
+        assert_eq!(content_u64(&run, &format!("columns_skipped/{reason}"))?, 0);
+    }
     // Names and dates of birth rest on the column name alone, with no
     // counts; everything else on values.
     for finding in run
@@ -211,7 +226,7 @@ fn partial_reads_find_the_same_and_read_fewer_bytes() -> TestResult {
     let whole = run("whole", "lake/", &["--pii"])?;
     let partial = run("partial", "lake/", &["--pii", "--pii-whole-file-max", "0"])?;
     assert_eq!(pii_found(&partial), expected_lake());
-    assert_eq!(content_u64(&partial, "scanned_partially")?, 5);
+    assert_eq!(content_u64(&partial, "scanned_partially")?, 8);
     assert_eq!(content_u64(&partial, "scanned_whole")?, 0);
     let (whole_bytes, partial_bytes) = (
         content_u64(&whole, "bytes_read")?,
@@ -267,6 +282,70 @@ fn unreadable_files_are_reported_and_exit_six_when_nothing_was_scanned() -> Test
 
 #[test]
 #[ignore = "needs a seeded S3-compatible server; see this file's header"]
+fn gzip_and_brotli_files_are_decoded_and_their_pii_found() -> TestResult {
+    for (prefix, writers) in [
+        ("lake/gzip/", &["gzip/pyarrow", "gzip/spark"][..]),
+        ("lake/brotli/", &["brotli/pyarrow"][..]),
+    ] {
+        for (test, extra) in [
+            ("whole", &["--pii"][..]),
+            ("partial", &["--pii", "--pii-whole-file-max", "0"][..]),
+        ] {
+            let run = run(&format!("codec-{test}"), prefix, extra)?;
+            assert_eq!(run.code, Some(1), "{prefix} {test}; stderr: {}", run.stderr);
+            let expected: BTreeSet<Found> = expected_lake()
+                .into_iter()
+                .filter(|(key, ..)| {
+                    writers
+                        .iter()
+                        .any(|w| key == &format!("lake/{w}/customers.parquet"))
+                })
+                .collect();
+            assert_eq!(expected.len(), CUSTOMERS.len() * writers.len());
+            assert_eq!(pii_found(&run), expected, "{prefix} {test}");
+            assert_eq!(content_u64(&run, "columns_skipped/unreadable")?, 0);
+            assert_eq!(content_u64(&run, "not_scanned/no-column-examined")?, 0);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs a seeded S3-compatible server; see this file's header"]
+fn a_lake_of_files_with_every_column_skipped_exits_six() -> TestResult {
+    // Parquet that opens, but whose one string column has a data page over
+    // the page cap: no value was examined, so the file was not scanned.
+    for extra in [&["--pii"][..], &["--pii", "--pii-whole-file-max", "0"][..]] {
+        let run = run("skipped", "skipped/", extra)?;
+        assert_eq!(run.code, Some(6), "stderr: {}", run.stderr);
+        assert_eq!(content_u64(&run, "not_scanned/no-column-examined")?, 1);
+        assert_eq!(content_u64(&run, "columns_skipped/page_too_large")?, 1);
+        assert_eq!(content_u64(&run, "columns_examined")?, 0);
+        assert!(
+            run.stderr.contains(
+                "no Parquet file could be content-scanned (1 eligible: no-column-examined=1)"
+            ),
+            "{}",
+            run.stderr
+        );
+        let reasons: Vec<(String, String)> = run
+            .findings
+            .iter()
+            .map(|f| (text(f, "rule"), text(f, "reason")))
+            .collect();
+        assert_eq!(
+            reasons,
+            [(
+                "content-not-scanned".to_owned(),
+                "no-column-examined".to_owned()
+            )]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs a seeded S3-compatible server; see this file's header"]
 fn a_whole_bucket_scan_reports_both_and_does_not_exit_six() -> TestResult {
     let run = run("all", "", &["--pii"])?;
     assert_eq!(run.code, Some(1), "stderr: {}", run.stderr);
@@ -305,7 +384,7 @@ fn a_column_suppression_covers_exactly_that_column() -> TestResult {
         .ok_or("pii-email missing from the summary")?;
     assert_eq!(
         email.pointer("/suppressed/count").and_then(Value::as_u64),
-        Some(4)
+        Some(u64::try_from(WRITERS.len())?)
     );
     Ok(())
 }

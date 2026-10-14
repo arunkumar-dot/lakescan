@@ -11,13 +11,19 @@ synthetic: every name, email, number and address is generated.
 | `polars/customers.parquet` | polars 1.44.2 | 12,000 | 3 |
 | `duckdb/customers.parquet` | duckdb 1.5.6 | 12,000 | 3 |
 | `spark/customers.parquet` | Spark 4.2.0 (parquet-java 1.17.0) | 12,000 | 1 |
+| `gzip/pyarrow/customers.parquet` | pyarrow, GZIP | 12,000 | 3 |
+| `gzip/spark/customers.parquet` | Spark, GZIP | 12,000 | 1 |
+| `brotli/pyarrow/customers.parquet` | pyarrow, BROTLI | 12,000 | 3 |
 | `escalation.parquet` | pyarrow | 8,000 | 4 |
 | `bad/truncated.parquet` | the first 60% of `pyarrow/customers.parquet` | | |
 | `bad/not_parquet.parquet` | a CSV file named `.parquet` | | |
+| `skipped/too_large.parquet` | pyarrow, ZSTD, no dictionary | 16,000 | 1 |
 
 Every writer runs at its defaults, except that the row-group size is set to
 4,000 rows for pyarrow, polars and DuckDB, so that partial reads and
 escalation have several row groups to work with. Spark writes one row group.
+The `gzip/` and `brotli/` files hold the same rows as the others, with only
+the codec changed (Athena writes GZIP Parquet by default for Hive tables).
 
 ## Ground truth
 
@@ -59,6 +65,11 @@ Expected: `pii-email`, confirmed, found only by escalating past row group
 `bad/truncated.parquet` is `content-not-scanned` with reason `unreadable`,
 and `bad/not_parquet.parquet` with reason `not-parquet`.
 
+`skipped/too_large.parquet`: `email` holds ~600-byte emails in one 9.5 MB
+data page (over LakeScan's 8 MiB page cap; ZSTD keeps the file at ~30 KB),
+and `amount` is a double. Expected: `email` skipped as page-too-large, so
+`content-not-scanned` with reason `no-column-examined`.
+
 ## Regenerating
 
 With Python 3 and Docker:
@@ -73,6 +84,11 @@ docker run --rm -v "$PWD:/data" \
   /opt/spark/bin/spark-submit --driver-memory 2g /data/spark_write.py /data
 rm -rf _spark_src .venv
 ```
+
+`spark_write.py` writes `spark/customers.parquet` and
+`gzip/spark/customers.parquet`. Spark's output bytes differ from run to run
+(the values do not), so the committed Spark files need not be rewritten
+when only another fixture changes.
 
 The Spark image is `apache/spark:4.2.0-python3`, pinned by digest. The
 generator is seeded, so the values are reproducible with the pinned

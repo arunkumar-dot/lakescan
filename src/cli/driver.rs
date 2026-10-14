@@ -763,6 +763,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn files_whose_every_column_was_skipped_exit_six()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // One email data page over the page cap, and a double column: the
+        // file is Parquet and opens, but no value could be examined.
+        let rows = 300_000;
+        let too_large = parquet_file(
+            &[
+                ("email", Values::Text(emails(rows))),
+                ("amount", Values::Double(vec![1.0; rows])),
+            ],
+            Layout {
+                dictionary: false,
+                page_bytes: usize::MAX,
+                ..Layout::default()
+            },
+        )?;
+        let run = content_run(
+            &[("big.parquet", too_large)],
+            Config::default(),
+            Format::Text,
+            64 * 1024 * 1024,
+        )
+        .await?;
+        assert_eq!(run.code, ExitCode::ContentNotScanned);
+        assert_eq!(
+            run.errors,
+            "lakescan: no Parquet file could be content-scanned \
+             (1 eligible: no-column-examined=1)\n"
+        );
+        assert!(run.summary.contains("page-too-large=1"), "{}", run.summary);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn one_scanned_file_is_enough_to_avoid_exit_six() -> Result<(), Box<dyn std::error::Error>>
     {
         let run = content_run(

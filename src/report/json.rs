@@ -230,6 +230,7 @@ struct ColumnsSkipped {
     unsupported_type: u64,
     page_too_large: u64,
     unreadable: u64,
+    unsupported_codec: u64,
 }
 
 impl ContentSection {
@@ -248,6 +249,7 @@ impl ContentSection {
                 unsupported_type: summary.skipped_unsupported_type,
                 page_too_large: summary.skipped_page_too_large,
                 unreadable: summary.skipped_unreadable,
+                unsupported_codec: summary.skipped_unsupported_codec,
             },
             bytes_read: summary.bytes_read,
             get_requests: summary.get_requests,

@@ -1626,7 +1626,9 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
+ "brotli",
  "clap",
+ "flate2",
  "parquet",
  "regex",
  "serde",

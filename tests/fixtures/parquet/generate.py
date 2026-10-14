@@ -10,10 +10,16 @@ Writes, at each writer's defaults except for row-group size:
 - {pyarrow,polars,duckdb}/customers.parquet: 12,000 messy rows in row
   groups of about 4,000; _spark_src/customers.parquet for spark_write.py,
   which writes spark/customers.parquet (one row group);
+- gzip/pyarrow/customers.parquet and brotli/pyarrow/customers.parquet: the
+  same rows, written by pyarrow with GZIP and BROTLI (spark_write.py writes
+  gzip/spark/customers.parquet);
 - escalation.parquet (pyarrow): 4 row groups of 2,000 rows whose
   contact_email is only nulls and junk in row group 0, and emails after;
 - bad/truncated.parquet: the first 60% of pyarrow/customers.parquet;
-- bad/not_parquet.parquet: a CSV file with a .parquet name.
+- bad/not_parquet.parquet: a CSV file with a .parquet name;
+- skipped/too_large.parquet (pyarrow): one string column of emails whose
+  only data page is over LakeScan's 8 MiB page cap (no dictionary, ZSTD,
+  so the file stays small), and one double column.
 
 Ground truth per column is in README.md next to this script.
 """
@@ -151,6 +157,15 @@ def escalation(rng):
     })
 
 
+def too_large():
+    """16,000 emails of about 600 bytes: one ~9.6 MB data page."""
+    n = 16_000
+    return pa.table({
+        "email": [f"{'customer.' * 64}{i}@example.org" for i in range(n)],
+        "amount": np.linspace(0.0, 1.0, n),
+    })
+
+
 def main():
     out = Path(sys.argv[1]).resolve()
     rng = np.random.default_rng(20261014)
@@ -169,6 +184,11 @@ def main():
             con.execute(f"COPY t TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE {ROW_GROUP})")
             con.close()
         print(f"{writer:8s} {path.stat().st_size / 1e3:8.1f} KB  {pq.ParquetFile(path).metadata.num_row_groups} row groups")
+    for codec in ("gzip", "brotli"):
+        path = out / codec / "pyarrow" / "customers.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, path, row_group_size=ROW_GROUP, compression=codec)
+        print(f"{codec:8s} {path.stat().st_size / 1e3:8.1f} KB")
     (out / "_spark_src").mkdir(exist_ok=True)
     pq.write_table(table, out / "_spark_src" / "customers.parquet")
 
@@ -179,6 +199,13 @@ def main():
     whole = (out / "pyarrow" / "customers.parquet").read_bytes()
     (bad / "truncated.parquet").write_bytes(whole[: int(len(whole) * 0.6)])
     (bad / "not_parquet.parquet").write_bytes(b"customer_id,email\n1,someone@example.org\n")
+    skipped = out / "skipped"
+    skipped.mkdir(exist_ok=True)
+    pq.write_table(too_large(), skipped / "too_large.parquet", use_dictionary=False,
+                   compression="zstd", data_page_size=64 * 1024 * 1024)
+    meta = pq.ParquetFile(skipped / "too_large.parquet").metadata.row_group(0).column(0)
+    print(f"too_large: email chunk {meta.total_uncompressed_size / 1e6:.1f} MB uncompressed, "
+          f"{meta.total_compressed_size / 1e3:.1f} KB stored")
     print("versions:", {"pyarrow": pa.__version__, "polars": pl.__version__, "duckdb": duckdb.__version__,
                         "numpy": np.__version__, "python": sys.version.split()[0]})
 

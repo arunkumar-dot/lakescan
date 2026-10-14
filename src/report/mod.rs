@@ -91,18 +91,21 @@
 //!     "scanned_whole": integer,    // read in one GetObject
 //!     "scanned_partially": integer,// footer + sampled pages
 //!     "not_scanned": {             // one key per NotScannedReason::code(),
-//!       "not-parquet": integer,    // always all five, zero when none
+//!       "not-parquet": integer,    // always all six, zero when none
 //!       "unreadable": integer,
 //!       "access-denied": integer,
 //!       "encrypted": integer,
-//!       "footer-too-large": integer
+//!       "footer-too-large": integer,
+//!       "no-column-examined": integer // Parquet, but every column whose
+//!                                  // values could be read was skipped
 //!     },
 //!     "columns_examined": integer, // candidate columns sampled and classified
 //!     "columns_skipped": {
 //!       "repeated": integer,        // list/map columns, never read
 //!       "unsupported_type": integer,// booleans, floats, decimals, times
 //!       "page_too_large": integer,  // a page over the 8 MiB cap
-//!       "unreadable": integer       // pages that could not be decoded
+//!       "unreadable": integer,      // pages that could not be decoded
+//!       "unsupported_codec": integer // a codec not decoded safely (LZO)
 //!     },
 //!     "bytes_read": integer,       // bytes returned by every GetObject
 //!     "get_requests": integer      // GetObject requests made

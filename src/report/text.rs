@@ -216,12 +216,13 @@ fn write_content<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), L
     wl!(out, "  columns examined:   {}", content.columns_examined)?;
     wl!(
         out,
-        "  columns skipped:    {} (repeated={}, unsupported-type={}, page-too-large={}, unreadable={})",
+        "  columns skipped:    {} (repeated={}, unsupported-type={}, page-too-large={}, unreadable={}, unsupported-codec={})",
         content.columns_skipped(),
         content.skipped_repeated,
         content.skipped_unsupported_type,
         content.skipped_page_too_large,
-        content.skipped_unreadable
+        content.skipped_unreadable,
+        content.skipped_unsupported_codec
     )?;
     wl!(
         out,

@@ -84,7 +84,9 @@
 //! checked before the `parquet` crate allocates anything for the page:
 //! its declared sizes against the 8 MiB page cap, a dictionary's declared
 //! value count, and its codec, so nothing allocated grows with what a file
-//! merely claims. And the release build unwinds on panic rather than
+//! merely claims; GZIP and BROTLI pages, whose `parquet` decoders are not
+//! bounded, are decompressed by `content` itself, never past the declared
+//! size. And the release build unwinds on panic rather than
 //! aborting, so `content` can catch a panic inside the `parquet` parser
 //! with `std::panic::catch_unwind` and turn it into a `content-not-scanned`
 //! finding (reason `unreadable`) for that one file. The panic hook

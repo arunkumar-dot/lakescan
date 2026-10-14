@@ -20,6 +20,12 @@ toml = "1.1.6"
 # Arrow, and only the codecs data lakes use in practice.
 parquet = { version = "=60.0.0", default-features = false, features = ["snap", "zstd", "flate2-zlib-rs", "lz4", "brotli"] }
 regex = "1.13.1"
+# GZIP and BROTLI pages are decompressed by LakeScan itself, bounded by the
+# page's declared size (parquet's own decoders read to the end of the
+# stream). Pinned to exactly the versions and features parquet's codec
+# features already put in the build, so they add no code.
+flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
+brotli = { version = "=9.0.0", default-features = false, features = ["std"] }
 
 [lib]
 name = "lakescan"

@@ -9,11 +9,15 @@
 //! to hand to `parquet` first, and refuses any page over the page cap.
 //!
 //! This reads only the Thrift compact protocol (the format of every Parquet
-//! header) far enough to get four numbers: the page type, the uncompressed
-//! and compressed sizes, and, for a dictionary page, its value count. It
-//! also returns the header's length, so the next page can be located. Every
-//! other field is skipped generically. It decodes no values: that remains
-//! the `parquet` crate's job.
+//! header) far enough to get a few numbers: the page type, the uncompressed
+//! and compressed sizes, for a dictionary page its value count, and for a
+//! v2 data page the length of its (never compressed) levels and whether its
+//! values are compressed. It also returns the header's length, so the next
+//! page can be located. Every other field is skipped generically. It
+//! decodes no values: that remains the `parquet` crate's job.
+//!
+//! [`with_body_len`] re-encodes a header for a body `LakeScan` decompressed
+//! itself (GZIP, BROTLI), so `parquet` can be handed the page uncompressed.
 
 /// What a page header declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +31,12 @@ pub(super) struct PageHeader {
     pub(super) compressed: u64,
     /// A dictionary page's value count; 0 for any other page.
     pub(super) dictionary_values: u64,
+    /// A v2 data page's definition and repetition level bytes, which
+    /// precede its values and are never compressed; 0 for any other page.
+    pub(super) levels: u64,
+    /// Whether the values are compressed: false only for a v2 data page
+    /// that says so.
+    pub(super) values_compressed: bool,
     /// The header's own length in bytes.
     pub(super) len: usize,
 }
@@ -198,6 +208,40 @@ impl Cursor<'_> {
         Ok(())
     }
 
+    /// A `DataPageHeaderV2`'s level byte lengths (fields 5 and 6, summed)
+    /// and `is_compressed` (field 7, default true); the rest skipped.
+    fn v2(&mut self) -> Result<(u64, bool), Stop> {
+        let mut definition = None;
+        let mut repetition = None;
+        let mut compressed = None;
+        let mut last = 0;
+        while let Some((id, kind)) = self.field(last)? {
+            match (id, kind) {
+                (5 | 6, I32) => {
+                    let slot = if id == 5 {
+                        &mut definition
+                    } else {
+                        &mut repetition
+                    };
+                    if slot.is_some() {
+                        return Err(Stop::Invalid);
+                    }
+                    *slot = Some(u64::try_from(self.i32()?).map_err(|_| Stop::Invalid)?);
+                }
+                (7, BOOL_TRUE | BOOL_FALSE) if compressed.is_none() => {
+                    compressed = Some(kind == BOOL_TRUE);
+                }
+                (5..=7, _) => return Err(Stop::Invalid),
+                _ => self.skip_value(kind, 1)?,
+            }
+            last = id;
+        }
+        let (Some(definition), Some(repetition)) = (definition, repetition) else {
+            return Err(Stop::Invalid);
+        };
+        Ok((definition + repetition, compressed.unwrap_or(true)))
+    }
+
     /// A `DictionaryPageHeader`'s `num_values` (field 1); the rest skipped.
     fn dictionary_values(&mut self) -> Result<u64, Stop> {
         let mut values = None;
@@ -231,6 +275,7 @@ fn header(cursor: &mut Cursor<'_>) -> Result<PageHeader, Stop> {
     let mut uncompressed = None;
     let mut compressed = None;
     let mut dictionary_values = None;
+    let mut v2 = None;
     let mut last = 0;
     while let Some((id, field_kind)) = cursor.field(last)? {
         // A required field seen twice, or with the wrong type, is not a
@@ -251,6 +296,12 @@ fn header(cursor: &mut Cursor<'_>) -> Result<PageHeader, Stop> {
                 }
                 dictionary_values = Some(cursor.dictionary_values()?);
             }
+            None if id == 8 && field_kind == STRUCT => {
+                if v2.is_some() {
+                    return Err(Stop::Invalid);
+                }
+                v2 = Some(cursor.v2()?);
+            }
             None => cursor.skip_value(field_kind, 1)?,
         }
         last = id;
@@ -264,30 +315,82 @@ fn header(cursor: &mut Cursor<'_>) -> Result<PageHeader, Stop> {
     if kind == DICTIONARY_PAGE && dictionary_values.is_none() {
         return Err(Stop::Invalid);
     }
+    let (levels, values_compressed) = match v2 {
+        Some(v2) if kind == DATA_PAGE_V2 => v2,
+        None if kind != DATA_PAGE_V2 => (0, true),
+        _ => return Err(Stop::Invalid),
+    };
     Ok(PageHeader {
         kind,
         uncompressed: size(uncompressed)?,
         compressed: size(compressed)?,
         dictionary_values: dictionary_values.unwrap_or(0),
+        levels,
+        values_compressed,
         len: cursor.pos,
     })
 }
 
+/// The page header in `bytes` (one [`read`] accepted, and nothing after
+/// it) re-encoded for a body of `body_len` bytes: `compressed_page_size`
+/// becomes `body_len`, and the CRC (field 4), which covered the compressed
+/// body, is dropped. Every other field is copied byte for byte. `None` if
+/// `bytes` is not one whole header or `body_len` exceeds an `i32`.
+pub(super) fn with_body_len(bytes: &[u8], body_len: usize) -> Option<Vec<u8>> {
+    let body_len = i64::from(i32::try_from(body_len).ok()?);
+    let mut cursor = Cursor { bytes, pos: 0 };
+    let mut out = Vec::with_capacity(bytes.len() + 5);
+    let (mut last_read, mut last_written) = (0, 0);
+    while let Some((id, kind)) = cursor.field(last_read).ok()? {
+        let start = cursor.pos;
+        cursor.skip_value(kind, 1).ok()?;
+        last_read = id;
+        if id == 4 {
+            continue;
+        }
+        if let Some(delta @ 1..=15) = id.checked_sub(last_written) {
+            out.push((u8::try_from(delta).ok()? << 4) | kind);
+        } else {
+            out.push(kind);
+            push_zigzag(&mut out, i64::from(id));
+        }
+        if id == 3 {
+            push_zigzag(&mut out, body_len);
+        } else {
+            out.extend_from_slice(bytes.get(start..cursor.pos)?);
+        }
+        last_written = id;
+    }
+    (cursor.pos == bytes.len()).then_some(())?;
+    out.push(0);
+    Some(out)
+}
+
+/// Appends `value` as a compact-protocol zigzag varint.
+fn push_zigzag(out: &mut Vec<u8>, value: i64) {
+    let mut raw = ((value << 1) ^ (value >> 63)).cast_unsigned();
+    loop {
+        let byte = u8::try_from(raw & 0x7f).unwrap_or(0);
+        raw >>= 7;
+        if raw == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{DATA_PAGE, DICTIONARY_PAGE, PageHeader, Read, read};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        DATA_PAGE, DATA_PAGE_V2, DICTIONARY_PAGE, PageHeader, Read, push_zigzag, read,
+        with_body_len,
+    };
 
     fn zigzag_varint(value: i64, out: &mut Vec<u8>) {
-        let mut raw = u64::try_from((value << 1) ^ (value >> 63)).unwrap_or(0);
-        loop {
-            let byte = u8::try_from(raw & 0x7f).unwrap_or(0);
-            raw >>= 7;
-            if raw == 0 {
-                out.push(byte);
-                return;
-            }
-            out.push(byte | 0x80);
-        }
+        push_zigzag(out, value);
     }
 
     /// A compact-protocol page header: type, sizes, and either a
@@ -324,6 +427,229 @@ pub(crate) mod tests {
         out
     }
 
+    /// A v2 data page header: type 3, sizes, a CRC (field 4), and a
+    /// `DataPageHeaderV2` with level lengths and, if given, `is_compressed`.
+    fn encode_v2(
+        uncompressed: i32,
+        compressed: i32,
+        levels: (i32, i32),
+        is_compressed: Option<bool>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in [DATA_PAGE_V2, uncompressed, compressed, 12345] {
+            out.push(0x15);
+            zigzag_varint(i64::from(value), &mut out);
+        }
+        out.push(0x4c); // delta 4 (field 8), struct
+        for value in [5, 1, 5, 0, levels.0, levels.1] {
+            // num_values, num_nulls, num_rows, encoding, def, rep lengths
+            out.push(0x15);
+            zigzag_varint(i64::from(value), &mut out);
+        }
+        if let Some(flag) = is_compressed {
+            out.push(if flag { 0x11 } else { 0x12 }); // field 7, bool
+        }
+        out.push(0x00);
+        out.push(0x00);
+        out
+    }
+
+    #[test]
+    fn a_v2_header_reports_its_levels_and_compression_flag() {
+        for (flag, expected) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let bytes = encode_v2(100, 60, (7, 3), flag);
+            let Read::Header(header) = read(&bytes) else {
+                unreachable!("not a header: {:?}", read(&bytes));
+            };
+            assert_eq!(header.levels, 10);
+            assert_eq!(header.values_compressed, expected);
+        }
+        // A v2 page without its v2 header, or a v1 page with one, is not
+        // a header `parquet` would decode the same way.
+        let mut v1_with_v2 = encode_v2(100, 60, (0, 0), None);
+        if let Some(kind) = v1_with_v2.get_mut(1) {
+            *kind = 0;
+        }
+        assert_eq!(read(&v1_with_v2), Read::Invalid);
+        let v2_without = [0x15, 0x06, 0x15, 0x04, 0x15, 0x04, 0x00];
+        assert_eq!(read(&v2_without), Read::Invalid);
+    }
+
+    #[test]
+    fn a_rewritten_header_declares_the_new_body_length_and_no_crc() {
+        let bytes = encode_v2(100, 60, (7, 3), Some(true));
+        let rewritten = with_body_len(&bytes, 100);
+        let reread = rewritten.as_deref().map(read);
+        let Some(Read::Header(header)) = reread else {
+            unreachable!("not a header: {reread:?}");
+        };
+        assert_eq!((header.compressed, header.uncompressed), (100, 100));
+        assert_eq!((header.levels, header.values_compressed), (10, true));
+        // Field 4 (the CRC, 12345) is gone: field 3 (100, zigzag 0xc8 0x01)
+        // is followed by field 8, now with a delta of 5.
+        assert_eq!(
+            rewritten.as_deref().and_then(|r| r.get(5..9)),
+            Some(&[0x15, 0xc8, 0x01, 0x5c][..])
+        );
+        // Trailing bytes, or a body over `i32::MAX`, are refused.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(with_body_len(&trailing, 1), None);
+        assert_eq!(with_body_len(&bytes, 1 << 31), None);
+    }
+
+    /// `SplitMix64`: a small deterministic generator, so the fuzz run is
+    /// the same every time.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next() % u64::try_from(n.max(1)).unwrap_or(1)).unwrap_or(0)
+        }
+
+        fn byte(&mut self) -> u8 {
+            u8::try_from(self.next() & 0xff).unwrap_or(0)
+        }
+    }
+
+    /// Every header [`read`] accepts can be rewritten, and reads back the
+    /// same apart from the new body length.
+    fn check(bytes: &[u8]) {
+        if let Read::Header(header) = read(bytes) {
+            assert!(header.len <= bytes.len(), "{bytes:?}");
+            let rewritten = bytes.get(..header.len).and_then(|h| with_body_len(h, 77));
+            let reread = rewritten.as_deref().map(read);
+            let Some(Read::Header(again)) = reread else {
+                unreachable!("{bytes:?} rewrote to {reread:?}");
+            };
+            assert_eq!(
+                again,
+                PageHeader {
+                    compressed: 77,
+                    len: again.len,
+                    ..header
+                },
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fuzzed_headers_never_panic_and_always_return_promptly() {
+        let mut rng = Rng(0x1a4e_5ca9);
+        let seeds = [
+            encode(DATA_PAGE, 1000, 400, None),
+            encode(DICTIONARY_PAGE, 5000, 900, Some(100)),
+            encode_v2(100, 60, (7, 3), Some(false)),
+            encode_v2(i32::MAX, 0, (0, 0), None),
+            // A header with an unknown field of every type, nested.
+            vec![
+                0x15, 0x00, 0x15, 0x04, 0x15, 0x04, 0x18, 0x02, b'h', b'i', 0x19, 0x25, 0x02, 0x04,
+                0x1b, 0x01, 0x55, 0x02, 0x02, 0x11, 0x1c, 0x19, 0x1c, 0x11, 0x00, 0x00, 0x00, 0x00,
+            ],
+        ];
+        // Compact-protocol bytes that matter: stops, field headers of each
+        // type, long-form ids, collection headers, varint continuations.
+        let interesting = [
+            0x00, 0x01, 0x02, 0x0c, 0x0d, 0x0f, 0x15, 0x16, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x2c,
+            0x4c, 0x5c, 0x7f, 0x80, 0xf9, 0xfc, 0xff,
+        ];
+        let started = Instant::now();
+        let mut cases = 0_u32;
+
+        // Random bytes, short and long.
+        for _ in 0..20_000 {
+            let len = if rng.below(10) == 0 {
+                rng.below(4096)
+            } else {
+                rng.below(64)
+            };
+            let bytes: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            check(&bytes);
+            cases += 1;
+        }
+        // Random sequences of interesting bytes: deep nesting, huge
+        // collection sizes, long varints.
+        for _ in 0..20_000 {
+            let len = rng.below(256);
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    let pick = rng.below(interesting.len());
+                    interesting.get(pick).copied().unwrap_or(0)
+                })
+                .collect();
+            check(&bytes);
+            cases += 1;
+        }
+        // Valid headers, mutated: bit flips, byte replacements, insertions,
+        // deletions, truncations and repeated runs, several per case.
+        for _ in 0..60_000 {
+            let mut bytes = seeds
+                .get(rng.below(seeds.len()))
+                .cloned()
+                .unwrap_or_default();
+            for _ in 0..=rng.below(4) {
+                let at = rng.below(bytes.len() + 1);
+                match rng.below(6) {
+                    0 => {
+                        if let Some(byte) = bytes.get_mut(at) {
+                            *byte ^= 1 << rng.below(8);
+                        }
+                    }
+                    1 => {
+                        if let Some(byte) = bytes.get_mut(at) {
+                            *byte = rng.byte();
+                        }
+                    }
+                    2 => bytes.insert(at, rng.byte()),
+                    3 => {
+                        if at < bytes.len() {
+                            bytes.remove(at);
+                        }
+                    }
+                    4 => bytes.truncate(at),
+                    _ => {
+                        let run: Vec<u8> = bytes
+                            .get(at..)
+                            .unwrap_or(&[])
+                            .iter()
+                            .take(8)
+                            .copied()
+                            .collect();
+                        for _ in 0..rng.below(64) {
+                            bytes.splice(at..at, run.iter().copied());
+                        }
+                    }
+                }
+            }
+            check(&bytes);
+            cases += 1;
+        }
+        // The worst inputs for a recursive reader: maximal nesting, and a
+        // list claiming far more elements than there are bytes.
+        check(&vec![0x1c; 100_000]);
+        check(&[0x19, 0xfc, 0xff, 0xff, 0xff, 0x7f]);
+        cases += 2;
+
+        assert_eq!(cases, 100_002);
+        // Generous, so a slow CI machine cannot fail it: in practice the
+        // whole run takes well under a second, because the reader is
+        // linear in its input.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn a_data_page_header_reads_back_with_its_length() {
         let bytes = encode(DATA_PAGE, 1000, 400, None);
@@ -334,6 +660,8 @@ pub(crate) mod tests {
                 uncompressed: 1000,
                 compressed: 400,
                 dictionary_values: 0,
+                levels: 0,
+                values_compressed: true,
                 len: bytes.len(),
             })
         );

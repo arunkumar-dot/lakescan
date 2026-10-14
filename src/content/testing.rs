@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aws_sdk_s3::primitives::{AggregatedBytes, ByteStream};
 use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
 use parquet::errors::ParquetError;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 
@@ -101,6 +101,8 @@ pub(crate) struct Layout {
     pub(crate) page_bytes: usize,
     /// The compression codec.
     pub(crate) compression: parquet::basic::Compression,
+    /// Data page v2 (Parquet 2.0) instead of v1.
+    pub(crate) v2: bool,
 }
 
 impl Default for Layout {
@@ -111,6 +113,7 @@ impl Default for Layout {
             dictionary: true,
             page_bytes: 1024 * 1024,
             compression: parquet::basic::Compression::UNCOMPRESSED,
+            v2: false,
         }
     }
 }
@@ -145,7 +148,12 @@ pub(crate) fn parquet_file(
         .set_dictionary_enabled(layout.dictionary)
         .set_data_page_row_count_limit(usize::MAX)
         .set_data_page_size_limit(layout.page_bytes)
-        .set_compression(layout.compression);
+        .set_compression(layout.compression)
+        .set_writer_version(if layout.v2 {
+            WriterVersion::PARQUET_2_0
+        } else {
+            WriterVersion::PARQUET_1_0
+        });
     if !layout.offset_index {
         props = props
             .set_statistics_enabled(EnabledStatistics::Chunk)

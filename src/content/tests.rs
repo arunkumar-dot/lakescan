@@ -369,7 +369,15 @@ async fn every_writer_fixture_is_classified_by_both_read_paths() -> TestResult {
         .into_iter()
         .map(|(column, pii, confidence)| (column.to_owned(), pii, confidence))
         .collect();
-    for writer in ["pyarrow", "polars", "duckdb", "spark"] {
+    for writer in [
+        "pyarrow",
+        "polars",
+        "duckdb",
+        "spark",
+        "gzip/pyarrow",
+        "gzip/spark",
+        "brotli/pyarrow",
+    ] {
         let body = fixture(&format!("{writer}/customers.parquet"))?;
         let size = u64::try_from(body.len())?;
         let (whole, _) = scan("c.parquet", body.clone(), super::DEFAULT_WHOLE_FILE_MAX).await;
@@ -409,6 +417,10 @@ async fn the_bad_fixtures_are_not_scanned() -> TestResult {
     for (path, reason) in [
         ("bad/truncated.parquet", NotScannedReason::Unreadable),
         ("bad/not_parquet.parquet", NotScannedReason::NotParquet),
+        (
+            "skipped/too_large.parquet",
+            NotScannedReason::NoColumnExamined,
+        ),
     ] {
         for whole_file_max in [0, super::DEFAULT_WHOLE_FILE_MAX] {
             let (scan, _) = scan("b.parquet", fixture(path)?, whole_file_max).await;
@@ -471,10 +483,11 @@ async fn a_page_declaring_a_huge_uncompressed_size_is_never_decoded() -> TestRes
             before,
             "a decode was attempted"
         );
-        assert!(matches!(
+        // Its only column skipped, the file was not scanned.
+        assert_eq!(
             scan.outcome,
-            FileOutcome::ScannedWhole | FileOutcome::ScannedPartially
-        ));
+            FileOutcome::NotScanned(NotScannedReason::NoColumnExamined)
+        );
         assert_eq!(scan.stats.skipped_page_too_large, 1);
         assert_eq!(scan.columns, []);
     }
@@ -505,23 +518,183 @@ async fn a_dictionary_declaring_billions_of_values_is_never_decoded() -> TestRes
     Ok(())
 }
 
-#[tokio::test]
-async fn gzip_and_brotli_pages_are_never_decompressed() -> TestResult {
+fn gzip_and_brotli() -> [parquet::basic::Compression; 2] {
     use parquet::basic::{BrotliLevel, Compression, GzipLevel};
-    for compression in [
+    [
         Compression::GZIP(GzipLevel::default()),
         Compression::BROTLI(BrotliLevel::default()),
-    ] {
+    ]
+}
+
+#[tokio::test]
+async fn gzip_and_brotli_pages_are_decompressed_by_lakescan() -> TestResult {
+    for compression in gzip_and_brotli() {
+        for (dictionary, v2) in [(true, false), (false, false), (true, true), (false, true)] {
+            let layout = Layout {
+                dictionary,
+                compression,
+                v2,
+                ..Layout::default()
+            };
+            let body = parquet_file(&customers(500), layout)?;
+            for whole_file_max in [0, super::DEFAULT_WHOLE_FILE_MAX] {
+                let (scan, _) = scan("z.parquet", body.clone(), whole_file_max).await;
+                let case = format!("{compression:?} dictionary={dictionary} v2={v2}");
+                assert_eq!(verdicts(&scan), expected_customers(), "{case}");
+                assert_eq!(scan.stats.skipped_unreadable, 0, "{case}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `body` with the first page header's declared uncompressed size (field
+/// 2, right after the page type) changed by `delta`, in place: the new
+/// size must encode to as many bytes as the old one.
+fn redeclared(mut body: Vec<u8>, delta: i32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let zigzag = |value: i32| {
+        let mut raw = (i64::from(value) << 1).cast_unsigned();
+        let mut out = Vec::new();
+        loop {
+            let byte = u8::try_from(raw & 0x7f).unwrap_or(0);
+            raw >>= 7;
+            if raw == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    };
+    let (offset, uncompressed, _) = first_page(&body)?;
+    let (old, new) = (zigzag(uncompressed), zigzag(uncompressed + delta));
+    let at = offset + 3;
+    assert_eq!(body.get(offset..at), Some(&[0x15, 0x00, 0x15][..]));
+    assert_eq!(body.get(at..at + old.len()), Some(&old[..]));
+    assert_eq!(old.len(), new.len());
+    for (byte, new) in body.iter_mut().skip(at).zip(new) {
+        *byte = new;
+    }
+    Ok(body)
+}
+
+#[tokio::test]
+async fn a_compressed_page_whose_output_differs_from_its_declared_size_is_unreadable() -> TestResult
+{
+    // One email data page, no dictionary. Declared one byte short, the
+    // stream has more to give: it is cut there, not decompressed in full.
+    // Declared one byte long, it ends early. Either way `parquet` never
+    // sees the page.
+    for compression in gzip_and_brotli() {
         let layout = Layout {
             compression,
+            dictionary: false,
             ..Layout::default()
         };
         let body = parquet_file(&[("email", Values::Text(emails(500)))], layout)?;
-        let before = super::read::fault::decodes();
-        let (scan, _) = scan("z.parquet", body, super::DEFAULT_WHOLE_FILE_MAX).await;
-        assert_eq!(super::read::fault::decodes(), before, "{compression:?}");
-        assert_eq!(scan.stats.skipped_unreadable, 1, "{compression:?}");
-        assert_eq!(scan.columns, []);
+        for delta in [-1, 1] {
+            let crafted = redeclared(body.clone(), delta)?;
+            for whole_file_max in [0, super::DEFAULT_WHOLE_FILE_MAX] {
+                let before = super::read::fault::decodes();
+                let (scan, _) = scan("z.parquet", crafted.clone(), whole_file_max).await;
+                let case = format!("{compression:?} declared {delta:+}");
+                assert_eq!(super::read::fault::decodes(), before, "{case}");
+                assert_eq!(scan.stats.skipped_unreadable, 1, "{case}");
+                assert_eq!(
+                    scan.outcome,
+                    FileOutcome::NotScanned(NotScannedReason::NoColumnExamined),
+                    "{case}"
+                );
+            }
+        }
+        // Unchanged, the same file decodes.
+        let (scan, _) = scan("z.parquet", body, 0).await;
+        assert_eq!(scan.stats.columns_examined, 1);
+    }
+    Ok(())
+}
+
+/// `body` with every column chunk's codec rewritten to LZO in the footer.
+fn as_lzo(body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use parquet::file::metadata::{ParquetMetaDataReader, ParquetMetaDataWriter};
+    let tail = body.len() - 8;
+    let footer_len = usize::try_from(u32::from_le_bytes(
+        body.get(tail..tail + 4).ok_or("short")?.try_into()?,
+    ))?;
+    let footer_start = tail - footer_len;
+    let metadata =
+        ParquetMetaDataReader::decode_metadata(body.get(footer_start..tail).ok_or("short")?)?;
+    let mut groups = Vec::new();
+    for group in metadata.row_groups() {
+        let columns = group
+            .columns()
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .clone()
+                    .into_builder()
+                    .set_compression(parquet::basic::Compression::LZO)
+                    .build()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        groups.push(
+            group
+                .clone()
+                .into_builder()
+                .set_column_metadata(columns)
+                .build()?,
+        );
+    }
+    let metadata = metadata.into_builder().set_row_groups(groups).build();
+    let mut out = body.get(..footer_start).ok_or("short")?.to_vec();
+    ParquetMetaDataWriter::new(&mut out, &metadata).finish()?;
+    Ok(out)
+}
+
+#[tokio::test]
+async fn an_lzo_column_is_skipped_as_an_unsupported_codec() -> TestResult {
+    let body = parquet_file(
+        &[
+            ("email", Values::Text(emails(500))),
+            ("dob", Values::Date((0..500).map(Some).collect())),
+        ],
+        Layout::default(),
+    )?;
+    let body = as_lzo(&body)?;
+    for whole_file_max in [0, super::DEFAULT_WHOLE_FILE_MAX] {
+        let (scan, _) = scan("lzo.parquet", body.clone(), whole_file_max).await;
+        assert_eq!(scan.stats.skipped_unsupported_codec, 1);
+        assert_eq!(scan.stats.skipped_unreadable, 0);
+        // No value was read, so the file was not scanned, though the date
+        // of birth, found by its name alone, still stands.
+        assert_eq!(
+            scan.outcome,
+            FileOutcome::NotScanned(NotScannedReason::NoColumnExamined)
+        );
+        assert_eq!(
+            verdicts(&scan),
+            [("dob".to_owned(), PiiType::DateOfBirth, Confidence::Likely)]
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_file_with_no_column_to_read_still_counts_as_scanned() -> TestResult {
+    let doubles = parquet_file(
+        &[("amount", Values::Double(vec![1.5; 100]))],
+        Layout::default(),
+    )?;
+    for whole_file_max in [0, super::DEFAULT_WHOLE_FILE_MAX] {
+        let (scan, _) = scan("d.parquet", doubles.clone(), whole_file_max).await;
+        assert!(
+            matches!(
+                scan.outcome,
+                FileOutcome::ScannedWhole | FileOutcome::ScannedPartially
+            ),
+            "{:?}",
+            scan.outcome
+        );
+        assert_eq!(scan.stats.skipped_unsupported_type, 1);
     }
     Ok(())
 }

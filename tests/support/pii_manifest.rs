@@ -6,8 +6,9 @@
 pub(crate) const PII_BUCKET: &str = "lakescan-pii";
 
 /// `(key, fixture path relative to tests/fixtures/parquet)`, in upload
-/// order. The `lake/` files are all readable; the `bad/` ones are not.
-pub(crate) const PII_OBJECTS: [(&str, &str); 7] = [
+/// order. The `lake/` files are all readable; the `bad/` ones are not; the
+/// `skipped/` one is Parquet whose every candidate column is skipped.
+pub(crate) const PII_OBJECTS: [(&str, &str); 11] = [
     (
         "lake/pyarrow/customers.parquet",
         "pyarrow/customers.parquet",
@@ -16,8 +17,21 @@ pub(crate) const PII_OBJECTS: [(&str, &str); 7] = [
     ("lake/duckdb/customers.parquet", "duckdb/customers.parquet"),
     ("lake/spark/customers.parquet", "spark/customers.parquet"),
     ("lake/escalation.parquet", "escalation.parquet"),
+    (
+        "lake/gzip/pyarrow/customers.parquet",
+        "gzip/pyarrow/customers.parquet",
+    ),
+    (
+        "lake/gzip/spark/customers.parquet",
+        "gzip/spark/customers.parquet",
+    ),
+    (
+        "lake/brotli/pyarrow/customers.parquet",
+        "brotli/pyarrow/customers.parquet",
+    ),
     ("bad/truncated.parquet", "bad/truncated.parquet"),
     ("bad/not_parquet.parquet", "bad/not_parquet.parquet"),
+    ("skipped/too_large.parquet", "skipped/too_large.parquet"),
 ];
 
 /// The fixture file at `path`, read from the repository.

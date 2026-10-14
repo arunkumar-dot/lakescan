@@ -31,6 +31,8 @@ pub struct ContentSummary {
     pub skipped_page_too_large: u64,
     /// Columns skipped because their pages could not be decoded.
     pub skipped_unreadable: u64,
+    /// Columns skipped because of a codec that cannot be decoded safely.
+    pub skipped_unsupported_codec: u64,
     /// Bytes read from S3 for content scanning.
     pub bytes_read: u64,
     /// `GetObject` requests made for content scanning.
@@ -67,6 +69,10 @@ impl ContentSummary {
             stats.skipped_page_too_large,
         );
         add(&mut self.skipped_unreadable, stats.skipped_unreadable);
+        add(
+            &mut self.skipped_unsupported_codec,
+            stats.skipped_unsupported_codec,
+        );
         add(&mut self.bytes_read, stats.bytes_read);
         add(&mut self.get_requests, stats.get_requests);
     }
@@ -91,6 +97,10 @@ impl ContentSummary {
             other.skipped_page_too_large,
         );
         add(&mut self.skipped_unreadable, other.skipped_unreadable);
+        add(
+            &mut self.skipped_unsupported_codec,
+            other.skipped_unsupported_codec,
+        );
         add(&mut self.bytes_read, other.bytes_read);
         add(&mut self.get_requests, other.get_requests);
     }
@@ -123,6 +133,7 @@ impl ContentSummary {
             self.skipped_unsupported_type,
             self.skipped_page_too_large,
             self.skipped_unreadable,
+            self.skipped_unsupported_codec,
         ]
         .iter()
         .fold(0, |total, &n| total.saturating_add(n))
@@ -142,6 +153,7 @@ mod tests {
             stats: FileStats {
                 columns_examined: 3,
                 skipped_repeated: 1,
+                skipped_unsupported_codec: 1,
                 bytes_read: bytes,
                 get_requests: 2,
                 ..FileStats::default()
@@ -163,7 +175,8 @@ mod tests {
         assert_eq!(summary.not_scanned(NotScannedReason::AccessDenied), 1);
         assert_eq!(summary.not_scanned_total(), 1);
         assert_eq!(summary.columns_examined, 9);
-        assert_eq!(summary.columns_skipped(), 3);
+        assert_eq!(summary.columns_skipped(), 6);
+        assert_eq!(summary.skipped_unsupported_codec, 3);
         assert_eq!(summary.bytes_read, 110);
         assert_eq!(summary.get_requests, 6);
     }

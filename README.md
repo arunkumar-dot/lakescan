@@ -101,9 +101,16 @@ The numbers are a stable contract. CI can branch on them.
 | 3 | `Auth` | Credentials are missing, expired, or rejected. |
 | 4 | `Transport` | The network or S3 failed (DNS, TLS, timeouts, 5xx, an unparseable response). Often worth retrying. |
 | 5 | `Report` | The summary or findings stream could not be written (full disk, bad path, permissions). |
-| 6 | `ContentNotScanned` | `--pii` was given and at least one Parquet file was found, but none could be content-scanned (all unreadable, encrypted, refused, or not Parquet). The summary is still written, and stderr gives the reasons. Takes precedence over 1. |
+| 6 | `ContentNotScanned` | `--pii` was given and at least one Parquet file was found, but none could be content-scanned (all unreadable, encrypted, refused, not Parquet, or with every readable column skipped). The summary is still written, and stderr gives the reasons. Takes precedence over 1. |
 
 A closed pipe (`lakescan ... | head`) is not an error.
+
+Exit status 101 is outside this contract. It means an internal error: a bug
+in LakeScan itself, which panicked. stderr then names the source location
+(never the message, which could quote scanned data). Please report it, with
+that line and the command you ran. A panic inside the Parquet parser while
+reading one file is not this: it is contained, and that file becomes
+`content-not-scanned`.
 
 ## Rules
 
@@ -136,7 +143,7 @@ names one column, and its severity follows from its confidence (see
 | `pii-ip-address` | A column of IPv4 or IPv6 addresses. |
 | `pii-person-name` | A column whose name says it holds people's names (`full_name`, `lastName`, …). Detected by name only. |
 | `pii-date-of-birth` | A column whose name says it holds dates of birth (`dob`, `birth_date`, …). Detected by name only. |
-| `content-not-scanned` | `info`: a Parquet file that could not be scanned, with a reason: `not-parquet`, `unreadable`, `access-denied`, `encrypted` or `footer-too-large`. It never stops the scan. |
+| `content-not-scanned` | `info`: a Parquet file that could not be scanned, with a reason: `not-parquet`, `unreadable`, `access-denied`, `encrypted`, `footer-too-large`, or `no-column-examined` (it has string or integer columns, but every one was skipped, so no value was examined). It never stops the scan. |
 
 ## PII content scanning
 
@@ -159,6 +166,18 @@ file. Candidate columns are string, binary, INT32 and INT64 columns, plus
 DATE and TIMESTAMP columns for the date-of-birth name check. Struct fields
 count; repeated (list and map) columns are skipped and counted. At most
 2,000 values per column per row group are evaluated.
+
+A candidate column is skipped, and counted by reason, when its first pages
+are over the page cap (`page-too-large`), can't be decoded (`unreadable`),
+or use a codec LakeScan doesn't decode (`unsupported-codec`: LZO). Every
+other codec is read: uncompressed, Snappy, GZIP, LZ4, LZ4_RAW, ZSTD and
+BROTLI. A file whose string and integer columns were *all* skipped is not
+counted as scanned: it is `content-not-scanned` with reason
+`no-column-examined`, so a lake LakeScan couldn't actually read can't pass
+silently. Findings that rest on a column's name alone, such as a date of
+birth, are still reported for such a file. A file with no string or integer
+columns at all (only doubles, say) has nothing to examine and counts as
+scanned.
 
 Each file's `PAR1` magic bytes are checked first. A file without them is not
 Parquet and is skipped (`content-not-scanned`, `not-parquet`), not an error.
@@ -206,10 +225,19 @@ never crash the scan or exhaust memory:
   paths. A page declaring more than 8 MiB compressed or uncompressed, or a
   dictionary declaring more than 1,048,576 values, skips its column as
   `page-too-large`. Nothing is allocated for it.
-- **Some codecs are never decompressed.** GZIP and BROTLI write as much
-  output as the stream produces, whatever size the header declares, so their
-  columns are `unreadable`. Snappy, ZSTD, LZ4 and LZ4_RAW decompress into a
-  buffer of the declared size (LZ4's unbounded frame fallback is off).
+- **Decompression stops at the declared size.** Snappy, ZSTD, LZ4 and
+  LZ4_RAW pages are decompressed by the Parquet parser into a buffer of the
+  declared size (LZ4's unbounded frame fallback is off). The parser's GZIP
+  and BROTLI decoders would write as much as the stream produces, so
+  LakeScan decompresses those pages itself. It reads at most the declared
+  size plus one byte, and a page whose output doesn't exactly match its
+  declared size is `unreadable`, however much more the stream holds. Brotli
+  streams asking for a window over 16 MiB ("large window" Brotli) are
+  refused before decoding, because the decoder would allocate the whole
+  window up front.
+- **LakeScan's own page-header reader is fuzzed.** A test feeds it 100,000
+  random and mutated headers and checks it always returns a result or an
+  error, without panicking.
 - **A parser panic costs one file.** The Parquet parser is third-party code,
   so a panic inside it becomes `content-not-scanned` (reason `unreadable`)
   for that file, and the scan continues. Its message is never printed,
@@ -326,8 +354,10 @@ covers:
   `{count, bytes}`. For a content rule, `bytes` is the size of the file the
   finding is in, once per finding.
 - `content`: with `--pii`, Parquet files found, scanned whole or partially,
-  and not scanned by reason; columns examined and skipped by reason; bytes
-  read and `GET` requests. `null` without `--pii`.
+  and not scanned by reason; columns examined and skipped by reason
+  (`repeated`, `unsupported_type`, `page_too_large`, `unreadable`,
+  `unsupported_codec`); bytes read and `GET` requests. `null` without
+  `--pii`.
 - `suppressions`: `expired` and `unused` entries
 - `samples`: up to 10 example findings per rule. A PII sample also has
   `column`, `confidence` and `evidence` (`values` or `column-name`), plus
@@ -374,9 +404,7 @@ changing what it means bumps `schema_version`.
   `kms:Decrypt`.
 - **Page caps.** A page whose header declares over 8 MiB, compressed or
   decompressed, skips that column (see [Hostile files](#hostile-files)).
-- **GZIP and BROTLI columns are not read.** Their decompressors can't be
-  bounded to the declared size, so those columns are counted as
-  `unreadable`. Older Spark and Hive files often use GZIP.
+- **LZO columns are not read.** They're skipped as `unsupported-codec`.
 - **`stale-standard` measures last modification, not last access.** A listing
   has no access time, so an object read every day but written two years ago
   is still flagged as stale.

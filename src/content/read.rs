@@ -16,19 +16,31 @@
 //! header (see `header`) and checks what it *declares*: a compressed or
 //! uncompressed size over [`PAGE_CAP`], or a dictionary of more than
 //! [`MAX_DICTIONARY_VALUES`] values, skips the column as page-too-large
-//! with nothing allocated for it. Pages compressed with a codec whose
-//! output is not bounded by the declared size (GZIP, BROTLI) are never
-//! decompressed: the column is unreadable. Values are then decoded by
+//! with nothing allocated for it. Values are then decoded by
 //! `SerializedPageReader` and the typed column reader from exactly the
 //! checked pages, with the chunk's metadata rebased onto the fetched range,
 //! and every synchronous `parquet` call runs inside [`contain`], so a
 //! parser panic costs one file, not the scan.
+//!
+//! **Codecs.** `parquet` decompresses Snappy, LZ4, `LZ4_RAW` and ZSTD pages
+//! into a buffer of the declared size. Its GZIP and BROTLI decoders read to
+//! the end of the stream, however large, so `LakeScan` decompresses those
+//! pages itself (see [`inflate`]): at most the declared size plus one byte
+//! is read, and a page whose output differs from its declared size is
+//! unreadable. The decompressed pages, with their headers re-encoded, are
+//! then handed to `parquet` as an uncompressed chunk. LZO is skipped as an
+//! unsupported codec.
+//!
+//! **Files with nothing examined.** A file whose value-bearing candidate
+//! columns (strings and integers) were all skipped is `no-column-examined`:
+//! not scanned, so a lake of such files cannot pass silently.
 //!
 //! **Escalation.** A column whose cleaned sample is too small or ambiguous
 //! after row group 0 (see `classify::Evidence::needs_more`) is sampled
 //! again in the middle row group, then the last: never more than
 //! [`MAX_ROW_GROUPS`] per column.
 
+use std::io::Read as _;
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -113,6 +125,44 @@ enum ColumnRead {
     PageTooLarge,
     /// The pages could not be decoded.
     Unreadable,
+    /// The chunk's codec cannot be decoded safely.
+    UnsupportedCodec,
+}
+
+/// Who decompresses a column chunk's pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    /// `parquet`, whose decoder for it is bounded by the declared size
+    /// (or there is nothing to decompress).
+    Parquet,
+    /// `LakeScan`, with [`inflate`].
+    Gzip,
+    /// `LakeScan`, with [`inflate`].
+    Brotli,
+}
+
+/// A column chunk's checked pages, ready to decode.
+struct Checked<B> {
+    /// The buffer holding them, which starts at file offset `buffer_start`.
+    data: B,
+    buffer_start: u64,
+    /// The chunk's first byte, as a file offset.
+    chunk_start: u64,
+    /// The chunk length the rebased metadata declares.
+    chunk_len: u64,
+    /// The first data page (header and body): its offset from the chunk's
+    /// start, and its length. Anything before it is the dictionary page.
+    page_offset: u64,
+    page_len: u64,
+}
+
+/// What [`Session::scan`] found in an opened file.
+pub(super) struct Scanned {
+    /// One verdict per column found to hold PII.
+    pub(super) findings: Vec<ColumnFinding>,
+    /// Whether the file had string or integer columns to read, and none of
+    /// them could be read.
+    pub(super) nothing_examined: bool,
 }
 
 /// One file's reads: the reader, the object, and the running counts.
@@ -242,10 +292,12 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
         &mut self,
         metadata: &ParquetMetaData,
         opened: &Opened<B>,
-    ) -> Result<Vec<ColumnFinding>, NotScannedReason> {
+    ) -> Result<Scanned, NotScannedReason> {
         let schema = metadata.file_metadata().schema_descr();
         let order = row_group_order(metadata.num_row_groups());
         let mut findings = Vec::new();
+        // String and integer columns: those whose values are read.
+        let (mut to_read, mut read) = (0_u64, 0_u64);
 
         for index in 0..schema.num_columns() {
             let descr = schema.column(index);
@@ -263,6 +315,7 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
             let mut evidence = Evidence::default();
             let mut skipped = None;
             if kind != Kind::Temporal {
+                to_read += 1;
                 for &row_group in &order {
                     match self
                         .sample(metadata, opened, row_group, index, &descr)
@@ -283,30 +336,36 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
                 }
             }
 
-            match skipped {
-                Some(ColumnRead::PageTooLarge) => {
-                    self.stats.skipped_page_too_large =
-                        self.stats.skipped_page_too_large.saturating_add(1);
+            let count = match skipped {
+                Some(ColumnRead::PageTooLarge) => &mut self.stats.skipped_page_too_large,
+                Some(ColumnRead::UnsupportedCodec) => &mut self.stats.skipped_unsupported_codec,
+                Some(ColumnRead::Unreadable | ColumnRead::Values(_)) => {
+                    &mut self.stats.skipped_unreadable
                 }
-                Some(_) => {
-                    self.stats.skipped_unreadable = self.stats.skipped_unreadable.saturating_add(1);
-                }
-                None => {
-                    self.stats.columns_examined = self.stats.columns_examined.saturating_add(1);
-                    if let Some(verdict) = classify(&evidence, names::hint(descr.name()), kind) {
-                        findings.push(ColumnFinding {
-                            pii: verdict.pii,
-                            detail: ColumnDetail::new(
-                                &descr.path().string(),
-                                verdict.confidence,
-                                verdict.evidence,
-                            ),
-                        });
-                    }
-                }
+                None => &mut self.stats.columns_examined,
+            };
+            *count = count.saturating_add(1);
+            if skipped.is_some() {
+                continue;
+            }
+            if kind != Kind::Temporal {
+                read += 1;
+            }
+            if let Some(verdict) = classify(&evidence, names::hint(descr.name()), kind) {
+                findings.push(ColumnFinding {
+                    pii: verdict.pii,
+                    detail: ColumnDetail::new(
+                        &descr.path().string(),
+                        verdict.confidence,
+                        verdict.evidence,
+                    ),
+                });
             }
         }
-        Ok(findings)
+        Ok(Scanned {
+            findings,
+            nothing_examined: to_read > 0 && read == 0,
+        })
     }
 
     /// Reads and decodes the first data page (and the dictionary page, if
@@ -327,9 +386,9 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
         let Some(chunk) = group.columns().get(index) else {
             return Ok(ColumnRead::Unreadable);
         };
-        if !codec_is_bounded(chunk.compression()) {
-            return Ok(ColumnRead::Unreadable);
-        }
+        let Some(codec) = codec(chunk.compression()) else {
+            return Ok(ColumnRead::UnsupportedCodec);
+        };
         let rows = usize::try_from(group.num_rows()).unwrap_or(0);
         let Some((start, len)) = chunk_range(chunk)
             .filter(|&(start, len)| start.checked_add(len).is_some_and(|end| end <= self.size))
@@ -353,8 +412,15 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
                         offset,
                         len: page_len,
                     } => {
-                        let location = page_location(start + offset, page_len);
-                        decode_contained(data.clone(), rebase(chunk, 0, len), rows, location, descr)
+                        let checked = Checked {
+                            data: data.clone(),
+                            buffer_start: 0,
+                            chunk_start: start,
+                            chunk_len: len,
+                            page_offset: offset,
+                            page_len,
+                        };
+                        decode_contained(checked, chunk, codec, rows, descr)
                     }
                     Plan::TooLarge => Ok(ColumnRead::PageTooLarge),
                     Plan::NeedMore(_) | Plan::Invalid => Ok(ColumnRead::Unreadable),
@@ -389,14 +455,15 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
                     offset,
                     len: page_len,
                 } => {
-                    let location = page_location(offset, page_len);
-                    return decode_contained(
-                        window,
-                        rebase(chunk, start, held),
-                        rows,
-                        location,
-                        descr,
-                    );
+                    let checked = Checked {
+                        data: window,
+                        buffer_start: start,
+                        chunk_start: start,
+                        chunk_len: held,
+                        page_offset: offset,
+                        page_len,
+                    };
+                    return decode_contained(checked, chunk, codec, rows, descr);
                 }
                 Plan::TooLarge => return Ok(ColumnRead::PageTooLarge),
                 Plan::Invalid => return Ok(ColumnRead::Unreadable),
@@ -468,20 +535,104 @@ fn contain<T>(step: impl FnOnce() -> T) -> Result<T, NotScannedReason> {
     std::panic::catch_unwind(AssertUnwindSafe(step)).map_err(|_| NotScannedReason::Unreadable)
 }
 
-/// Whether `parquet`'s decompressor for `codec` can never write more than
-/// the page's declared size. Snappy, LZ4 (with the frame fallback off),
-/// `LZ4_RAW` and ZSTD decompress into a buffer of the declared size; GZIP and
-/// BROTLI read to the end of the stream, however large, so their pages are
-/// never decompressed. LZO is not built in.
-fn codec_is_bounded(codec: Compression) -> bool {
-    matches!(
-        codec,
+/// Who decompresses pages of `compression`, or `None` if nobody can do it
+/// safely. `parquet`'s Snappy, LZ4 (with the frame fallback off), `LZ4_RAW`
+/// and ZSTD decoders write into a buffer of the declared size; its GZIP and
+/// BROTLI decoders read to the end of the stream, however large, so those
+/// are decompressed here. LZO is not built in.
+fn codec(compression: Compression) -> Option<Codec> {
+    match compression {
         Compression::UNCOMPRESSED
-            | Compression::SNAPPY
-            | Compression::LZ4
-            | Compression::LZ4_RAW
-            | Compression::ZSTD(_)
-    )
+        | Compression::SNAPPY
+        | Compression::LZ4
+        | Compression::LZ4_RAW
+        | Compression::ZSTD(_) => Some(Codec::Parquet),
+        Compression::GZIP(_) => Some(Codec::Gzip),
+        Compression::BROTLI(_) => Some(Codec::Brotli),
+        Compression::LZO => None,
+    }
+}
+
+/// `body`, one page's stored bytes, decompressed with `codec`: the v2
+/// level bytes copied as they are, then the values decompressed, reading
+/// at most the declared size plus one byte. `None` if the output is not
+/// exactly the declared size (an extra byte means the stream would have
+/// gone on) or the stream is invalid.
+fn inflate(codec: Codec, body: &[u8], page: &header::PageHeader) -> Option<Vec<u8>> {
+    let declared = usize::try_from(page.uncompressed).ok()?;
+    if !page.values_compressed {
+        return (body.len() == declared).then(|| body.to_vec());
+    }
+    let levels = usize::try_from(page.levels).ok()?;
+    let expected = declared.checked_sub(levels)?;
+    let (level_bytes, values) = (body.get(..levels)?, body.get(levels..)?);
+    let mut out = Vec::with_capacity(declared);
+    out.extend_from_slice(level_bytes);
+    // As in `parquet`: a page of nothing but nulls may have no values to
+    // decompress at all.
+    if expected > 0 {
+        let limit = u64::try_from(expected).ok()?.checked_add(1)?;
+        let read = match codec {
+            Codec::Gzip => flate2::read::MultiGzDecoder::new(values)
+                .take(limit)
+                .read_to_end(&mut out),
+            Codec::Brotli if brotli_window_is_standard(values) => {
+                brotli::Decompressor::new(values, BROTLI_BUFFER)
+                    .take(limit)
+                    .read_to_end(&mut out)
+            }
+            Codec::Brotli | Codec::Parquet => return None,
+        };
+        read.ok()?;
+    }
+    (out.len() == declared).then_some(out)
+}
+
+/// The Brotli decoder's read buffer, as `parquet` sizes it.
+const BROTLI_BUFFER: usize = 4096;
+
+/// Whether a Brotli stream's window is a standard one (at most 2^24
+/// bytes, RFC 7932 section 9.1), not "large window" Brotli. The decoder
+/// accepts large windows of up to 2^30 bytes and allocates the whole
+/// window up front, so such streams are refused before it sees them.
+fn brotli_window_is_standard(stream: &[u8]) -> bool {
+    // WBITS is read least significant bit first: 1 bit, then 3, then 3.
+    // Large-window streams start 1, 000, 001.
+    stream.first().is_none_or(|&first| first & 0x7f != 0x11)
+}
+
+/// The first data page (and dictionary page) of `checked`, decompressed
+/// with `codec` and re-encoded as an uncompressed chunk: the buffer, and
+/// where its data page starts. Every header was already checked by
+/// [`plan_pages`]; this reads them again from the same bytes.
+fn decompress_pages<B: Window>(checked: &Checked<B>, codec: Codec) -> Option<(Vec<u8>, u64)> {
+    let base = usize::try_from(checked.chunk_start.checked_sub(checked.buffer_start)?).ok()?;
+    let page_offset = usize::try_from(checked.page_offset).ok()?;
+    let end = base
+        .checked_add(page_offset)?
+        .checked_add(usize::try_from(checked.page_len).ok()?)?;
+    let pages = as_slice(&checked.data).get(base..end)?;
+    let mut out = Vec::new();
+    let convert = |out: &mut Vec<u8>, bytes: &[u8]| {
+        let header::Read::Header(page) = header::read(bytes) else {
+            return None;
+        };
+        let body_end = page
+            .len
+            .checked_add(usize::try_from(page.compressed).ok()?)?;
+        (body_end == bytes.len()).then_some(())?;
+        let plain = inflate(codec, bytes.get(page.len..)?, &page)?;
+        out.extend(header::with_body_len(bytes.get(..page.len)?, plain.len())?);
+        out.extend(plain);
+        Some(())
+    };
+    let (dictionary, data) = (pages.get(..page_offset)?, pages.get(page_offset..)?);
+    if !dictionary.is_empty() {
+        convert(&mut out, dictionary)?;
+    }
+    let dictionary_len = u64::try_from(out.len()).ok()?;
+    convert(&mut out, data)?;
+    Some((out, dictionary_len))
 }
 
 /// The smallest a PLAIN-encoded dictionary value of this column can be.
@@ -576,19 +727,29 @@ fn plan_pages(bytes: &[u8], chunk_len: u64, min_value_bytes: u64) -> Plan {
     }
 }
 
-/// Decodes one checked data page with [`decode`], inside [`contain`]: a
-/// decoding error skips the column; a panic fails the file.
+/// Decodes one checked data page with [`decode`], decompressing it first
+/// if `codec` says `LakeScan` must, all inside [`contain`]: a decoding
+/// error skips the column; a panic fails the file.
 fn decode_contained<B: Window>(
-    data: B,
-    meta: Option<ColumnChunkMetaData>,
+    checked: Checked<B>,
+    chunk: &ColumnChunkMetaData,
+    codec: Codec,
     rows: usize,
-    location: PageLocation,
     descr: &ColumnDescPtr,
 ) -> Result<ColumnRead, NotScannedReason> {
-    let Some(meta) = meta else {
-        return Ok(ColumnRead::Unreadable);
-    };
-    let decoded = contain(|| decode(data, &meta, rows, location, descr))?;
+    let decoded = contain(|| {
+        if codec == Codec::Parquet {
+            let meta = rebase(chunk, checked.buffer_start, checked.chunk_len)?;
+            let at = checked.chunk_start.checked_sub(checked.buffer_start)? + checked.page_offset;
+            let location = page_location(at, checked.page_len);
+            return decode(checked.data, &meta, rows, location, descr).ok();
+        }
+        let (plain, data_at) = decompress_pages(&checked, codec)?;
+        let total = u64::try_from(plain.len()).ok()?;
+        let meta = uncompressed(chunk, data_at, total)?;
+        let location = page_location(data_at, total - data_at);
+        decode(B::from(plain), &meta, rows, location, descr).ok()
+    })?;
     Ok(decoded.map_or(ColumnRead::Unreadable, ColumnRead::Values))
 }
 
@@ -686,6 +847,26 @@ fn rebase(chunk: &ColumnChunkMetaData, start: u64, held: u64) -> Option<ColumnCh
         .set_data_page_offset(data)
         .set_dictionary_page_offset(dictionary)
         .set_total_compressed_size(i64::try_from(held).ok()?)
+        .build()
+        .ok()
+}
+
+/// `chunk`'s metadata for a buffer of `total` bytes holding its pages
+/// decompressed by [`decompress_pages`]: uncompressed, with the data page
+/// at `data_at` and the dictionary page, if any, at 0.
+fn uncompressed(
+    chunk: &ColumnChunkMetaData,
+    data_at: u64,
+    total: u64,
+) -> Option<ColumnChunkMetaData> {
+    chunk
+        .clone()
+        .into_builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_data_page_offset(i64::try_from(data_at).ok()?)
+        .set_dictionary_page_offset((data_at > 0).then_some(0))
+        .set_total_compressed_size(i64::try_from(total).ok()?)
+        .set_total_uncompressed_size(i64::try_from(total).ok()?)
         .build()
         .ok()
 }
@@ -860,7 +1041,97 @@ pub(crate) mod fault {
 
 #[cfg(test)]
 mod tests {
-    use super::row_group_order;
+    use std::io::Write as _;
+
+    use super::header::PageHeader;
+    use super::{Codec, brotli_window_is_standard, inflate, row_group_order};
+
+    fn page(uncompressed: usize, levels: u64, values_compressed: bool) -> PageHeader {
+        PageHeader {
+            kind: super::header::DATA_PAGE_V2,
+            uncompressed: u64::try_from(uncompressed).unwrap_or(u64::MAX),
+            compressed: 0,
+            dictionary_values: 0,
+            levels,
+            values_compressed,
+            len: 0,
+        }
+    }
+
+    fn gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data)?;
+        encoder.finish()
+    }
+
+    fn brotli(data: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+            writer.write_all(data)?;
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn a_decompression_bomb_stops_one_byte_past_the_declared_size() -> std::io::Result<()> {
+        // 16 MiB of zeros compress to kilobytes; declared as 1 KiB,
+        // decompression stops at 1 KiB + 1 byte and the page is refused.
+        let zeros = vec![0_u8; 16 * 1024 * 1024];
+        for (codec, body) in [
+            (Codec::Gzip, gzip(&zeros)?),
+            (Codec::Brotli, brotli(&zeros)?),
+        ] {
+            assert!(body.len() < 1024 * 1024, "{codec:?}");
+            let started = std::time::Instant::now();
+            assert_eq!(inflate(codec, &body, &page(1024, 0, true)), None);
+            assert!(started.elapsed().as_secs() < 5, "{codec:?}");
+            let exact = inflate(codec, &body, &page(zeros.len(), 0, true));
+            assert_eq!(exact.map(|out| out.len()), Some(zeros.len()), "{codec:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v2_levels_are_copied_and_only_the_values_decompressed() -> std::io::Result<()> {
+        let values = b"person.1@example.com".repeat(10);
+        let mut body = vec![1, 2, 3];
+        body.extend(gzip(&values)?);
+        let out = inflate(Codec::Gzip, &body, &page(3 + values.len(), 3, true));
+        let mut expected = vec![1, 2, 3];
+        expected.extend(&values);
+        assert_eq!(out, Some(expected));
+        // Values stored uncompressed are passed through, if the size fits.
+        let plain = inflate(Codec::Gzip, &values, &page(values.len(), 0, false));
+        assert_eq!(plain.as_deref(), Some(&values[..]));
+        assert_eq!(inflate(Codec::Gzip, &values, &page(1, 0, false)), None);
+        // Levels longer than the page are refused.
+        assert_eq!(inflate(Codec::Gzip, &body, &page(2, 3, true)), None);
+        Ok(())
+    }
+
+    #[test]
+    fn large_window_brotli_is_refused_before_decoding() -> std::io::Result<()> {
+        // WBITS bits 1, 000, 001: "large window" Brotli, which the decoder
+        // would accept with a window of up to 1 GiB, allocated up front.
+        for first in [0x11, 0x91] {
+            assert!(!brotli_window_is_standard(&[first, 0xff]));
+            assert_eq!(
+                inflate(Codec::Brotli, &[first, 0xff, 0xff], &page(10, 0, true)),
+                None
+            );
+        }
+        for lgwin in [10, 16, 22, 24] {
+            let mut out = Vec::new();
+            {
+                let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 5, lgwin);
+                writer.write_all(b"standard window")?;
+            }
+            assert!(brotli_window_is_standard(&out), "lgwin {lgwin}");
+            assert!(inflate(Codec::Brotli, &out, &page(15, 0, true)).is_some());
+        }
+        Ok(())
+    }
 
     #[test]
     fn row_groups_are_sampled_first_middle_last_without_repeats() {
