@@ -1,11 +1,14 @@
 //! The plain-text summary writer.
 //!
 //! Section order, always: header, verdict, inventory, findings, content,
-//! suppressions, samples (per rule), largest objects, size histogram, age
-//! histogram, distinct-content. A section with nothing to list says so in
-//! one line, except content, which is omitted entirely unless content
-//! scanning (`--pii`) was on, and suppressions, which is omitted entirely
-//! unless some `--config` entry expired or went unused. A rule's findings print one
+//! coverage, PII inventory, suppressions, samples (per rule), largest
+//! objects, size histogram, age histogram, distinct-content. A section with
+//! nothing to list says so in one line, except content, coverage and the
+//! PII inventory, which are omitted entirely unless content scanning
+//! (`--pii`) was on, and suppressions, which is omitted entirely unless
+//! some `--config` entry expired or went unused. A PII rule's byte totals
+//! print as `-`: its findings are about columns, so bytes do not apply.
+//! A rule's findings print one
 //! line per severity it actually raised, worst first, and skip the rest —
 //! a rule with a single High finding is one line, not a zero-padded row
 //! across every severity — followed by its suppressed count when it has
@@ -23,8 +26,10 @@ use std::io::Write;
 use super::escape::write_escaped;
 use super::human_size::human_bytes;
 use super::rfc3339::format_rfc3339;
-use super::{ScanInfo, TOOL_NAME, TOOL_VERSION};
-use crate::aggregate::{Aggregates, Sample, SampleDetail};
+use super::{ScanInfo, TOOL_NAME, TOOL_VERSION, status_of};
+use crate::aggregate::{
+    Aggregates, InventoryEntry, MAX_ENTRIES, MAX_TABLES, Sample, SampleDetail, Table, TableStatus,
+};
 use crate::error::LakeScanError;
 use crate::model::{Evidence, NotScannedReason, RuleId, Severity};
 use crate::suppress::{Entry, Pattern};
@@ -131,6 +136,14 @@ fn write_findings<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), 
         return wl_empty!(out);
     }
 
+    // Bytes, or `-` for a PII rule, whose findings are about columns.
+    let bytes = |rule: RuleId, bytes: u64| {
+        if rule.is_pii() {
+            "-".to_owned()
+        } else {
+            human_bytes(bytes)
+        }
+    };
     for rule in rows {
         wl!(out, "  {} - {}", rule.code(), rule.title())?;
         // Worst severity first; skip any severity this rule never raised,
@@ -146,7 +159,7 @@ fn write_findings<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), 
                 "    {}: {} ({})",
                 severity.code(),
                 cell.count,
-                human_bytes(cell.bytes)
+                bytes(rule, cell.bytes)
             )?;
         }
         let suppressed = aggregates.suppressed(rule);
@@ -155,7 +168,7 @@ fn write_findings<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), 
                 out,
                 "    suppressed: {} ({})",
                 suppressed.count,
-                human_bytes(suppressed.bytes)
+                bytes(rule, suppressed.bytes)
             )?;
         }
     }
@@ -231,6 +244,186 @@ fn write_content<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), L
         human_bytes(content.bytes_read)
     )?;
     wl!(out, "  GET requests:       {}", content.get_requests)?;
+    wl_empty!(out)
+}
+
+fn write_coverage<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
+    let Some(coverage) = aggregates.coverage() else {
+        return Ok(());
+    };
+    wl!(out, "COVERAGE")?;
+    wl!(out, "  parquet files:  {}", coverage.files_eligible)?;
+    let percent = coverage
+        .percent
+        .map_or_else(|| "n/a".to_owned(), |percent| format!("{percent:.1}%"));
+    wl!(
+        out,
+        "  scanned:        {} ({percent})",
+        coverage.files_scanned
+    )?;
+    wl!(
+        out,
+        "  not scanned:    {} documented, {} undocumented",
+        coverage.not_scanned_suppressed,
+        coverage.not_scanned_unsuppressed
+    )?;
+    wl_empty!(out)
+}
+
+/// One table's heading: its name, file counts, and its unscanned files by
+/// reason, documented or not.
+fn write_table_heading<W: Write>(out: &mut W, table: &Table) -> Result<(), LakeScanError> {
+    w!(out, "  ")?;
+    if table.name().is_empty() {
+        w!(out, "(bucket root)")?;
+    } else {
+        write_escaped(out, table.name()).map_err(LakeScanError::Report)?;
+    }
+    w!(
+        out,
+        "  files: {} scanned, {} not scanned",
+        table.files_scanned,
+        table.files_not_scanned()
+    )?;
+    let reasons: Vec<String> = NotScannedReason::ALL
+        .into_iter()
+        .flat_map(|reason| {
+            [
+                (table.not_scanned_unsuppressed(reason), "undocumented"),
+                (table.not_scanned_suppressed(reason), "documented"),
+            ]
+            .into_iter()
+            .filter(|&(count, _)| count > 0)
+            .map(move |(count, state)| format!("{}={count} {state}", reason.code()))
+        })
+        .collect();
+    if !reasons.is_empty() {
+        w!(out, " ({})", reasons.join(", "))?;
+    }
+    wl_empty!(out)?;
+    if let Some(key) = table.example_key() {
+        w!(out, "    example: ")?;
+        write_escaped(out, key).map_err(LakeScanError::Report)?;
+        wl_empty!(out)?;
+    }
+    Ok(())
+}
+
+/// `"1 file"` or `"N files"`.
+fn files(n: u64) -> String {
+    if n == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{n} files")
+    }
+}
+
+/// An undocumented row's file counts, non-zero ones only: `"4 files
+/// confirmed"`, `"3 files confirmed, 1 likely"`, `"2 files likely, 1
+/// suppressed"`.
+fn undocumented_counts(entry: &InventoryEntry) -> String {
+    let parts: Vec<(u64, &str)> = [
+        (entry.files_confirmed, "confirmed"),
+        (entry.files_likely, "likely"),
+        (entry.files_possible, "possible"),
+        (entry.files_suppressed, "suppressed"),
+    ]
+    .into_iter()
+    .filter(|&(count, _)| count > 0)
+    .collect();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, &(count, label))| {
+            if index == 0 {
+                format!("{} {label}", files(count))
+            } else {
+                format!("{count} {label}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn write_entry_row<W: Write>(
+    out: &mut W,
+    info: &ScanInfo,
+    entry: &InventoryEntry,
+) -> Result<(), LakeScanError> {
+    w!(out, "    ")?;
+    write_escaped(out, entry.column()).map_err(LakeScanError::Report)?;
+    w!(
+        out,
+        "  {}  {}  evidence={}  ",
+        entry.rule().code(),
+        entry.highest_confidence().code(),
+        entry.evidence().code()
+    )?;
+    match status_of(entry.status(), &info.suppressions) {
+        (status, Some(reason)) => {
+            // Documented: every file's finding was suppressed, so the
+            // count is all of them.
+            w!(out, "{}, {status}: ", files(entry.files()))?;
+            write_escaped(out, reason).map_err(LakeScanError::Report)?;
+            wl_empty!(out)
+        }
+        (status, None) => wl!(out, "{}  {status}", undocumented_counts(entry)),
+    }
+}
+
+fn write_pii_inventory<W: Write>(
+    out: &mut W,
+    info: &ScanInfo,
+    aggregates: &Aggregates,
+) -> Result<(), LakeScanError> {
+    let Some(inventory) = aggregates.pii_inventory() else {
+        return Ok(());
+    };
+    wl!(out, "PII INVENTORY")?;
+    let summary = inventory.summary();
+    wl!(
+        out,
+        "  {} tables with PII, {} PII columns: {} undocumented (action needed), {} documented. \
+         {} tables not fully scanned.",
+        summary.tables_with_pii,
+        summary.pii_columns,
+        summary.undocumented,
+        summary.documented,
+        summary.tables_not_fully_scanned
+    )?;
+    if inventory.tables().is_empty() {
+        wl!(out, "  no Parquet files")?;
+    }
+    for table in inventory.tables() {
+        write_table_heading(out, table)?;
+        match table.status() {
+            TableStatus::PiiFound => {
+                for entry in table.entries_for_review() {
+                    write_entry_row(out, info, entry)?;
+                }
+            }
+            // Never "no PII found" about files that were not read.
+            TableStatus::NoPiiInScannedFiles => {
+                let scanned = table.files_scanned;
+                let noun = if scanned == 1 { "file" } else { "files" };
+                w!(out, "    no PII found in {scanned} scanned {noun}")?;
+                if table.files_not_scanned() > 0 {
+                    w!(out, "; {} not scanned", table.files_not_scanned())?;
+                }
+                wl_empty!(out)?;
+            }
+            TableStatus::NotScanned => wl!(out, "    not scanned: PII unknown")?,
+        }
+    }
+    if inventory.truncated() {
+        wl!(
+            out,
+            "  truncated: {} files and {} findings left out over the caps ({MAX_TABLES} tables, \
+             {MAX_ENTRIES} entries); scan a narrower prefix to see them",
+            inventory.left_out_files(),
+            inventory.left_out_findings()
+        )?;
+    }
     wl_empty!(out)
 }
 
@@ -428,6 +621,8 @@ pub(super) fn write<W: Write>(
     write_inventory(out, aggregates)?;
     write_findings(out, aggregates)?;
     write_content(out, aggregates)?;
+    write_coverage(out, aggregates)?;
+    write_pii_inventory(out, info, aggregates)?;
     write_suppressions(out, info)?;
     write_samples(out, aggregates)?;
     write_largest_objects(out, aggregates)?;
@@ -461,6 +656,123 @@ mod tests {
         assert_eq!(
             String::from_utf8(buf)?,
             "    stale-standard  prefix=\"\" (every key)  reason: r\n"
+        );
+        Ok(())
+    }
+
+    /// One observed file: `(key, outcome, suppressed, findings)`, each
+    /// finding `(column, confidence, suppression)`.
+    type TestFile<'a> = (
+        &'a str,
+        crate::content::FileOutcome,
+        bool,
+        &'a [(&'a str, crate::model::Confidence, Option<usize>)],
+    );
+
+    /// Renders the PII INVENTORY section for `files`, observed directly.
+    fn inventory_section(files: &[TestFile<'_>]) -> Result<String, Box<dyn std::error::Error>> {
+        use crate::model::{ColumnDetail, Detail, Evidence, Finding, ObjectMeta, RuleId, Severity};
+        let now = fixture::now();
+        let mut aggregates = crate::aggregate::Aggregates::new(now);
+        aggregates.enable_content();
+        for (key, outcome, suppressed, findings) in files {
+            let object = ObjectMeta {
+                key: (*key).to_owned(),
+                size: 100,
+                last_modified: now,
+                etag: "e".to_owned(),
+                storage_class: crate::model::StorageClass::Standard,
+            };
+            for (column, confidence, suppression) in *findings {
+                let detail = ColumnDetail::new(
+                    column,
+                    *confidence,
+                    Evidence::Values {
+                        matched: 30,
+                        sampled: 30,
+                    },
+                );
+                let finding = Finding {
+                    rule: RuleId::PiiEmail,
+                    severity: Severity::High,
+                    object: &object,
+                    detail: Detail::Column(&detail),
+                };
+                match suppression {
+                    Some(entry) => aggregates.observe_suppressed(finding, *entry),
+                    None => aggregates.observe_finding(finding),
+                }
+            }
+            let scan = crate::content::FileScan {
+                outcome: *outcome,
+                columns: Vec::new(),
+                stats: crate::content::FileStats::default(),
+            };
+            aggregates.observe_content(&object, &scan, *suppressed);
+        }
+        let mut info = fixture::scan_info();
+        info.suppressions.reasons = vec!["Consented, DPA-12".to_owned()];
+        let mut buf = Vec::new();
+        super::write_pii_inventory(&mut buf, &info, &aggregates)?;
+        Ok(String::from_utf8(buf)?)
+    }
+
+    #[test]
+    fn the_inventory_never_claims_more_than_was_read() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::content::FileOutcome::{NotScanned, ScannedWhole};
+        use crate::model::Confidence::{Confirmed, Likely};
+        use crate::model::NotScannedReason::Unreadable;
+        let section = inventory_section(&[
+            // No file read: unknown, never "no PII found".
+            ("dark/a.parquet", NotScanned(Unreadable), false, &[]),
+            // Some read, nothing found, some not read.
+            ("half/a.parquet", ScannedWhole, false, &[]),
+            ("half/b.parquet", ScannedWhole, false, &[]),
+            ("half/c.parquet", NotScanned(Unreadable), true, &[]),
+            // All read, nothing found.
+            ("clean/a.parquet", ScannedWhole, false, &[]),
+            // PII, documented and not, with mixed confidences.
+            (
+                "pii/a.parquet",
+                ScannedWhole,
+                false,
+                &[
+                    ("zip", Confirmed, None),
+                    ("email", Confirmed, Some(0)),
+                    ("phone", Likely, None),
+                ],
+            ),
+            (
+                "pii/b.parquet",
+                ScannedWhole,
+                false,
+                &[
+                    ("zip", Likely, None),
+                    ("email", Confirmed, Some(0)),
+                    ("phone", Likely, Some(0)),
+                ],
+            ),
+        ])?;
+        assert_eq!(
+            section,
+            "PII INVENTORY\n\
+             \x20 1 tables with PII, 3 PII columns: 2 undocumented (action needed), 1 documented. \
+             2 tables not fully scanned.\n\
+             \x20 clean  files: 1 scanned, 0 not scanned\n\
+             \x20   no PII found in 1 scanned file\n\
+             \x20 dark  files: 0 scanned, 1 not scanned (unreadable=1 undocumented)\n\
+             \x20   not scanned: PII unknown\n\
+             \x20 half  files: 2 scanned, 1 not scanned (unreadable=1 documented)\n\
+             \x20   no PII found in 2 scanned files; 1 not scanned\n\
+             \x20 pii  files: 2 scanned, 0 not scanned\n\
+             \x20   example: pii/a.parquet\n\
+             \x20   phone  pii-email  likely  evidence=values  1 file likely, 1 suppressed  \
+             UNDOCUMENTED\n\
+             \x20   zip  pii-email  confirmed  evidence=values  1 file confirmed, 1 likely  \
+             UNDOCUMENTED\n\
+             \x20   email  pii-email  confirmed  evidence=values  2 files, documented: \
+             Consented, DPA-12\n\
+             \n"
         );
         Ok(())
     }

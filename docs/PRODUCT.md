@@ -34,4 +34,4 @@ Round 2 (messy synthetic data; pyarrow, Polars, DuckDB, Spark): passed both pre-
 - Validation on real data, which only early users can provide.
 
 ## Status
-M0-M7: the metadata pipeline plus structured-PII scanning of Parquet files (opt-in with --pii). Next: a per-table PII inventory report (M8), then parallel scanning (M9).
+M0-M8: metadata pipeline, structured-PII scanning of Parquet (opt-in with --pii, GZIP and Brotli included), and a per-table PII inventory with fail-closed coverage. Next: parallel scanning with request coalescing (M9), then release builds (M10).

@@ -34,6 +34,17 @@ pub(super) fn write_escaped<W: Write>(out: &mut W, s: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// `s` with every character [`is_escaped`] flags written as `\u{XXXX}`,
+/// as [`write_escaped`] writes it: for the CSV inventory, whose cells are
+/// built before they are quoted.
+pub(super) fn escaped(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    // Writing to a `Vec` cannot fail, and only whole UTF-8 characters and
+    // ASCII escapes are written, so the result is valid UTF-8.
+    let _ = write_escaped(&mut out, s);
+    String::from_utf8(out).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;

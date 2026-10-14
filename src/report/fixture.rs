@@ -1,12 +1,18 @@
 //! A fixed set of objects, findings, and a [`ScanInfo`], shared by the
 //! golden text-summary test and the JSON summary tests, so both exercise
-//! exactly the same input.
+//! exactly the same input: listing findings, and content scans of a few
+//! Parquet files in partitioned tables (made up here rather than read, so
+//! the reporters are tested apart from `content`).
 
 use std::time::{Duration, SystemTime};
 
 use super::ScanInfo;
 use crate::aggregate::Aggregates;
-use crate::model::{ObjectMeta, StorageClass};
+use crate::content::{ColumnFinding, FileOutcome, FileScan, FileStats};
+use crate::model::{
+    ColumnDetail, Confidence, Evidence, Finding, NotScannedReason, ObjectMeta, PiiType, RuleId,
+    StorageClass,
+};
 use crate::rules::{self, EvalContext};
 use crate::suppress::{Config, Date, Outcome, Suppressor};
 
@@ -89,7 +95,88 @@ pub(super) fn objects() -> Vec<ObjectMeta> {
             "etag-8",
             StorageClass::Other("FUTURE_TIER".to_owned()),
         ),
+        object(
+            "warehouse/customers/dt=2023-11-01/part-0.parquet",
+            5_000_000,
+            0,
+            "etag-10",
+            StorageClass::Standard,
+        ),
+        object(
+            "warehouse/customers/dt=2023-11-02/part-0.parquet",
+            4_000_000,
+            0,
+            "etag-11",
+            StorageClass::Standard,
+        ),
+        object(
+            "warehouse/orders/data/part-0.parquet",
+            10_000,
+            0,
+            "etag-12",
+            StorageClass::Standard,
+        ),
+        object("events.parquet", 2000, 0, "etag-13", StorageClass::Standard),
     ]
+}
+
+fn column(pii: PiiType, column: &str, confidence: Confidence, evidence: Evidence) -> ColumnFinding {
+    ColumnFinding {
+        pii,
+        detail: ColumnDetail::new(column, confidence, evidence),
+    }
+}
+
+/// What content scanning made of each fixture Parquet file: emails and
+/// names in both customer partitions, phones in one, an unreadable orders
+/// file, and an events file with nothing in it.
+fn scan_of(key: &str) -> FileScan {
+    let emails = column(
+        PiiType::Email,
+        "email",
+        Confidence::Confirmed,
+        Evidence::Values {
+            matched: 1900,
+            sampled: 2000,
+        },
+    );
+    let names = column(
+        PiiType::PersonName,
+        "full_name",
+        Confidence::Likely,
+        Evidence::ColumnName,
+    );
+    let (outcome, columns) = match key {
+        "warehouse/customers/dt=2023-11-01/part-0.parquet" => (
+            FileOutcome::ScannedPartially,
+            vec![
+                emails,
+                names,
+                column(
+                    PiiType::Phone,
+                    "contact.phone",
+                    Confidence::Likely,
+                    Evidence::Values {
+                        matched: 20,
+                        sampled: 24,
+                    },
+                ),
+            ],
+        ),
+        "warehouse/customers/dt=2023-11-02/part-0.parquet" => {
+            (FileOutcome::ScannedWhole, vec![emails, names])
+        }
+        "warehouse/orders/data/part-0.parquet" => (
+            FileOutcome::NotScanned(NotScannedReason::Unreadable),
+            Vec::new(),
+        ),
+        _ => (FileOutcome::ScannedWhole, Vec::new()),
+    };
+    FileScan {
+        outcome,
+        columns,
+        stats: FileStats::default(),
+    }
 }
 
 /// The fixture suppression config: one entry that suppresses
@@ -114,13 +201,26 @@ expires = 2023-10-01
 rule = "reduced-redundancy"
 key = "backups/2019.tar"
 reason = "Legacy archive, migration tracked in OPS-142"
+
+[[suppress]]
+rule = "pii-person-name"
+prefix = "warehouse/customers/"
+column = "full_name"
+reason = "Names are needed for invoicing (DPA section 4)"
+
+[[suppress]]
+rule = "content-not-scanned"
+prefix = "warehouse/orders/"
+reason = "Corrupt export; rerun tracked in DATA-77"
 "#;
 
-/// Runs the fixture objects through rules, the fixture suppressions, and
-/// aggregation, exactly as the driver does.
+/// Runs the fixture objects through rules, content scanning (as made up
+/// by [`scan_of`]), the fixture suppressions, and aggregation, exactly as
+/// the driver does.
 fn run() -> (Aggregates, Outcome) {
     let ctx = EvalContext { now: now() };
     let mut aggregates = Aggregates::new(now());
+    aggregates.enable_content();
     // The fixture config is a constant, checked by the golden test; an
     // invalid one would show up there as a missing suppression.
     let config = Config::parse(CONFIG, "fixture.toml").unwrap_or_default();
@@ -128,14 +228,33 @@ fn run() -> (Aggregates, Outcome) {
     for object in &objects() {
         aggregates.observe_object(object);
         for finding in rules::evaluate(object, &ctx) {
-            if suppressor.suppresses(&finding) {
-                aggregates.observe_suppressed(finding);
-            } else {
-                aggregates.observe_finding(finding);
+            route(&mut aggregates, &mut suppressor, finding);
+        }
+        if crate::content::is_eligible(&object.key) {
+            let scan = scan_of(&object.key);
+            let mut suppressed = false;
+            for finding in scan.findings(object) {
+                let covered = route(&mut aggregates, &mut suppressor, finding);
+                if finding.rule == RuleId::ContentNotScanned {
+                    suppressed = covered;
+                }
             }
+            aggregates.observe_content(object, &scan, suppressed);
         }
     }
     (aggregates, suppressor.finish())
+}
+
+/// Sends `finding` where the driver would; returns whether it was
+/// suppressed.
+fn route(aggregates: &mut Aggregates, suppressor: &mut Suppressor, finding: Finding<'_>) -> bool {
+    if let Some(entry) = suppressor.matching(&finding) {
+        aggregates.observe_suppressed(finding, entry);
+        true
+    } else {
+        aggregates.observe_finding(finding);
+        false
+    }
 }
 
 fn scan_info_bucket() -> String {

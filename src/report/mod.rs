@@ -41,9 +41,13 @@
 //! or renaming a field, changing its type, or changing what an existing
 //! field means is **breaking** and bumps `schema_version`. The
 //! `suppressed`, `suppressions`, and `distinct_content.duplicates_significant`
-//! fields (M6), and `content`, a suppression entry's `column`, and a
+//! fields (M6), `content`, a suppression entry's `column`, and a
 //! sample's `column`, `confidence`, `evidence`, `matched`, `sampled` and
-//! `reason` (M7) were added under this policy, so the version is still 1.
+//! `reason` (M7), and `coverage` and `pii_inventory` with its `summary`
+//! and per-table `status` (M8) were added under
+//! this policy, so the version is still 1. M8 also made a PII rule's
+//! `bytes` and `suppressed.bytes` always 0: they double-counted files
+//! (once per column), and a consumer summing them was already wrong.
 //!
 //! ```text
 //! {
@@ -81,9 +85,13 @@
 //!                   "low": integer, "info": integer },
 //!       "bytes":  { "critical": integer, "high": integer, "medium": integer,
 //!                   "low": integer, "info": integer },
+//!                                  // the finding objects' sizes; always 0
+//!                                  // for PII rules (RuleId::is_pii), which
+//!                                  // are about columns: not applicable
 //!       "suppressed": { "count": integer, "bytes": integer }
 //!                                  // findings a --config entry covered;
 //!                                  // not included in counts/bytes above
+//!                                  // (bytes 0 for PII rules, as above)
 //!     }
 //!   ],
 //!   "content": {                   // null unless --pii was given
@@ -109,6 +117,72 @@
 //!     },
 //!     "bytes_read": integer,       // bytes returned by every GetObject
 //!     "get_requests": integer      // GetObject requests made
+//!   },
+//!   "coverage": {                  // null unless --pii was given
+//!     "files_eligible": integer,   // as content.files_eligible
+//!     "files_scanned": integer,    // scanned whole or partially
+//!     "not_scanned_suppressed": integer,   // content-not-scanned finding
+//!                                  // suppressed: documented
+//!     "not_scanned_unsuppressed": integer, // undocumented; any of these
+//!                                  // fails the run with exit code 6
+//!     "percent": number | null     // files_scanned / files_eligible * 100,
+//!                                  // rounded down to one decimal; null
+//!                                  // when files_eligible is 0
+//!   },
+//!   "pii_inventory": {             // null unless --pii was given
+//!     "summary": {                 // the headline, over tables held:
+//!       "tables_with_pii": integer,  // tables with a PII location
+//!       "pii_columns": integer,    // (table, column, rule) locations
+//!       "undocumented": integer,   // of those: the action items
+//!       "documented": integer,
+//!       "tables_not_fully_scanned": integer // with any file not scanned
+//!     },
+//!     "tables": [                  // sorted by table; a table is
+//!       {                          // aggregate::table_of(key): the key's
+//!                                  // directory minus Hive partitions and
+//!                                  // one trailing "data" segment
+//!         "table": string,         // "" for the bucket root; at most 1 KiB
+//!         "status": string,        // "pii_found"; "no_pii_in_scanned_files"
+//!                                  // (some files may not have been
+//!                                  // scanned); "not_scanned": no file was
+//!                                  // read, so PII is unknown
+//!         "files_eligible": integer,
+//!         "files_scanned": integer,
+//!         "files_not_scanned": integer,
+//!         "not_scanned": {         // reasons with any file only, keyed by
+//!           "<reason code>": {     // NotScannedReason::code()
+//!             "suppressed": integer,
+//!             "unsuppressed": integer
+//!           }
+//!         },
+//!         "example_key": string | null, // the smallest key in the table
+//!                                  // with a PII finding; at most 1 KiB
+//!         "columns": [             // sorted by column, then rule
+//!           {
+//!             "column": string,    // the column path, at most 256 bytes
+//!             "rule": string,      // a PII rule's code
+//!             "highest_confidence": string, // over every file, suppressed
+//!                                  // or not; Confidence::code()
+//!             "evidence": string,  // "values" if any file's finding
+//!                                  // rested on values, else "column-name"
+//!             "files_confirmed": integer, // unsuppressed findings at each
+//!             "files_likely": integer,    // confidence, one per file
+//!             "files_possible": integer,
+//!             "files_suppressed": integer,
+//!             "status": string,    // "UNDOCUMENTED" if any file's finding
+//!                                  // was not suppressed, else "documented"
+//!             "reason": string | null // documented only: the reason of the
+//!                                  // first --config entry (file order)
+//!                                  // that suppressed any of them
+//!           }
+//!         ]
+//!       }
+//!     ],
+//!     "left_out": {                // what the caps dropped, exactly:
+//!       "files": integer,          // files in tables left out
+//!       "findings": integer        // findings in tables or entries left out
+//!     },
+//!     "caps": { "tables": integer, "entries": integer } // 4096, 16384
 //!   },
 //!   "suppressions": {              // --config entries worth attention,
 //!     "expired": [ entry ],        // each list in file order; both empty
@@ -171,6 +245,7 @@
 //! carries the identical information in a human-readable layout; see
 //! `text`'s module doc for its section order.
 
+mod csv;
 mod escape;
 mod findings;
 #[cfg(test)]
@@ -187,7 +262,7 @@ use std::time::{Duration, SystemTime};
 pub use findings::FindingsWriter;
 use sink::Sink;
 
-use crate::aggregate::Aggregates;
+use crate::aggregate::{Aggregates, Status};
 use crate::error::LakeScanError;
 use crate::suppress::Outcome;
 
@@ -253,6 +328,43 @@ pub fn write_summary<W: Write>(
         Format::Json => json::write(&mut sink, info, aggregates)?,
     }
     sink.flush().map_err(LakeScanError::Report)
+}
+
+/// Writes the PII inventory in `aggregates` as CSV (`--inventory`); see
+/// the `csv` submodule for the format and its formula-injection
+/// neutralization. Behind the same 64 KB buffer as [`write_summary`], with
+/// the same broken-pipe rule.
+///
+/// # Errors
+/// Returns [`LakeScanError::Report`] for any write or flush error other
+/// than a broken pipe.
+pub fn write_inventory_csv<W: Write>(
+    out: W,
+    info: &ScanInfo,
+    aggregates: &Aggregates,
+) -> Result<(), LakeScanError> {
+    let mut sink = Sink::new(out);
+    csv::write(&mut sink, &info.suppressions, aggregates)?;
+    sink.flush().map_err(LakeScanError::Report)
+}
+
+/// The strict RFC 4180 reader the CSV tests use, for tests elsewhere.
+#[cfg(test)]
+pub(crate) fn parse_csv(text: &str) -> Option<Vec<Vec<String>>> {
+    csv::parse(text)
+}
+
+/// An inventory entry's status as every format spells it: `"UNDOCUMENTED"`,
+/// or `"documented"` with the reason of the suppression entry that
+/// documents it (from `suppressions`, by index).
+fn status_of(status: Status, suppressions: &Outcome) -> (&'static str, Option<&str>) {
+    match status {
+        Status::Undocumented => ("UNDOCUMENTED", None),
+        Status::Documented { entry } => (
+            "documented",
+            Some(suppressions.reasons.get(entry).map_or("", String::as_str)),
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -85,6 +85,7 @@ container or instance credentials.
 | `--quiet` | off | No progress line and no suppression warnings on stderr. |
 | `--pii` | off | Also scan Parquet files (keys ending in `.parquet` or `.parq`, any case) for personal data. Reads object contents; see [PII content scanning](#pii-content-scanning). Without it, no object is read. |
 | `--pii-whole-file-max <BYTES>` | `8388608` (8 MiB) | With `--pii`: Parquet files of at most `BYTES` are read whole, in one request. Larger ones are read partially. `0` to `67108864` (64 MiB). Requires `--pii`. |
+| `--inventory <PATH>` | off | With `--pii`: also write the [PII inventory](#pii-inventory-and-coverage) as CSV to `PATH`, one row per table, column and rule. `-` means stdout, which then requires `--output` to name a file, and `--findings` not to be `-`. Requires `--pii`. |
 
 A progress line (`scanned N objects, M findings`) is shown on stderr only when
 stderr is a terminal. Errors print one line to stderr, `lakescan: <error>`.
@@ -101,7 +102,7 @@ The numbers are a stable contract. CI can branch on them.
 | 3 | `Auth` | Credentials are missing, expired, or rejected. |
 | 4 | `Transport` | The network or S3 failed (DNS, TLS, timeouts, 5xx, an unparseable response). Often worth retrying. |
 | 5 | `Report` | The summary or findings stream could not be written (full disk, bad path, permissions). |
-| 6 | `ContentNotScanned` | `--pii` was given and at least one Parquet file was found, but none could be content-scanned (all unreadable, encrypted, refused, not Parquet, or with every readable column skipped). The summary is still written, and stderr gives the reasons. Takes precedence over 1. |
+| 6 | `ContentNotScanned` | `--pii` was given and at least one Parquet file could not be content-scanned (unreadable, encrypted, refused, not Parquet, or with every readable column skipped) without a `content-not-scanned` suppression documenting it. Coverage fails closed: one such file among thousands of readable ones is enough. The summary is still written, and stderr gives the counts by reason. Takes precedence over 1. |
 
 A closed pipe (`lakescan ... | head`) is not an error.
 
@@ -143,7 +144,7 @@ names one column, and its severity follows from its confidence (see
 | `pii-ip-address` | A column of IPv4 or IPv6 addresses. |
 | `pii-person-name` | A column whose name says it holds people's names (`full_name`, `lastName`, …). Detected by name only. |
 | `pii-date-of-birth` | A column whose name says it holds dates of birth (`dob`, `birth_date`, …). Detected by name only. |
-| `content-not-scanned` | `info`: a Parquet file that could not be scanned, with a reason: `not-parquet`, `unreadable`, `access-denied`, `encrypted`, `footer-too-large`, or `no-column-examined` (it has string or integer columns, but every one was skipped, so no value was examined). It never stops the scan. |
+| `content-not-scanned` | `info`: a Parquet file that could not be scanned, with a reason: `not-parquet`, `unreadable`, `access-denied`, `encrypted`, `footer-too-large`, or `no-column-examined` (it has string or integer columns, but every one was skipped, so no value was examined). It never stops the scan, but unless suppressed it fails the run with exit code 6 (see [Coverage](#coverage-fails-closed)). |
 
 ## PII content scanning
 
@@ -255,9 +256,10 @@ files and checks that none appears in any output.
 
 Content scanning needs `s3:GetObject` on the objects it reads. For objects
 encrypted with SSE-KMS it also needs `kms:Decrypt` on their key. A refused
-read is a `content-not-scanned` finding with reason `access-denied`. If most
-files were refused and none could be scanned, LakeScan exits with code 6 and
-names the missing permissions on stderr.
+read is a `content-not-scanned` finding with reason `access-denied`, and
+fails the run with exit code 6 unless documented (see
+[Coverage](#coverage-fails-closed)). If most undocumented files were
+refused, stderr also names the missing permissions.
 
 The cost is S3 `GET` requests: one for a small file, and for a large one
 about one for the footer plus one or two per sampled column and row group.
@@ -266,6 +268,126 @@ data transfer for the bytes read when you run outside the bucket's AWS
 region. The
 `CONTENT` section (`content` in JSON) reports `bytes_read` and
 `get_requests`, so you can see what a scan cost.
+
+### PII inventory and coverage
+
+With `--pii`, the summary ends its content sections with COVERAGE and PII
+INVENTORY: where personal data lives, by table and column, and whether each
+location is documented. It is the report a privacy team hands to an
+auditor, a customer or a regulator.
+
+```text
+COVERAGE
+  parquet files:  11
+  scanned:        8 (72.7%)
+  not scanned:    2 documented, 1 undocumented
+
+PII INVENTORY
+  4 tables with PII, 31 PII columns: 30 undocumented (action needed), 1 documented. 2 tables not fully scanned.
+  bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 documented)
+    not scanned: PII unknown
+  lake/customers  files: 4 scanned, 0 not scanned
+    example: lake/customers/dt=2026-01-01/part-0.parquet
+    aadhaar_no  pii-in-aadhaar  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
+    full_name  pii-person-name  likely  evidence=column-name  4 files likely  UNDOCUMENTED
+    pan  pii-in-pan  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
+    email  pii-email  confirmed  evidence=values  4 files, documented: Consented marketing contacts, DPA-12
+```
+
+(Trimmed: the real output lists every table and row.)
+
+The headline counts the action items: undocumented PII locations, and
+tables with files that weren't scanned. A table never claims more than was
+read: one with no file scanned says `not scanned: PII unknown`, and one
+where nothing was found says `no PII found in N scanned files`, adding
+`; M not scanned` when some weren't (JSON: each table's `status`,
+`pii_found`, `no_pii_in_scanned_files` or `not_scanned`, and
+`pii_inventory.summary` for the headline).
+
+**Tables.** A listing knows nothing about catalogs, so each Parquet file is
+put in a table by its key, a heuristic: take the directory (everything up
+to the last `/`), drop trailing Hive-style partition segments
+(`name=value`, such as `dt=2026-01-01` and `region=in`), then drop one
+trailing `data` segment (Iceberg keeps data files under `<table>/data/`).
+So `lake/customers/dt=2026-01-01/region=in/part-0.parquet`,
+`lake/customers/data/part-0.parquet` and a Delta table's
+`lake/customers/part-0.parquet` are all table `lake/customers`. Files at the
+bucket root are table `(bucket root)` (`""` in JSON and CSV). A directory
+named `data` that isn't Iceberg's is folded into its parent all the same.
+
+**Entries.** Each table lists one line per column and PII rule,
+undocumented ones first, then documented, each by column: the highest
+confidence any file reached, what the findings rest on (`values` if any
+file's did), and a status. An `UNDOCUMENTED` line gives its non-zero file
+counts (`3 files confirmed, 1 likely`; suppressed files too, if only some
+were); it is undocumented if any file's finding was not suppressed. A
+documented line gives all its files and the reason of the first `--config`
+entry (in file order) that suppressed them: `4 files, documented: <reason>`.
+JSON and CSV keep every count. Each table
+also gives its files scanned and not scanned, the unscanned ones by reason,
+documented or not, and an example key: the smallest key in the table with a
+PII finding. No sampled value appears, in any format.
+
+**Documenting a location.** To record that a column is meant to hold
+personal data, suppress its rule for that column under the table's prefix,
+with the reason (see [Suppressions](#suppressions)):
+
+```toml
+[[suppress]]
+rule = "pii-email"
+prefix = "lake/customers/"
+column = "email"
+reason = "Consented marketing contacts, DPA-12"
+expires = 2027-06-30
+```
+
+The finding then stops counting toward the verdict and the findings stream,
+but stays in the inventory, as documented, with that reason.
+
+**CSV export.** `--inventory <PATH>` writes the same inventory as CSV, one
+row per table, column and rule, under a header row: `table`, `column`,
+`rule`, `highest_confidence`, `evidence`, `files_confirmed`,
+`files_likely`, `files_possible`, `files_suppressed`, `status`
+(`UNDOCUMENTED` or `documented`), `reason`, and `example_key` (the table's).
+It follows RFC 4180 (CRLF line ends; a field with a comma or quote is
+quoted, with quotes doubled). The CSV is a human-facing report, and table
+names, column paths, keys and reasons are attacker-controlled, so it is
+escaped like the text summary: control characters (ESC, newline, tab...)
+and the bidi controls U+202A-U+202E and U+2066-U+2069 are written as
+`\u{XXXX}`, so `--inventory -` can't drive your terminal and a name can't
+display as a different one. Then a cell that starts with `=`, `+`, `-` or
+`@` is prefixed with `'`, which stops spreadsheets from running it as a
+formula. Read such a cell without its leading `'`. The JSON summary and the
+`--findings` stream are the exact-data channels: they carry every name
+byte for byte (JSON-escaped).
+
+**Caps.** At most 4,096 tables and 16,384 entries (table, column, rule) are
+kept, so the inventory's memory stays bounded (~16.5 MiB at the caps). Over
+a cap, the lexicographically smallest tables and entries are kept, the
+same whatever order files arrive in, with every kept count exact. What is
+left out is counted (files and findings) and reported in a `truncated:`
+line, `left_out` in JSON. Scan a narrower prefix to see the rest.
+
+### Coverage fails closed
+
+COVERAGE counts the eligible Parquet files, those scanned (with the
+percentage, rounded down, so it never reads 100% unless every file was
+scanned), and those not scanned, split into **documented** (their
+`content-not-scanned` finding was suppressed) and **undocumented**.
+
+Any undocumented file fails the run with exit code 6, even among thousands
+of readable ones, and even when exit 1 would otherwise apply: an inventory
+is only evidence if the files it skipped are accounted for. stderr says how
+many, by reason. To accept a file that can't be scanned (a known-corrupt
+export, a blob table with no personal data), document it:
+
+```toml
+[[suppress]]
+rule = "content-not-scanned"
+prefix = "lake/raw_blobs/"
+reason = "Binary payloads, no personal data; reviewed 2026-10-01"
+expires = 2027-04-01
+```
 
 ## Suppressions
 
@@ -319,7 +441,11 @@ When several entries match a finding, the first one in the file wins.
 
 A suppressed finding still counts, but only as suppressed. It does not appear
 in the findings matrix, does not affect the verdict or exit code, and is not
-written to the `--findings` stream. The summary shows each rule's suppressed
+written to the `--findings` stream. A suppressed PII finding stays in the
+[PII inventory](#pii-inventory-and-coverage), marked documented with the
+entry's reason, and a suppressed `content-not-scanned` finding no longer
+fails the run with exit code 6: suppressions are how PII locations and
+unscannable files are documented. The summary shows each rule's suppressed
 count. Its SUPPRESSIONS section (and `suppressions` in JSON) lists entries that
 have **expired** and active entries that were **unused**, meaning they
 suppressed nothing in this scan. Unless `--quiet` is given, each of those also
@@ -351,13 +477,30 @@ covers:
 - `verdict`: `worst_severity`, or `null`
 - `inventory`: object and byte totals, overall and per storage class
 - `findings`: per rule, counts and bytes per severity plus `suppressed`
-  `{count, bytes}`. For a content rule, `bytes` is the size of the file the
-  finding is in, once per finding.
+  `{count, bytes}`. For `content-not-scanned`, `bytes` is the size of the
+  file. For PII rules, both byte totals are always `0`, as not applicable:
+  their findings are about columns, and a file's size would be counted once
+  per column. The text summary shows `-` for them.
 - `content`: with `--pii`, Parquet files found, scanned whole or partially,
   and not scanned by reason; columns examined and skipped by reason
   (`repeated`, `unsupported_type`, `page_too_large`, `unreadable`,
   `unsupported_codec`); bytes read and `GET` requests. `null` without
   `--pii`.
+- `coverage`: with `--pii`, `files_eligible`, `files_scanned`,
+  `not_scanned_suppressed`, `not_scanned_unsuppressed`, and `percent`
+  (rounded down to one decimal; `null` with no eligible file). `null`
+  without `--pii`.
+- `pii_inventory`: with `--pii`, `tables` (sorted by name), each with
+  `table`, `status` (`pii_found`, `no_pii_in_scanned_files` or
+  `not_scanned`), `files_eligible`, `files_scanned`, `files_not_scanned`,
+  `not_scanned` (per reason with any, `{suppressed, unsuppressed}`),
+  `example_key` (or `null`) and `columns` (sorted by column, then rule), each
+  with `column`, `rule`, `highest_confidence`, `evidence`,
+  `files_confirmed`, `files_likely`, `files_possible`, `files_suppressed`,
+  `status` (`UNDOCUMENTED` or `documented`) and `reason` (or `null`); plus
+  `summary` (`tables_with_pii`, `pii_columns`, `undocumented`, `documented`,
+  `tables_not_fully_scanned`), `left_out` (`files`, `findings`) and `caps`
+  (`tables`, `entries`). `null` without `--pii`.
 - `suppressions`: `expired` and `unused` entries
 - `samples`: up to 10 example findings per rule. A PII sample also has
   `column`, `confidence` and `evidence` (`values` or `column-name`), plus
@@ -397,6 +540,13 @@ changing what it means bumps `schema_version`.
   column whose personal data appears only in other pages can be missed.
 - **Sequential.** Files are read one at a time, so a lake of many small files
   takes one round trip per file, or more.
+- **Tables are guessed from keys.** The inventory groups files by directory,
+  minus Hive partitions and an Iceberg `data/` directory. It does not read
+  Glue, Hive, Iceberg or Delta metadata, so a table laid out differently is
+  split or merged.
+- **Inventory caps.** Past 4,096 tables or 16,384 table/column/rule entries,
+  the largest names are left out and counted. Scan by prefix for bigger
+  lakes.
 - **Encryption.** Files using Parquet modular encryption with an encrypted
   footer are reported as `encrypted`. Files that encrypt only some columns,
   with a plaintext footer, are reported as `unreadable` or have those
@@ -452,8 +602,9 @@ docker stop lakescan-moto
 The seeder fills two buckets: `lakescan-demo` for the listing rules, and
 `lakescan-pii` with the Parquet fixtures in
 [`tests/fixtures/parquet`](tests/fixtures/parquet/README.md), written by
-pyarrow, polars, DuckDB and Spark. That README lists each fixture's ground
-truth and how to regenerate it.
+pyarrow, polars, DuckDB and Spark, uploaded under partitioned keys (Hive
+`dt=`/`region=` and Iceberg `data/`) so the inventory has tables to group.
+That README lists each fixture's ground truth and how to regenerate it.
 
 ## License
 

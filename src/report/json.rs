@@ -9,8 +9,11 @@ use serde::Serialize;
 
 use super::findings::DetailFields;
 use super::rfc3339::format_rfc3339;
-use super::{TOOL_NAME, TOOL_VERSION};
-use crate::aggregate::{Aggregates, ContentSummary, CountBytes, Sample, SampleDetail};
+use super::{TOOL_NAME, TOOL_VERSION, status_of};
+use crate::aggregate::{
+    Aggregates, ContentSummary, CountBytes, Coverage, InventoryEntry, InventorySummary,
+    MAX_ENTRIES, MAX_TABLES, PiiInventory, Sample, SampleDetail, Table,
+};
 use crate::error::LakeScanError;
 use crate::model::{NotScannedReason, RuleId, Severity};
 use crate::suppress::{Entry, Outcome, Pattern};
@@ -280,6 +283,172 @@ struct DistinctContentSection {
     duplicates_significant: bool,
 }
 
+/// The `coverage` section: [`Coverage`], field for field.
+#[derive(Serialize)]
+struct CoverageSection {
+    files_eligible: u64,
+    files_scanned: u64,
+    not_scanned_suppressed: u64,
+    not_scanned_unsuppressed: u64,
+    percent: Option<f64>,
+}
+
+impl From<Coverage> for CoverageSection {
+    fn from(coverage: Coverage) -> Self {
+        Self {
+            files_eligible: coverage.files_eligible,
+            files_scanned: coverage.files_scanned,
+            not_scanned_suppressed: coverage.not_scanned_suppressed,
+            not_scanned_unsuppressed: coverage.not_scanned_unsuppressed,
+            percent: coverage.percent,
+        }
+    }
+}
+
+/// A table's unscanned files for one reason.
+#[derive(Serialize)]
+struct NotScannedCounts {
+    suppressed: u64,
+    unsuppressed: u64,
+}
+
+/// One `(column, rule)` location in a table.
+#[derive(Serialize)]
+struct InventoryColumn<'a> {
+    column: &'a str,
+    rule: &'static str,
+    highest_confidence: &'static str,
+    evidence: &'static str,
+    files_confirmed: u64,
+    files_likely: u64,
+    files_possible: u64,
+    files_suppressed: u64,
+    status: &'static str,
+    reason: Option<&'a str>,
+}
+
+impl<'a> InventoryColumn<'a> {
+    fn from_entry(entry: &'a InventoryEntry, suppressions: &'a Outcome) -> Self {
+        let (status, reason) = status_of(entry.status(), suppressions);
+        Self {
+            column: entry.column(),
+            rule: entry.rule().code(),
+            highest_confidence: entry.highest_confidence().code(),
+            evidence: entry.evidence().code(),
+            files_confirmed: entry.files_confirmed,
+            files_likely: entry.files_likely,
+            files_possible: entry.files_possible,
+            files_suppressed: entry.files_suppressed,
+            status,
+            reason,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct InventoryTable<'a> {
+    table: &'a str,
+    status: &'static str,
+    files_eligible: u64,
+    files_scanned: u64,
+    files_not_scanned: u64,
+    not_scanned: BTreeMap<&'static str, NotScannedCounts>,
+    example_key: Option<&'a str>,
+    columns: Vec<InventoryColumn<'a>>,
+}
+
+impl<'a> InventoryTable<'a> {
+    fn from_table(table: &'a Table, suppressions: &'a Outcome) -> Self {
+        Self {
+            table: table.name(),
+            status: table.status().code(),
+            files_eligible: table.files_eligible,
+            files_scanned: table.files_scanned,
+            files_not_scanned: table.files_not_scanned(),
+            not_scanned: NotScannedReason::ALL
+                .into_iter()
+                .filter_map(|reason| {
+                    let counts = NotScannedCounts {
+                        suppressed: table.not_scanned_suppressed(reason),
+                        unsuppressed: table.not_scanned_unsuppressed(reason),
+                    };
+                    (counts.suppressed + counts.unsuppressed > 0).then_some((reason.code(), counts))
+                })
+                .collect(),
+            example_key: table.example_key(),
+            columns: table
+                .entries()
+                .iter()
+                .map(|entry| InventoryColumn::from_entry(entry, suppressions))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LeftOut {
+    files: u64,
+    findings: u64,
+}
+
+#[derive(Serialize)]
+struct Caps {
+    tables: usize,
+    entries: usize,
+}
+
+/// The headline counts: [`InventorySummary`], field for field.
+#[derive(Serialize)]
+struct InventorySummarySection {
+    tables_with_pii: u64,
+    pii_columns: u64,
+    undocumented: u64,
+    documented: u64,
+    tables_not_fully_scanned: u64,
+}
+
+impl From<InventorySummary> for InventorySummarySection {
+    fn from(summary: InventorySummary) -> Self {
+        Self {
+            tables_with_pii: summary.tables_with_pii,
+            pii_columns: summary.pii_columns,
+            undocumented: summary.undocumented,
+            documented: summary.documented,
+            tables_not_fully_scanned: summary.tables_not_fully_scanned,
+        }
+    }
+}
+
+/// The `pii_inventory` section.
+#[derive(Serialize)]
+struct PiiInventorySection<'a> {
+    summary: InventorySummarySection,
+    tables: Vec<InventoryTable<'a>>,
+    left_out: LeftOut,
+    caps: Caps,
+}
+
+impl<'a> PiiInventorySection<'a> {
+    fn from_inventory(inventory: &'a PiiInventory, suppressions: &'a Outcome) -> Self {
+        Self {
+            summary: inventory.summary().into(),
+            tables: inventory
+                .tables()
+                .iter()
+                .map(|table| InventoryTable::from_table(table, suppressions))
+                .collect(),
+            left_out: LeftOut {
+                files: inventory.left_out_files(),
+                findings: inventory.left_out_findings(),
+            },
+            caps: Caps {
+                tables: MAX_TABLES,
+                entries: MAX_ENTRIES,
+            },
+        }
+    }
+}
+
 /// The `samples` section: a map from rule code to that rule's samples.
 ///
 /// A `BTreeMap`, so keys come out alphabetically — not [`RuleId::ALL`]
@@ -299,6 +468,8 @@ struct Summary<'a> {
     inventory: InventorySection<'a>,
     findings: Vec<FindingSummary>,
     content: Option<ContentSection>,
+    coverage: Option<CoverageSection>,
+    pii_inventory: Option<PiiInventorySection<'a>>,
     suppressions: SuppressionsSection<'a>,
     samples: SamplesSection<'a>,
     largest_objects: Vec<SampleEntry<'a>>,
@@ -430,6 +601,10 @@ fn build<'a>(info: &'a super::ScanInfo, aggregates: &'a Aggregates) -> Summary<'
         inventory: inventory_section(aggregates),
         findings: findings_section(aggregates),
         content: aggregates.content().map(ContentSection::from_summary),
+        coverage: aggregates.coverage().map(CoverageSection::from),
+        pii_inventory: aggregates
+            .pii_inventory()
+            .map(|inventory| PiiInventorySection::from_inventory(inventory, &info.suppressions)),
         suppressions: SuppressionsSection::from_outcome(&info.suppressions),
         samples: samples_section(aggregates),
         largest_objects: aggregates
@@ -500,7 +675,7 @@ mod tests {
 
         assert_eq!(
             value.get("inventory").and_then(|i| i.get("object_count")),
-            Some(&Value::from(9))
+            Some(&Value::from(13))
         );
         assert_eq!(
             value
@@ -566,10 +741,12 @@ mod tests {
             .ok_or("no findings array")?;
         for entry in findings {
             let suppressed = entry.get("suppressed").ok_or("no suppressed field")?;
-            let expected = if entry.get("rule") == Some(&Value::from("sensitive-key")) {
-                serde_json::json!({ "count": 1, "bytes": 400 })
-            } else {
-                serde_json::json!({ "count": 0, "bytes": 0 })
+            // A PII rule's bytes are not applicable, so always 0.
+            let expected = match entry.get("rule").and_then(Value::as_str) {
+                Some("sensitive-key") => serde_json::json!({ "count": 1, "bytes": 400 }),
+                Some("pii-person-name") => serde_json::json!({ "count": 2, "bytes": 0 }),
+                Some("content-not-scanned") => serde_json::json!({ "count": 1, "bytes": 10000 }),
+                _ => serde_json::json!({ "count": 0, "bytes": 0 }),
             };
             assert_eq!(suppressed, &expected, "{entry}");
         }
@@ -614,7 +791,7 @@ mod tests {
         aggregates.observe_object(&object);
         let ctx = crate::rules::EvalContext { now };
         for finding in crate::rules::evaluate(&object, &ctx) {
-            aggregates.observe_suppressed(finding);
+            aggregates.observe_suppressed(finding, 0);
         }
 
         let mut buf = Vec::new();
@@ -679,7 +856,119 @@ mod tests {
                 "small-object-cold-tier",
                 "zero-byte-object",
                 "unknown-storage-class",
+                "pii-email",
+                "pii-phone",
+                "pii-person-name",
+                "content-not-scanned",
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pii_findings_carry_no_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        let value = render()?;
+        let email = value
+            .get("findings")
+            .and_then(Value::as_array)
+            .and_then(|all| {
+                all.iter()
+                    .find(|f| f.get("rule") == Some(&Value::from("pii-email")))
+            })
+            .ok_or("pii-email missing")?;
+        assert_eq!(email.pointer("/counts/high"), Some(&Value::from(2)));
+        assert_eq!(email.pointer("/bytes/high"), Some(&Value::from(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_and_the_pii_inventory_match_the_fixture() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let value = render()?;
+        assert_eq!(
+            value.get("coverage"),
+            Some(&serde_json::json!({
+                "files_eligible": 4,
+                "files_scanned": 3,
+                "not_scanned_suppressed": 1,
+                "not_scanned_unsuppressed": 0,
+                "percent": 75.0
+            }))
+        );
+        let inventory = value.get("pii_inventory").ok_or("no pii_inventory")?;
+        assert_eq!(
+            inventory.get("left_out"),
+            Some(&serde_json::json!({ "files": 0, "findings": 0 }))
+        );
+        assert_eq!(
+            inventory.get("caps"),
+            Some(&serde_json::json!({ "tables": 4096, "entries": 16384 }))
+        );
+        let names: Vec<&str> = inventory
+            .get("tables")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.get("table").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, ["", "warehouse/customers", "warehouse/orders"]);
+        let statuses: Vec<&str> = inventory
+            .get("tables")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.get("status").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            statuses,
+            ["no_pii_in_scanned_files", "pii_found", "not_scanned"]
+        );
+        assert_eq!(
+            inventory.get("summary"),
+            Some(&serde_json::json!({
+                "tables_with_pii": 1,
+                "pii_columns": 3,
+                "undocumented": 2,
+                "documented": 1,
+                "tables_not_fully_scanned": 1
+            }))
+        );
+        assert_eq!(
+            inventory.pointer("/tables/1/columns/2"),
+            Some(&serde_json::json!({
+                "column": "full_name",
+                "rule": "pii-person-name",
+                "highest_confidence": "likely",
+                "evidence": "column-name",
+                "files_confirmed": 0,
+                "files_likely": 0,
+                "files_possible": 0,
+                "files_suppressed": 2,
+                "status": "documented",
+                "reason": "Names are needed for invoicing (DPA section 4)"
+            }))
+        );
+        assert_eq!(
+            inventory.pointer("/tables/1/columns/1/status"),
+            Some(&Value::from("UNDOCUMENTED"))
+        );
+        assert_eq!(
+            inventory.pointer("/tables/1/columns/1/reason"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            inventory.pointer("/tables/1/example_key"),
+            Some(&Value::from(
+                "warehouse/customers/dt=2023-11-01/part-0.parquet"
+            ))
+        );
+        assert_eq!(
+            inventory.pointer("/tables/2/not_scanned"),
+            Some(&serde_json::json!({ "unreadable": { "suppressed": 1, "unsuppressed": 0 } }))
+        );
+        assert_eq!(
+            inventory.pointer("/tables/0/example_key"),
+            Some(&Value::Null)
         );
         Ok(())
     }
@@ -698,6 +987,8 @@ mod tests {
         keys.sort_unstable();
 
         let mut expected = [
+            "pii-email",
+            "pii-phone",
             "sensitive-key",
             "reduced-redundancy",
             "stale-standard",

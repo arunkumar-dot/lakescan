@@ -4,7 +4,8 @@
 //! ```text
 //! lakescan scan <TARGET> [OPTIONS]   scan s3://bucket[/prefix]
 //!                                    (--config <PATH> for suppressions,
-//!                                    --pii to scan Parquet content)
+//!                                    --pii to scan Parquet content,
+//!                                    --inventory <PATH> for its CSV)
 //! lakescan rules                     list every rule's code and title
 //! ```
 //!
@@ -107,6 +108,12 @@ struct ScanArgs {
         requires = "pii"
     )]
     pii_whole_file_max: u64,
+
+    /// With --pii, also write the PII inventory as CSV to PATH, one row
+    /// per (table, column, rule) ("-" for stdout, which requires --output
+    /// to name a file and --findings not to be "-").
+    #[arg(long, value_name = "PATH", requires = "pii")]
+    inventory: Option<PathBuf>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -262,9 +269,20 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
 
     let summary_to_stdout = args.output.as_deref().is_none_or(is_stdout);
     let findings_to_stdout = args.findings.as_deref().is_some_and(is_stdout);
+    let inventory_to_stdout = args.inventory.as_deref().is_some_and(is_stdout);
     if summary_to_stdout && findings_to_stdout {
         return Err(LakeScanError::Usage(
             "--findings - streams findings to stdout, so --output must name a file".to_owned(),
+        ));
+    }
+    if summary_to_stdout && inventory_to_stdout {
+        return Err(LakeScanError::Usage(
+            "--inventory - writes the inventory to stdout, so --output must name a file".to_owned(),
+        ));
+    }
+    if findings_to_stdout && inventory_to_stdout {
+        return Err(LakeScanError::Usage(
+            "--findings - and --inventory - cannot both write to stdout".to_owned(),
         ));
     }
     if args.region.as_deref().is_some_and(str::is_empty) {
@@ -302,6 +320,11 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         .as_deref()
         .map(|path| open_destination(Some(path)))
         .transpose()?;
+    let inventory = args
+        .inventory
+        .as_deref()
+        .map(|path| open_destination(Some(path)))
+        .transpose()?;
 
     let stderr = io::stderr();
     let progress = (!args.quiet && stderr.is_terminal()).then_some(io::stderr());
@@ -321,6 +344,7 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         Outputs {
             summary,
             findings,
+            inventory,
             progress,
             warnings,
             errors: stderr,
@@ -492,6 +516,31 @@ mod tests {
                 "-1",
             ],
             &["lakescan", "scan", "s3://b", "--pii-whole-file-max", "1024"],
+            // --inventory needs --pii, and stdout to itself.
+            &["lakescan", "scan", "s3://b", "--inventory", "inv.csv"],
+            &["lakescan", "scan", "s3://b", "--pii", "--inventory", "-"],
+            &[
+                "lakescan",
+                "scan",
+                "s3://b",
+                "--pii",
+                "--inventory",
+                "-",
+                "--output",
+                "-",
+            ],
+            &[
+                "lakescan",
+                "scan",
+                "s3://b",
+                "--pii",
+                "--inventory",
+                "-",
+                "--findings",
+                "-",
+                "--output",
+                "summary.txt",
+            ],
         ] {
             assert!(usage_error(args).await.is_some(), "{args:?}");
         }

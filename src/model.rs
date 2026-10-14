@@ -336,6 +336,14 @@ impl RuleId {
     pub fn is_content(self) -> bool {
         self.index() >= Self::PiiEmail.index()
     }
+
+    /// Whether this rule says a Parquet column holds personal data: a
+    /// content rule other than `content-not-scanned`. Its findings are
+    /// about a column, not a file, so a byte total is meaningless for them.
+    #[must_use]
+    pub fn is_pii(self) -> bool {
+        self.is_content() && self != Self::ContentNotScanned
+    }
 }
 
 /// A kind of personal data content scanning detects.
@@ -741,6 +749,9 @@ mod tests {
         }
         assert!(RuleId::ContentNotScanned.is_content());
         assert!(!RuleId::UnknownStorageClass.is_content());
+        assert!(rules.iter().all(|rule| rule.is_pii()));
+        assert!(!RuleId::ContentNotScanned.is_pii());
+        assert!(!RuleId::SensitiveKey.is_pii());
     }
 
     #[test]

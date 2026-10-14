@@ -16,6 +16,7 @@ use super::target::Target;
 use crate::aggregate::{Aggregates, ContentSummary};
 use crate::content::{self, ObjectReader};
 use crate::error::{ExitCode, LakeScanError};
+use crate::model::RuleId;
 use crate::model::{Finding, NotScannedReason, Severity};
 use crate::report::{self, FindingsWriter, Format, ScanInfo};
 use crate::rules::{self, EvalContext};
@@ -41,6 +42,9 @@ pub(crate) struct Outputs<O, F, P, D, E> {
     pub(crate) summary: O,
     /// The JSON Lines findings stream, if one was requested.
     pub(crate) findings: Option<F>,
+    /// The PII inventory as CSV (`--inventory`), if requested; written
+    /// after the summary.
+    pub(crate) inventory: Option<F>,
     /// The progress line's destination, or `None` for no progress output.
     /// The caller decides (terminal or not, `--quiet` or not); the driver
     /// only writes to it.
@@ -54,8 +58,10 @@ pub(crate) struct Outputs<O, F, P, D, E> {
 }
 
 /// Runs one scan of `source` to completion and returns its verdict:
-/// [`ExitCode::ContentNotScanned`] when `content` was given, at least one
-/// Parquet file was eligible, and none could be scanned;
+/// [`ExitCode::ContentNotScanned`] when `content` was given and at least
+/// one eligible Parquet file was not scanned without its
+/// `content-not-scanned` finding being suppressed (fail closed; this wins
+/// over a failing severity);
 /// [`ExitCode::FindingsExceedThreshold`] when the worst finding's severity
 /// is at or above `fail_on`; otherwise [`ExitCode::Ok`]. `fail_on` of
 /// `None` never fails on findings.
@@ -68,8 +74,9 @@ pub(crate) struct Outputs<O, F, P, D, E> {
 /// aggregates, and the suppressor (whose expiry check uses its UTC date),
 /// so every stage agrees on it. Every finding passes through the
 /// suppressor: a suppressed one is counted by
-/// [`Aggregates::observe_suppressed`] and goes nowhere else — not the
-/// findings matrix, not the verdict, not the findings stream.
+/// [`Aggregates::observe_suppressed`] (which also records a PII finding in
+/// the inventory as documented) and goes nowhere else — not the findings
+/// matrix, not the verdict, not the findings stream.
 ///
 /// The findings stream is finished before the summary is written, and the
 /// progress line is cleared before either, whether the scan succeeded or
@@ -111,6 +118,7 @@ where
     let Outputs {
         summary,
         findings,
+        inventory,
         mut progress,
         warnings,
         mut errors,
@@ -152,6 +160,9 @@ where
         suppressions: suppressor.finish(),
     };
     report::write_summary(summary, format, &info, &aggregates)?;
+    if let Some(out) = inventory {
+        report::write_inventory_csv(out, &info, &aggregates)?;
+    }
 
     if let Some(mut out) = warnings {
         // Best effort, like progress: the summary already carries these.
@@ -159,7 +170,7 @@ where
     }
 
     if let Some(content) = aggregates.content()
-        && nothing_scanned(content)
+        && content.coverage().not_scanned_unsuppressed > 0
     {
         // Best effort: the exit code carries the verdict regardless.
         let _ = write_not_scanned(&mut errors, content);
@@ -168,28 +179,38 @@ where
     Ok(verdict(aggregates.worst_severity(), fail_on))
 }
 
-/// Whether content scanning found eligible files but scanned none of
-/// them.
-fn nothing_scanned(content: &ContentSummary) -> bool {
-    content.files_eligible > 0 && content.files_scanned() == 0
-}
-
-/// Explains [`ExitCode::ContentNotScanned`]: the reasons, and, when most
-/// files were refused, the permissions content scanning needs.
+/// Explains [`ExitCode::ContentNotScanned`]: the undocumented files by
+/// reason, how to document them, and, when most were refused, the
+/// permissions content scanning needs.
 fn write_not_scanned<E: Write>(out: &mut E, content: &ContentSummary) -> std::io::Result<()> {
+    let coverage = content.coverage();
     let reasons: Vec<String> = NotScannedReason::ALL
         .into_iter()
-        .filter(|&reason| content.not_scanned(reason) > 0)
-        .map(|reason| format!("{}={}", reason.code(), content.not_scanned(reason)))
+        .filter(|&reason| content.not_scanned_unsuppressed(reason) > 0)
+        .map(|reason| {
+            format!(
+                "{}={}",
+                reason.code(),
+                content.not_scanned_unsuppressed(reason)
+            )
+        })
         .collect();
     writeln!(
         out,
-        "lakescan: no Parquet file could be content-scanned ({} eligible: {})",
-        content.files_eligible,
+        "lakescan: {} of {} eligible Parquet files could not be content-scanned and are not \
+         documented ({})",
+        coverage.not_scanned_unsuppressed,
+        coverage.files_eligible,
         reasons.join(", ")
     )?;
-    let denied = content.not_scanned(NotScannedReason::AccessDenied);
-    if denied.saturating_mul(2) > content.not_scanned_total() {
+    writeln!(
+        out,
+        "lakescan: to accept a file that cannot be scanned, document it in --config with a \
+         {} suppression: rule, key or prefix, reason, and optionally expires",
+        RuleId::ContentNotScanned.code()
+    )?;
+    let denied = content.not_scanned_unsuppressed(NotScannedReason::AccessDenied);
+    if denied.saturating_mul(2) > coverage.not_scanned_unsuppressed {
         writeln!(
             out,
             "lakescan: reading Parquet content requires s3:GetObject on the objects, and \
@@ -239,17 +260,18 @@ struct Sinks<'a, F: Write> {
 }
 
 impl<F: Write> Sinks<'_, F> {
-    fn route(&mut self, finding: Finding<'_>) -> Result<(), LakeScanError> {
-        if self.suppressor.suppresses(&finding) {
-            self.aggregates.observe_suppressed(finding);
-            return Ok(());
+    /// Routes `finding`; returns whether a suppression covered it.
+    fn route(&mut self, finding: Finding<'_>) -> Result<bool, LakeScanError> {
+        if let Some(entry) = self.suppressor.matching(&finding) {
+            self.aggregates.observe_suppressed(finding, entry);
+            return Ok(true);
         }
         self.aggregates.observe_finding(finding);
         if let Some(writer) = self.findings.as_deref_mut() {
             writer.write(finding)?;
         }
         self.finding_count = self.finding_count.saturating_add(1);
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -285,10 +307,16 @@ where
             {
                 let scan =
                     content::scan_file(&mut content.reader, object, content.whole_file_max).await;
-                sinks.aggregates.observe_content(&scan);
+                // Whether the file's content-not-scanned finding, if any,
+                // was suppressed: that decides the exit code.
+                let mut suppressed = false;
                 for finding in scan.findings(object) {
-                    sinks.route(finding)?;
+                    let covered = sinks.route(finding)?;
+                    if finding.rule == RuleId::ContentNotScanned {
+                        suppressed = covered;
+                    }
                 }
+                sinks.aggregates.observe_content(object, &scan, suppressed);
                 file_count = file_count.saturating_add(1);
             }
         }
@@ -442,6 +470,7 @@ mod tests {
             Outputs {
                 summary: &mut summary,
                 findings: Some(&mut findings),
+                inventory: None,
                 progress: None::<Vec<u8>>,
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
@@ -492,6 +521,7 @@ mod tests {
                 Outputs {
                     summary: Vec::new(),
                     findings: None::<Vec<u8>>,
+                    inventory: None,
                     progress: None::<Vec<u8>>,
                     warnings: None::<Vec<u8>>,
                     errors: Vec::<u8>::new(),
@@ -517,6 +547,7 @@ mod tests {
             Outputs {
                 summary: Vec::new(),
                 findings: None::<Vec<u8>>,
+                inventory: None,
                 progress: Some(&mut progress),
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
@@ -556,6 +587,7 @@ mod tests {
             Outputs {
                 summary: &mut summary,
                 findings: None::<Vec<u8>>,
+                inventory: None,
                 progress: Some(&mut progress),
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
@@ -569,11 +601,12 @@ mod tests {
     }
 
     /// What one content scan wrote: exit code, summary, findings stream,
-    /// warnings and errors.
+    /// inventory CSV, warnings and errors.
     struct ContentRun {
         code: ExitCode,
         summary: String,
         findings: String,
+        inventory: String,
         warnings: String,
         errors: String,
     }
@@ -596,8 +629,8 @@ mod tests {
                 StorageClass::Standard,
             ));
         }
-        let (mut summary, mut findings, mut warnings, mut errors) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut summary, mut findings, mut inventory, mut warnings, mut errors) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let code = scan(
             source(vec![Step::Page(listed, None)]),
             target(),
@@ -611,6 +644,7 @@ mod tests {
             Outputs {
                 summary: &mut summary,
                 findings: Some(&mut findings),
+                inventory: Some(&mut inventory),
                 progress: None::<Vec<u8>>,
                 warnings: Some(&mut warnings),
                 errors: &mut errors,
@@ -621,6 +655,7 @@ mod tests {
             code,
             summary: String::from_utf8(summary)?,
             findings: String::from_utf8(findings)?,
+            inventory: String::from_utf8(inventory)?,
             warnings: String::from_utf8(warnings)?,
             errors: String::from_utf8(errors)?,
         })
@@ -699,6 +734,7 @@ mod tests {
             Outputs {
                 summary: &mut summary,
                 findings: None::<Vec<u8>>,
+                inventory: None,
                 progress: None::<Vec<u8>>,
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
@@ -733,8 +769,11 @@ mod tests {
         );
         assert_eq!(
             run.errors,
-            "lakescan: no Parquet file could be content-scanned \
-             (2 eligible: not-parquet=1, unreadable=1)\n"
+            "lakescan: 2 of 2 eligible Parquet files could not be content-scanned and are not \
+             documented (not-parquet=1, unreadable=1)\n\
+             lakescan: to accept a file that cannot be scanned, document it in --config with a \
+             content-not-scanned suppression: rule, key or prefix, reason, and optionally \
+             expires\n"
         );
         assert_eq!(run.findings.lines().count(), 2);
         Ok(())
@@ -748,9 +787,12 @@ mod tests {
             columns: Vec::new(),
             stats: crate::content::FileStats::default(),
         };
-        summary.observe_content(&scan(NotScannedReason::AccessDenied));
-        summary.observe_content(&scan(NotScannedReason::AccessDenied));
-        summary.observe_content(&scan(NotScannedReason::NotParquet));
+        let file = object("t/a.parquet", 10, StorageClass::Standard);
+        summary.observe_content(&file, &scan(NotScannedReason::AccessDenied), false);
+        summary.observe_content(&file, &scan(NotScannedReason::AccessDenied), false);
+        summary.observe_content(&file, &scan(NotScannedReason::NotParquet), false);
+        // A documented file is left out of the message.
+        summary.observe_content(&file, &scan(NotScannedReason::Encrypted), true);
         let mut out = Vec::new();
         if let Some(content) = summary.content() {
             super::write_not_scanned(&mut out, content)?;
@@ -787,29 +829,148 @@ mod tests {
         )
         .await?;
         assert_eq!(run.code, ExitCode::ContentNotScanned);
-        assert_eq!(
-            run.errors,
-            "lakescan: no Parquet file could be content-scanned \
-             (1 eligible: no-column-examined=1)\n"
+        assert!(
+            run.errors.starts_with(
+                "lakescan: 1 of 1 eligible Parquet files could not be content-scanned and are \
+                 not documented (no-column-examined=1)\n"
+            ),
+            "{}",
+            run.errors
         );
         assert!(run.summary.contains("page-too-large=1"), "{}", run.summary);
         Ok(())
     }
 
     #[tokio::test]
-    async fn one_scanned_file_is_enough_to_avoid_exit_six() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn one_undocumented_unscannable_file_fails_closed_until_it_is_documented()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let files = [
+            ("lake/t/dt=1/bad.parquet", b"nope".to_vec()),
+            ("lake/t/dt=2/good.parquet", customers_file(50)?),
+            ("lake/t/dt=3/good.parquet", customers_file(50)?),
+        ];
+        // One bad file among readable ones fails closed, and exit 6 wins
+        // over the confirmed (High) PII that would otherwise give exit 1.
+        let run = content_run(&files, Config::default(), Format::Text, 8 * 1024 * 1024).await?;
+        assert_eq!(run.code, ExitCode::ContentNotScanned);
+        assert!(run.errors.contains("1 of 3 eligible"), "{}", run.errors);
+        assert!(run.summary.contains("COVERAGE"), "{}", run.summary);
+        assert!(
+            run.summary.contains("scanned:        2 (66.6%)"),
+            "{}",
+            run.summary
+        );
+
+        // Documented, the file no longer fails the run: it exits by
+        // severity, and coverage says why.
+        let config = Config::parse(
+            "version = 1\n[[suppress]]\nrule = \"content-not-scanned\"\n\
+             key = \"lake/t/dt=1/bad.parquet\"\nreason = \"Known corrupt export\"\n",
+            "test.toml",
+        )?;
+        let run = content_run(&files, config, Format::Json, 8 * 1024 * 1024).await?;
+        assert_eq!(run.code, ExitCode::FindingsExceedThreshold);
+        assert_eq!(run.errors, "");
+        let summary: serde_json::Value = serde_json::from_str(&run.summary)?;
+        assert_eq!(
+            summary.get("coverage"),
+            Some(&serde_json::json!({
+                "files_eligible": 3,
+                "files_scanned": 2,
+                "not_scanned_suppressed": 1,
+                "not_scanned_unsuppressed": 0,
+                "percent": 66.6
+            }))
+        );
+        assert_eq!(
+            summary.pointer("/pii_inventory/tables/0/not_scanned/not-parquet"),
+            Some(&serde_json::json!({ "suppressed": 1, "unsuppressed": 0 }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_inventory_groups_files_into_tables_and_exports_csv()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = Config::parse(
+            r#"
+version = 1
+
+[[suppress]]
+rule = "pii-email"
+prefix = "lake/crm/"
+column = "email"
+reason = "Consented contacts, see DPA-12"
+"#,
+            "test.toml",
+        )?;
         let run = content_run(
             &[
-                ("bad.parquet", b"nope".to_vec()),
-                ("good.parquet", customers_file(50)?),
+                ("lake/crm/dt=2026-01-01/a.parquet", customers_file(100)?),
+                ("lake/crm/dt=2026-01-02/b.parquet", customers_file(100)?),
+                ("lake/=bad,\"name\"/data/c.parquet", customers_file(100)?),
             ],
-            Config::default(),
+            config,
             Format::Text,
             8 * 1024 * 1024,
         )
         .await?;
-        assert_eq!(run.code, ExitCode::FindingsExceedThreshold);
+        assert!(
+            run.summary.contains(
+                "  lake/crm  files: 2 scanned, 0 not scanned\n    example: \
+                 lake/crm/dt=2026-01-01/a.parquet\n"
+            ),
+            "{}",
+            run.summary
+        );
+        assert!(
+            run.summary.contains(
+                "    email  pii-email  confirmed  evidence=values  2 files, documented: Consented \
+                 contacts, see DPA-12\n"
+            ),
+            "{}",
+            run.summary
+        );
+        let rows = crate::report::parse_csv(&run.inventory).ok_or("invalid CSV")?;
+        assert_eq!(
+            rows.first().map(|header| header.join(",")),
+            Some(
+                "table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,\
+                 files_possible,files_suppressed,status,reason,example_key"
+                    .to_owned()
+            )
+        );
+        let cells = |table: &str, column: &str| {
+            rows.iter()
+                .find(|row| {
+                    row.first().map(String::as_str) == Some(table)
+                        && row.get(1).map(String::as_str) == Some(column)
+                })
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            cells("lake/crm", "email"),
+            [
+                "lake/crm",
+                "email",
+                "pii-email",
+                "confirmed",
+                "values",
+                "0",
+                "0",
+                "0",
+                "2",
+                "documented",
+                "Consented contacts, see DPA-12",
+                "lake/crm/dt=2026-01-01/a.parquet"
+            ]
+        );
+        let odd = cells("lake/=bad,\"name\"", "mobile_no");
+        assert_eq!(odd.get(9).map(String::as_str), Some("UNDOCUMENTED"));
+        assert_eq!(odd.get(5).map(String::as_str), Some("1"));
+        // 3 columns in each of 2 tables, plus the header.
+        assert_eq!(rows.len(), 7);
         Ok(())
     }
 
@@ -911,8 +1072,15 @@ reason = "Never matches"
         let mut outputs = String::new();
         for (format, whole_file_max) in [(Format::Text, 8 * 1024 * 1024), (Format::Json, 0)] {
             let run = content_run(&files, config.clone(), format, whole_file_max).await?;
-            assert_eq!(run.code, ExitCode::FindingsExceedThreshold);
-            for text in [run.summary, run.findings, run.warnings, run.errors] {
+            // The broken file is undocumented, so the run fails closed.
+            assert_eq!(run.code, ExitCode::ContentNotScanned);
+            for text in [
+                run.summary,
+                run.findings,
+                run.inventory,
+                run.warnings,
+                run.errors,
+            ] {
                 outputs.push_str(&text);
             }
         }
@@ -959,6 +1127,7 @@ reason = "Never matches anything in this scan"
             Outputs {
                 summary: &mut summary,
                 findings: Some(&mut findings),
+                inventory: None,
                 progress: None::<Vec<u8>>,
                 warnings: Some(&mut warnings),
                 errors: Vec::<u8>::new(),

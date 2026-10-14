@@ -72,11 +72,13 @@ pub enum ExitCode {
     /// will not help.
     Report = 5,
 
-    /// `--pii` was set and at least one eligible Parquet file existed, but
-    /// none could be content-scanned (every one was unreadable, encrypted,
-    /// refused, or not Parquet at all). The summary is still written; this
-    /// takes precedence over [`Self::FindingsExceedThreshold`], since a PII
-    /// scan that read nothing must not pass silently.
+    /// `--pii` was set and at least one eligible Parquet file could not be
+    /// content-scanned (unreadable, encrypted, refused, not Parquet, or
+    /// with every readable column skipped) without its
+    /// `content-not-scanned` finding being suppressed: coverage fails
+    /// closed. The summary is still written; this takes precedence over
+    /// [`Self::FindingsExceedThreshold`], since an inventory with
+    /// unexplained gaps must not pass as evidence.
     ContentNotScanned = 6,
 }
 

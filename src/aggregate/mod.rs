@@ -3,7 +3,9 @@
 //! Single responsibility: answer whole-bucket questions — totals, top-k,
 //! distributions, cardinalities — without ever holding the bucket in memory.
 //! Findings that `suppress` set aside arrive separately, through
-//! [`Aggregates::observe_suppressed`], and are only counted per rule.
+//! [`Aggregates::observe_suppressed`]: they are counted per rule and, for
+//! PII findings, recorded in the PII inventory as documented, and nothing
+//! else.
 //!
 //! **Memory budget: 18 MB.** Bounded sketches only. Every aggregator declares
 //! a `const` upper bound on its own footprint, and no aggregator may use a
@@ -12,12 +14,13 @@
 //! objects, which is exactly why its bound is explicit and checked.
 //!
 //! [`Aggregates::MAX_BYTES`] is a compile-time-checked sum of every summary's
-//! own `MAX_BYTES`: **270,848 bytes (~265 KiB)** as of M7 (15 rules, each
-//! sample able to carry a 256-byte column path, plus the fixed-size
-//! [`ContentSummary`]), asserted below to be no more than 18 MiB. The real
-//! total is far smaller than that ceiling, because every fixed capacity
-//! here (10 samples per rule, 20 largest objects, 16 KiB of `Hll`
-//! registers) is sized for what a report needs, not for the budget. Every summary here is mergeable and
+//! own `MAX_BYTES`: **17,541,072 bytes (~16.7 MiB)** as of M8, asserted
+//! below to be no more than 18 MiB. Nearly all of it is the
+//! [`PiiInventory`] at its caps (17,268,800 bytes: 4,096 tables, 16,384
+//! entries, with 1 KiB names and keys and 256-byte column paths);
+//! everything else (15 rules' samples, the fixed-size [`ContentSummary`],
+//! 16 KiB of `Hll` registers) is 272,272 bytes. The real total is far smaller than that ceiling
+//! unless a lake really has thousands of tables. Every summary here is mergeable and
 //! order-independent: observing the same objects and findings in any order,
 //! or splitting them across any number of [`Aggregates`] and folding the
 //! results together with [`Aggregates::merge`], produces the identical
@@ -29,6 +32,7 @@ mod content;
 mod hyperloglog;
 mod inventory;
 mod matrix;
+mod pii;
 mod sample;
 mod size_histogram;
 mod stats;
@@ -43,12 +47,16 @@ use matrix::FindingsMatrix;
 use size_histogram::SizeHistogram;
 use topk::TopK;
 
-pub use content::ContentSummary;
+pub use content::{ContentSummary, Coverage};
+pub use pii::{
+    EvidenceKind, InventoryEntry, InventorySummary, MAX_ENTRIES, MAX_TABLES, PiiInventory, Status,
+    Table, TableStatus, table_of,
+};
 pub use sample::{Sample, SampleDetail};
 pub use stats::CountBytes;
 
 use crate::content::FileScan;
-use crate::model::{Finding, ObjectMeta, RuleId, Severity, StorageClass};
+use crate::model::{Detail, Finding, ObjectMeta, RuleId, Severity, StorageClass};
 
 /// How many rules exist; sizes the per-rule sample array.
 const NUM_RULES: usize = RuleId::ALL.len();
@@ -81,13 +89,16 @@ pub struct Aggregates {
     hll: Hll,
     /// Content-scanning totals; `None` unless content scanning is on.
     content: Option<ContentSummary>,
+    /// Where PII was found, per table and column; reported only when
+    /// content scanning is on.
+    pii: PiiInventory,
 }
 
 impl Aggregates {
     /// The combined worst-case size of every summary this struct holds:
-    /// the plain sum of each summary type's own `MAX_BYTES`. 270,848 bytes
-    /// as of this milestone (see this module's doc); checked below to be
-    /// within the 18 MiB module budget.
+    /// the plain sum of each summary type's own `MAX_BYTES`. 17,541,072
+    /// bytes as of this milestone (see this module's doc); checked below
+    /// to be within the 18 MiB module budget.
     pub const MAX_BYTES: usize = Inventory::MAX_BYTES
         + FindingsMatrix::MAX_BYTES
         + NUM_RULES * TopK::<Sample, SAMPLES_PER_RULE>::MAX_BYTES
@@ -96,7 +107,8 @@ impl Aggregates {
         + SizeHistogram::MAX_BYTES
         + AgeHistogram::MAX_BYTES
         + Hll::MAX_BYTES
-        + ContentSummary::MAX_BYTES;
+        + ContentSummary::MAX_BYTES
+        + PiiInventory::MAX_BYTES;
 
     /// Starts an empty summary. `now` should be the same scan-start
     /// instant passed to [`crate::rules::EvalContext`], so that this
@@ -115,6 +127,7 @@ impl Aggregates {
             age_histogram: AgeHistogram::default(),
             hll: Hll::default(),
             content: None,
+            pii: PiiInventory::default(),
         }
     }
 
@@ -124,18 +137,46 @@ impl Aggregates {
         self.content.get_or_insert_with(ContentSummary::default);
     }
 
-    /// Records one content-scanned (or unscannable) file. Enables the
-    /// content summary if it was not already.
-    pub fn observe_content(&mut self, scan: &FileScan) {
+    /// Records one content-scanned (or unscannable) file, `object`, in the
+    /// content summary and its table's file counts. `suppressed` says
+    /// whether its `content-not-scanned` finding, if it had one, was
+    /// suppressed. Enables the content summary if it was not already. The
+    /// file's findings arrive separately, through
+    /// [`Aggregates::observe_finding`] and [`Aggregates::observe_suppressed`].
+    pub fn observe_content(&mut self, object: &ObjectMeta, scan: &FileScan, suppressed: bool) {
         self.content
             .get_or_insert_with(ContentSummary::default)
-            .observe(scan);
+            .observe(scan, suppressed);
+        self.pii.observe_file(&object.key, scan.outcome, suppressed);
     }
 
     /// The content summary, or `None` if content scanning was off.
     #[must_use]
     pub fn content(&self) -> Option<&ContentSummary> {
         self.content.as_ref()
+    }
+
+    /// Content-scanning coverage, or `None` if content scanning was off.
+    #[must_use]
+    pub fn coverage(&self) -> Option<Coverage> {
+        self.content.as_ref().map(ContentSummary::coverage)
+    }
+
+    /// The PII inventory, or `None` if content scanning was off.
+    #[must_use]
+    pub fn pii_inventory(&self) -> Option<&PiiInventory> {
+        self.content.is_some().then_some(&self.pii)
+    }
+
+    /// The bytes a finding adds to its rule's totals: the object's size,
+    /// except for a PII finding, which is about a column, not a file, so
+    /// a byte total would only count the file once per column.
+    fn finding_bytes(finding: &Finding<'_>) -> u64 {
+        if finding.rule.is_pii() {
+            0
+        } else {
+            finding.object.size
+        }
     }
 
     /// Records one listed object: the inventory, both histograms, the
@@ -157,8 +198,17 @@ impl Aggregates {
     /// Records one finding: the findings matrix, and a candidacy check
     /// against that rule's sample list.
     pub fn observe_finding(&mut self, finding: Finding<'_>) {
-        self.matrix
-            .observe(finding.rule, finding.severity, finding.object.size);
+        self.matrix.observe(
+            finding.rule,
+            finding.severity,
+            Self::finding_bytes(&finding),
+        );
+        if let Detail::Column(detail) = finding.detail
+            && finding.rule.is_pii()
+        {
+            self.pii
+                .observe_pii(&finding.object.key, finding.rule, detail, None);
+        }
 
         if let Some(slot) = self.samples.get_mut(finding.rule.index()) {
             let severity = finding.severity;
@@ -173,12 +223,20 @@ impl Aggregates {
         }
     }
 
-    /// Records one suppressed finding: its rule's suppressed count and
-    /// bytes, and nothing else. A suppressed finding never reaches the
-    /// findings matrix (so never the verdict) or a rule's samples.
-    pub fn observe_suppressed(&mut self, finding: Finding<'_>) {
+    /// Records one suppressed finding, covered by the `--config` entry at
+    /// index `entry`: its rule's suppressed count and bytes, and, for a PII
+    /// finding, its inventory entry, as documented by that suppression. A
+    /// suppressed finding never reaches the findings matrix (so never the
+    /// verdict) or a rule's samples.
+    pub fn observe_suppressed(&mut self, finding: Finding<'_>, entry: usize) {
         if let Some(cell) = self.suppressed.get_mut(finding.rule.index()) {
-            cell.observe(finding.object.size);
+            cell.observe(Self::finding_bytes(&finding));
+        }
+        if let Detail::Column(detail) = finding.detail
+            && finding.rule.is_pii()
+        {
+            self.pii
+                .observe_pii(&finding.object.key, finding.rule, detail, Some(entry));
         }
     }
 
@@ -201,6 +259,7 @@ impl Aggregates {
             (mine @ None, theirs) => *mine = theirs,
             (Some(_), None) => {}
         }
+        self.pii.merge(other.pii);
     }
 
     /// The total number of objects observed.
@@ -381,6 +440,7 @@ impl Aggregates {
         self.inventory.heap_bytes()
             + self.samples.iter().map(TopK::heap_bytes).sum::<usize>()
             + self.largest.heap_bytes()
+            + self.pii.heap_bytes()
     }
 }
 
@@ -409,8 +469,12 @@ fn u64_to_f64(value: u64) -> f64 {
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use super::Aggregates;
-    use crate::model::{ObjectMeta, RuleId, Severity, StorageClass};
+    use super::{Aggregates, PiiInventory};
+    use crate::content::{ColumnFinding, FileOutcome, FileScan, FileStats};
+    use crate::model::{
+        ColumnDetail, Confidence, Evidence, NotScannedReason, ObjectMeta, PiiType, RuleId,
+        Severity, StorageClass,
+    };
     use crate::rules::{self, EvalContext};
 
     fn now() -> SystemTime {
@@ -503,6 +567,130 @@ mod tests {
 
         assert_eq!(forward, backward);
         assert_eq!(forward, merged);
+    }
+
+    /// Parquet objects in a few partitioned tables, each with a made-up
+    /// content scan: some with PII, some not scanned; and which of their
+    /// findings a suppression (by index) covered.
+    fn content_fixture() -> Vec<(ObjectMeta, FileScan, Option<usize>)> {
+        let mut out = Vec::new();
+        for table in 0..4_u64 {
+            for file in 0..5_u64 {
+                let object = ObjectMeta {
+                    key: format!("lake/t{table}/dt={file}/part-0.parquet"),
+                    size: 1000 + table * 10 + file,
+                    last_modified: now(),
+                    etag: format!("etag-{table}-{file}"),
+                    storage_class: StorageClass::Standard,
+                };
+                let outcome = if file == 4 {
+                    FileOutcome::NotScanned(NotScannedReason::Unreadable)
+                } else {
+                    FileOutcome::ScannedWhole
+                };
+                let columns = if file == 4 {
+                    Vec::new()
+                } else {
+                    vec![ColumnFinding {
+                        pii: if table % 2 == 0 {
+                            PiiType::Email
+                        } else {
+                            PiiType::Phone
+                        },
+                        detail: ColumnDetail::new(
+                            "contact",
+                            Confidence::Confirmed,
+                            Evidence::Values {
+                                matched: 30,
+                                sampled: 30,
+                            },
+                        ),
+                    }]
+                };
+                let scan = FileScan {
+                    outcome,
+                    columns,
+                    stats: FileStats::default(),
+                };
+                let suppression =
+                    (table == 1 || file == 4).then_some(usize::try_from(table).unwrap_or(0));
+                out.push((object, scan, suppression));
+            }
+        }
+        out
+    }
+
+    /// Observes `files` as the driver does: every finding through
+    /// `observe_finding` or, if suppressed, `observe_suppressed`, then the
+    /// file itself.
+    fn observe_content(files: &[(ObjectMeta, FileScan, Option<usize>)]) -> Aggregates {
+        let mut aggregates = Aggregates::new(now());
+        aggregates.enable_content();
+        for (object, scan, suppression) in files {
+            aggregates.observe_object(object);
+            for finding in scan.findings(object) {
+                match suppression {
+                    Some(entry) => aggregates.observe_suppressed(finding, *entry),
+                    None => aggregates.observe_finding(finding),
+                }
+            }
+            aggregates.observe_content(object, scan, suppression.is_some());
+        }
+        aggregates
+    }
+
+    #[test]
+    fn content_coverage_and_the_pii_inventory_are_order_independent_and_mergeable() {
+        let files = content_fixture();
+        let mut reversed = files.clone();
+        reversed.reverse();
+        let forward = observe_content(&files);
+        assert_eq!(forward, observe_content(&reversed));
+        for split in [1, 7, 13] {
+            let (first, second) = files.split_at(split);
+            let mut merged = observe_content(second);
+            merged.merge(observe_content(first));
+            assert_eq!(forward, merged, "split at {split}");
+        }
+
+        let coverage = forward.coverage();
+        assert_eq!(
+            coverage.map(|c| (c.files_eligible, c.files_scanned, c.not_scanned_suppressed)),
+            Some((20, 16, 4))
+        );
+        let inventory = forward.pii_inventory().map(PiiInventory::tables);
+        let tables: Vec<(&str, u64)> = inventory
+            .into_iter()
+            .flatten()
+            .map(|t| (t.name(), t.files_eligible))
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                ("lake/t0", 5),
+                ("lake/t1", 5),
+                ("lake/t2", 5),
+                ("lake/t3", 5)
+            ]
+        );
+        // PII findings count, but carry no bytes; suppressed ones stay out
+        // of the matrix.
+        assert_eq!(
+            forward.matrix_cell(RuleId::PiiEmail, Severity::High).count,
+            8
+        );
+        assert_eq!(
+            forward.matrix_cell(RuleId::PiiEmail, Severity::High).bytes,
+            0
+        );
+        assert_eq!(
+            forward.matrix_cell(RuleId::PiiPhone, Severity::High).count,
+            4
+        );
+        assert_eq!(forward.suppressed(RuleId::PiiPhone).count, 4);
+        assert_eq!(forward.suppressed(RuleId::PiiPhone).bytes, 0);
+        // Without content scanning, there is no coverage or inventory.
+        assert_eq!(observe_all(&fixture_objects()).pii_inventory(), None);
     }
 
     #[test]
@@ -698,7 +886,7 @@ mod tests {
         };
         aggregates.observe_object(&object);
         for finding in rules::evaluate(&object, &ctx) {
-            aggregates.observe_suppressed(finding);
+            aggregates.observe_suppressed(finding, 0);
         }
 
         let suppressed = aggregates.suppressed(RuleId::SensitiveKey);

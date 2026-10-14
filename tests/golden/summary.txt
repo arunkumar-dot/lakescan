@@ -7,10 +7,10 @@ VERDICT
   worst severity: high
 
 INVENTORY
-  objects:     9
-  total bytes: 2147492481 (2.0 GiB)
+  objects:     13
+  total bytes: 2156504481 (2.0 GiB)
   by storage class:
-    STANDARD                 count=6          bytes=2147486608 (2.0 GiB)
+    STANDARD                 count=10         bytes=2156498608 (2.0 GiB)
     REDUCED_REDUNDANCY       count=1          bytes=4096 (4.0 KiB)
     GLACIER                  count=1          bytes=1000 (1000 B)
     FUTURE_TIER              count=1          bytes=777 (777 B)
@@ -29,6 +29,41 @@ FINDINGS
     info: 1 (0 B)
   unknown-storage-class - Object reports a storage class this build of LakeScan does not recognize
     info: 1 (777 B)
+  pii-email - Parquet column holds email addresses
+    high: 2 (-)
+  pii-phone - Parquet column holds phone numbers
+    medium: 1 (-)
+  pii-person-name - Parquet column holds people's names
+    suppressed: 2 (-)
+  content-not-scanned - Parquet file could not be content-scanned
+    suppressed: 1 (9.7 KiB)
+
+CONTENT
+  parquet files:      4
+    scanned whole:     2
+    scanned partially: 1
+    not scanned:       1 (unreadable=1)
+  columns examined:   0
+  columns skipped:    0 (repeated=0, unsupported-type=0, page-too-large=0, unreadable=0, unsupported-codec=0)
+  bytes read:         0 (0 B)
+  GET requests:       0
+
+COVERAGE
+  parquet files:  4
+  scanned:        3 (75.0%)
+  not scanned:    1 documented, 0 undocumented
+
+PII INVENTORY
+  1 tables with PII, 3 PII columns: 2 undocumented (action needed), 1 documented. 1 tables not fully scanned.
+  (bucket root)  files: 1 scanned, 0 not scanned
+    no PII found in 1 scanned file
+  warehouse/customers  files: 2 scanned, 0 not scanned
+    example: warehouse/customers/dt=2023-11-01/part-0.parquet
+    contact.phone  pii-phone  likely  evidence=values  1 file likely  UNDOCUMENTED
+    email  pii-email  confirmed  evidence=values  2 files confirmed  UNDOCUMENTED
+    full_name  pii-person-name  likely  evidence=column-name  2 files, documented: Names are needed for invoicing (DPA section 4)
+  warehouse/orders  files: 0 scanned, 1 not scanned (unreadable=1 documented)
+    not scanned: PII unknown
 
 SUPPRESSIONS
   expired:
@@ -49,11 +84,20 @@ SAMPLES
     placeholder/empty.txt  severity=info size=0 (0 B) class=STANDARD modified=2023-11-14T22:13:20Z
   [unknown-storage-class]
     unknown/object.dat  severity=info size=777 (777 B) class=FUTURE_TIER modified=2023-11-14T22:13:20Z
+  [pii-email]
+    warehouse/customers/dt=2023-11-01/part-0.parquet  column=email confidence=confirmed evidence=values matched=1900/2000  severity=high size=5000000 (4.7 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
+    warehouse/customers/dt=2023-11-02/part-0.parquet  column=email confidence=confirmed evidence=values matched=1900/2000  severity=high size=4000000 (3.8 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
+  [pii-phone]
+    warehouse/customers/dt=2023-11-01/part-0.parquet  column=contact.phone confidence=likely evidence=values matched=20/24  severity=medium size=5000000 (4.7 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
 
 LARGEST OBJECTS
   old/dataset.bin  size=2147483648 (2.0 GiB) class=STANDARD modified=2023-04-28T22:13:20Z
+  warehouse/customers/dt=2023-11-01/part-0.parquet  size=5000000 (4.7 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
+  warehouse/customers/dt=2023-11-02/part-0.parquet  size=4000000 (3.8 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
+  warehouse/orders/data/part-0.parquet  size=10000 (9.7 KiB) class=STANDARD modified=2023-11-14T22:13:20Z
   backups/archive.tar  size=4096 (4.0 KiB) class=REDUCED_REDUNDANCY modified=2023-11-14T22:13:20Z
   reports/2024/summary.csv  size=2048 (2.0 KiB) class=STANDARD modified=2023-11-14T22:13:20Z
+  events.parquet  size=2000 (1.9 KiB) class=STANDARD modified=2023-11-14T22:13:20Z
   cold/thumbnail.jpg  size=1000 (1000 B) class=GLACIER modified=2023-11-14T22:13:20Z
   unknown/object.dat  size=777 (777 B) class=FUTURE_TIER modified=2023-11-14T22:13:20Z
   id_rsa  size=512 (512 B) class=STANDARD modified=2023-11-14T22:13:20Z
@@ -65,14 +109,18 @@ SIZE HISTOGRAM
   [0, 1)                   count=2          bytes=0 (0 B)
   [256, 512)               count=1          bytes=400 (400 B)
   [512, 1024)              count=3          bytes=2289 (2.2 KiB)
+  [1024, 2048)             count=1          bytes=2000 (1.9 KiB)
   [2048, 4096)             count=1          bytes=2048 (2.0 KiB)
   [4096, 8192)             count=1          bytes=4096 (4.0 KiB)
+  [8192, 16384)            count=1          bytes=10000 (9.7 KiB)
+  [2097152, 4194304)       count=1          bytes=4000000 (3.8 MiB)
+  [4194304, 8388608)       count=1          bytes=5000000 (4.7 MiB)
   [2147483648, 4294967296) count=1          bytes=2147483648 (2.0 GiB)
 
 AGE HISTOGRAM
-  [0d, 1d)                 count=8          bytes=8833 (8.6 KiB)
+  [0d, 1d)                 count=12         bytes=9020833 (8.6 MiB)
   [180d, 365d)             count=1          bytes=2147483648 (2.0 GiB)
 
 DISTINCT CONTENT
-  ~9 distinct (etag, size) values across 9 objects; no duplicates detected (differences under ~2% are within estimator error)
+  ~13 distinct (etag, size) values across 13 objects; no duplicates detected (differences under ~2% are within estimator error)
   (re-uploaded or re-encrypted content gets a new ETag and is not detected)

@@ -69,13 +69,17 @@ enum State {
 
 /// What a scan's suppressions amounted to, for the report: the entries
 /// that expired and the active entries that suppressed nothing, each in
-/// file order.
+/// file order, and every entry's reason.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outcome {
     /// Entries whose `expires` date was before the scan date.
     pub expired: Vec<Entry>,
     /// Active entries that matched no finding.
     pub unused: Vec<Entry>,
+    /// Every entry's reason, in file order: the index
+    /// [`Suppressor::matching`] returned for a finding finds the reason
+    /// that documents it.
+    pub reasons: Vec<String>,
 }
 
 /// Matches findings against one config's entries for one scan, counting
@@ -142,6 +146,12 @@ impl Suppressor {
     /// Whether an active entry covers `finding`; if so, records a hit on
     /// the first such entry in file order.
     pub fn suppresses(&mut self, finding: &Finding<'_>) -> bool {
+        self.matching(finding).is_some()
+    }
+
+    /// The index (in file order) of the first active entry that covers
+    /// `finding`, recording a hit on it; `None` if no entry does.
+    pub fn matching(&mut self, finding: &Finding<'_>) -> Option<usize> {
         let rule = finding.rule.index();
         let key = finding.object.key.as_str();
         let column = finding.detail.column().map(|detail| detail.column.as_str());
@@ -170,20 +180,25 @@ impl Suppressor {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let Some(index) = winner else {
-            return false;
-        };
+        let index = winner?;
         if let Some(hits) = self.hits.get_mut(index) {
             *hits = hits.saturating_add(1);
         }
-        true
+        Some(index)
     }
 
     /// Ends the scan: the expired entries, and the active entries with no
     /// hits.
     #[must_use]
     pub fn finish(self) -> Outcome {
-        let mut outcome = Outcome::default();
+        let mut outcome = Outcome {
+            reasons: self
+                .entries
+                .iter()
+                .map(|entry| entry.reason.clone())
+                .collect(),
+            ..Outcome::default()
+        };
         for ((entry, state), hits) in self.entries.into_iter().zip(self.states).zip(self.hits) {
             match state {
                 State::Expired => outcome.expired.push(entry),
@@ -304,6 +319,24 @@ mod tests {
     }
 
     #[test]
+    fn matching_names_the_winning_entry_by_its_file_order_index() -> Result<(), LakeScanError> {
+        let mut s = suppressor(
+            &[
+                "rule = \"zero-byte-object\"\nprefix = \"\"\nreason = \"zero\"",
+                "rule = \"sensitive-key\"\nprefix = \"docs/\"\nreason = \"docs\"",
+            ],
+            "b",
+            TODAY,
+        )?;
+        let docs = object("docs/id_rsa");
+        let other = object("other/id_rsa");
+        assert_eq!(s.matching(&finding(RuleId::SensitiveKey, &docs)), Some(1));
+        assert_eq!(s.matching(&finding(RuleId::SensitiveKey, &other)), None);
+        assert_eq!(s.finish().reasons, ["zero", "docs"]);
+        Ok(())
+    }
+
+    #[test]
     fn the_first_matching_entry_in_file_order_wins() -> Result<(), LakeScanError> {
         // Prefix first, then an exact key, then a duplicate exact key: the
         // prefix wins every finding it covers.
@@ -359,7 +392,9 @@ mod tests {
         )?;
         assert!(!suppressed(&mut s, RuleId::SensitiveKey, "id_rsa"));
         assert!(suppressed(&mut s, RuleId::SensitiveKey, ".env"));
-        assert_eq!(s.finish(), Outcome::default());
+        let outcome = s.finish();
+        assert_eq!((outcome.expired, outcome.unused), (vec![], vec![]));
+        assert_eq!(outcome.reasons, ["other", "old", "mine"]);
         Ok(())
     }
 
@@ -371,7 +406,8 @@ mod tests {
 
         let mut on_the_day = suppressor(&[entry], "b", "2026-10-13")?;
         assert!(suppressed(&mut on_the_day, RuleId::SensitiveKey, "id_rsa"));
-        assert_eq!(on_the_day.finish(), Outcome::default());
+        let outcome = on_the_day.finish();
+        assert_eq!((outcome.expired, outcome.unused), (vec![], vec![]));
 
         let mut day_after = suppressor(&[entry], "b", "2026-10-14")?;
         assert!(!suppressed(&mut day_after, RuleId::SensitiveKey, "id_rsa"));
