@@ -4,7 +4,8 @@
 //! Throwaway measurement code for docs/experiments/parquet-pii.md. It is not
 //! part of lakescan and must never be imported by it.
 //!
-//!     cargo run --release -- <data_dir>      # reads <data_dir>/manifest.json
+//!     cargo run --release -- <data_dir>          # round 1: reads <data_dir>/manifest.json
+//!     cargo run --release -- round2 <data_dir>   # round 2: see round2.rs
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -30,6 +31,8 @@ use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::serialized_reader::SerializedPageReader;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+mod round2;
 
 // ---------------------------------------------------------------- counting I/O
 
@@ -759,6 +762,13 @@ fn encodings(data: &Path, truth: &FileTruth) -> Vec<EncodingRow> {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("round2") {
+        let data = std::env::args()
+            .nth(2)
+            .expect("usage: parquet-pii-spike round2 <data_dir>");
+        round2::run(Path::new(&data));
+        return;
+    }
     let data = PathBuf::from(
         std::env::args()
             .nth(1)
