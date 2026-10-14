@@ -1,0 +1,5 @@
+numpy==2.5.3
+pyarrow==25.0.1
+polars==1.44.2
+polars-runtime-32==1.44.2
+duckdb==1.5.6

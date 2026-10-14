@@ -6,7 +6,9 @@ use std::time::SystemTime;
 
 use super::stats::truncate_at_char_boundary;
 use super::topk::Bounded;
-use crate::model::{ObjectMeta, Severity, StorageClass};
+use crate::model::{
+    ColumnDetail, Detail, MAX_COLUMN_BYTES, NotScannedReason, ObjectMeta, Severity, StorageClass,
+};
 
 /// A key longer than this is truncated when copied into a [`Sample`]. S3
 /// keys can be up to 1024 bytes, so this is the real worst case, not an
@@ -44,20 +46,54 @@ pub struct Sample {
     /// The finding's severity, for a per-rule sample; `None` for an entry
     /// in the largest-objects list, which has no associated finding.
     pub severity: Option<Severity>,
+    /// What the finding said beyond its object: a PII finding's column
+    /// (at most [`MAX_COLUMN_BYTES`]), confidence and counts, or why a
+    /// file was not scanned.
+    pub detail: SampleDetail,
+}
+
+/// An owned copy of a finding's [`Detail`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SampleDetail {
+    /// A listing finding, or a largest-objects entry.
+    None,
+    /// A PII finding's column, confidence and counts.
+    Column(ColumnDetail),
+    /// Why a file could not be content-scanned.
+    NotScanned(NotScannedReason),
+}
+
+impl SampleDetail {
+    fn of(detail: Detail<'_>) -> Self {
+        match detail {
+            Detail::None => Self::None,
+            Detail::Column(column) => Self::Column(column.clone()),
+            Detail::NotScanned(reason) => Self::NotScanned(reason),
+        }
+    }
+
+    /// The column path, or `""` when there is none: the last tie-breaker
+    /// when ranking samples.
+    fn column(&self) -> &str {
+        match self {
+            Self::Column(column) => &column.column,
+            Self::None | Self::NotScanned(_) => "",
+        }
+    }
 }
 
 impl Sample {
     /// Builds a `Sample` for a finding on `object`.
-    pub(super) fn for_finding(object: &ObjectMeta, severity: Severity) -> Self {
-        Self::build(object, Some(severity))
+    pub(super) fn for_finding(object: &ObjectMeta, severity: Severity, detail: Detail<'_>) -> Self {
+        Self::build(object, Some(severity), SampleDetail::of(detail))
     }
 
     /// Builds a `Sample` for the largest-objects list (no finding).
     pub(super) fn for_object(object: &ObjectMeta) -> Self {
-        Self::build(object, None)
+        Self::build(object, None, SampleDetail::None)
     }
 
-    fn build(object: &ObjectMeta, severity: Option<Severity>) -> Self {
+    fn build(object: &ObjectMeta, severity: Option<Severity>, detail: SampleDetail) -> Self {
         let (key, key_truncated) = truncate_at_char_boundary(&object.key, MAX_KEY_BYTES);
         Self {
             key,
@@ -66,14 +102,20 @@ impl Sample {
             last_modified: object.last_modified,
             storage_class: compact_storage_class(&object.storage_class),
             severity,
+            detail,
         }
     }
 
     /// The total heap this one sample currently occupies: its key's
-    /// allocation, plus its storage class's, if it owns one.
+    /// allocation, its storage class's, if it owns one, and its column
+    /// path's, if it has one.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
-        self.key.capacity() + storage_class_heap_bytes(&self.storage_class)
+        let column = match &self.detail {
+            SampleDetail::Column(detail) => detail.column.capacity(),
+            SampleDetail::None | SampleDetail::NotScanned(_) => 0,
+        };
+        self.key.capacity() + storage_class_heap_bytes(&self.storage_class) + column
     }
 }
 
@@ -97,19 +139,23 @@ fn storage_class_heap_bytes(class: &StorageClass) -> usize {
 }
 
 impl Bounded for Sample {
-    const MAX_BYTES: usize = size_of::<Self>() + MAX_KEY_BYTES + MAX_CLASS_NAME_BYTES;
+    const MAX_BYTES: usize =
+        size_of::<Self>() + MAX_KEY_BYTES + MAX_CLASS_NAME_BYTES + MAX_COLUMN_BYTES;
 }
 
 /// Orders samples best-first: higher severity first, then larger size,
-/// then lexicographically *smaller* key — the key comparison is reversed
-/// so that, among ties, the deterministically "first" key is the one a
-/// bounded top-K keeps, regardless of observation order.
+/// then lexicographically *smaller* key, then smaller column path — the
+/// key and column comparisons are reversed so that, among ties, the
+/// deterministically "first" one is what a bounded top-K keeps, regardless
+/// of observation order. The column breaks ties between several PII
+/// findings on one file.
 impl Ord for Sample {
     fn cmp(&self, other: &Self) -> Ordering {
         self.severity
             .cmp(&other.severity)
             .then_with(|| self.size.cmp(&other.size))
             .then_with(|| other.key.cmp(&self.key))
+            .then_with(|| other.detail.column().cmp(self.detail.column()))
     }
 }
 
@@ -127,21 +173,29 @@ pub(super) fn rank_against(
     candidate_severity: Option<Severity>,
     candidate_size: u64,
     candidate_key: &str,
+    candidate_column: &str,
     worst: &Sample,
 ) -> Ordering {
     candidate_severity
         .cmp(&worst.severity)
         .then_with(|| candidate_size.cmp(&worst.size))
         .then_with(|| worst.key.as_str().cmp(candidate_key))
+        .then_with(|| worst.detail.column().cmp(candidate_column))
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::SystemTime;
 
-    use super::{Sample, rank_against};
+    use super::{Sample, SampleDetail, rank_against};
     use crate::aggregate::topk::Bounded;
-    use crate::model::{ObjectMeta, Severity, StorageClass};
+    use crate::model::{
+        ColumnDetail, Confidence, Detail, Evidence, ObjectMeta, Severity, StorageClass,
+    };
+
+    fn finding_sample(object: &ObjectMeta, severity: Severity) -> Sample {
+        Sample::for_finding(object, severity, Detail::None)
+    }
 
     fn object(key: &str, size: u64, storage_class: StorageClass) -> ObjectMeta {
         ObjectMeta {
@@ -188,14 +242,11 @@ mod tests {
 
     #[test]
     fn ordering_is_severity_then_size_then_key_ascending() {
-        let high_small =
-            Sample::for_finding(&object("b", 10, StorageClass::Standard), Severity::High);
-        let high_large =
-            Sample::for_finding(&object("b", 20, StorageClass::Standard), Severity::High);
+        let high_small = finding_sample(&object("b", 10, StorageClass::Standard), Severity::High);
+        let high_large = finding_sample(&object("b", 20, StorageClass::Standard), Severity::High);
         let medium_large =
-            Sample::for_finding(&object("b", 1000, StorageClass::Standard), Severity::Medium);
-        let high_small_a =
-            Sample::for_finding(&object("a", 10, StorageClass::Standard), Severity::High);
+            finding_sample(&object("b", 1000, StorageClass::Standard), Severity::Medium);
+        let high_small_a = finding_sample(&object("a", 10, StorageClass::Standard), Severity::High);
 
         assert!(high_large > high_small, "same severity, larger size wins");
         assert!(high_small > medium_large, "severity beats size");
@@ -207,8 +258,7 @@ mod tests {
 
     #[test]
     fn rank_against_agrees_with_sample_ord() {
-        let worst =
-            Sample::for_finding(&object("m", 100, StorageClass::Standard), Severity::Medium);
+        let worst = finding_sample(&object("m", 100, StorageClass::Standard), Severity::Medium);
 
         for (severity, size, key) in [
             (Severity::High, 50_u64, "z"),
@@ -217,10 +267,9 @@ mod tests {
             (Severity::Medium, 100_u64, "z"),
             (Severity::Low, 100_u64, "a"),
         ] {
-            let candidate =
-                Sample::for_finding(&object(key, size, StorageClass::Standard), severity);
+            let candidate = finding_sample(&object(key, size, StorageClass::Standard), severity);
             assert_eq!(
-                rank_against(Some(severity), size, key, &worst),
+                rank_against(Some(severity), size, key, "", &worst),
                 candidate.cmp(&worst),
                 "mismatch for severity={severity:?} size={size} key={key}"
             );
@@ -236,7 +285,13 @@ mod tests {
         let huge_class_name = "c".repeat(10_000);
         let obj = object(&huge_key, u64::MAX, StorageClass::Other(huge_class_name));
 
-        let sample = Sample::for_finding(&obj, Severity::Critical);
+        let detail = ColumnDetail::new(
+            &"c".repeat(10_000),
+            Confidence::Confirmed,
+            Evidence::ColumnName,
+        );
+        let sample = Sample::for_finding(&obj, Severity::Critical, Detail::Column(&detail));
+        assert!(matches!(&sample.detail, SampleDetail::Column(d) if d.column.len() <= 256));
 
         assert!(
             size_of::<Sample>() + sample.heap_bytes() <= Sample::MAX_BYTES,

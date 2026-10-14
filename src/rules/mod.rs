@@ -33,7 +33,7 @@ mod zero_byte_object;
 
 use std::time::SystemTime;
 
-use crate::model::{Finding, ObjectMeta, RuleId, Severity};
+use crate::model::{Detail, Finding, ObjectMeta, RuleId, Severity};
 
 /// Everything a rule is allowed to know besides the object itself.
 ///
@@ -56,7 +56,9 @@ type Check = fn(&ObjectMeta, &EvalContext) -> Option<Severity>;
 ///
 /// This is the one `match` in the crate that must stay exhaustive over
 /// [`RuleId`]: adding a rule variant without adding its arm here is a
-/// compile error, not a silently-skipped rule.
+/// compile error, not a silently-skipped rule. Content rules (see
+/// [`RuleId::is_content`]) are raised by [`crate::content`] from inside
+/// files, never from a listing, so their listing check never fires.
 fn check_for(rule: RuleId) -> Check {
     match rule {
         RuleId::SensitiveKey => sensitive_key::check,
@@ -65,7 +67,21 @@ fn check_for(rule: RuleId) -> Check {
         RuleId::SmallObjectColdTier => small_object_cold_tier::check,
         RuleId::ZeroByteObject => zero_byte_object::check,
         RuleId::UnknownStorageClass => unknown_storage_class::check,
+        RuleId::PiiEmail
+        | RuleId::PiiPhone
+        | RuleId::PiiInPan
+        | RuleId::PiiInAadhaar
+        | RuleId::PiiCardNumber
+        | RuleId::PiiIpAddress
+        | RuleId::PiiPersonName
+        | RuleId::PiiDateOfBirth
+        | RuleId::ContentNotScanned => no_listing_check,
     }
+}
+
+/// The listing check of a content rule: never fires.
+fn no_listing_check(_: &ObjectMeta, _: &EvalContext) -> Option<Severity> {
+    None
 }
 
 /// Evaluates every rule against `object`, in [`RuleId::ALL`] order.
@@ -83,6 +99,7 @@ pub fn evaluate<'a>(
             rule,
             severity,
             object,
+            detail: Detail::None,
         })
     })
 }
@@ -199,7 +216,7 @@ mod tests {
             },
         ];
 
-        for rule in RuleId::ALL {
+        for rule in RuleId::ALL.into_iter().filter(|rule| !rule.is_content()) {
             let triggered = triggering_objects
                 .iter()
                 .any(|object| evaluate(object, &ctx).any(|finding| finding.rule == rule));

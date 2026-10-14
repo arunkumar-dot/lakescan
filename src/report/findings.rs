@@ -8,10 +8,13 @@ use serde::Serialize;
 use super::rfc3339::format_rfc3339;
 use super::sink::Sink;
 use crate::error::LakeScanError;
-use crate::model::Finding;
+use crate::model::{ColumnDetail, Detail, Evidence, Finding, NotScannedReason};
 
 /// One JSON Lines record: `{"key", "rule", "severity", "size",
-/// "storage_class", "last_modified"}`, with the full, untruncated key —
+/// "storage_class", "last_modified"}`, plus, for a PII finding, `"column"`,
+/// `"confidence"` and `"evidence"` (with `"matched"` and `"sampled"` when the
+/// evidence is `"values"`), and for
+/// `content-not-scanned`, `"reason"`. The key is full and untruncated —
 /// unlike a summary [`crate::aggregate::Sample`], a findings-stream record
 /// is written and forgotten immediately, so there is no bounded top-K
 /// holding it in memory and therefore no reason to truncate it.
@@ -23,6 +26,59 @@ struct Record<'a> {
     size: u64,
     storage_class: &'a str,
     last_modified: String,
+    #[serde(flatten)]
+    detail: DetailFields<'a>,
+}
+
+/// The detail fields a finding record or a summary sample carries,
+/// flattened into it; every field is omitted when absent, so listing
+/// findings are unchanged.
+#[derive(Serialize, Default)]
+pub(super) struct DetailFields<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) column: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) confidence: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) evidence: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) matched: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sampled: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<&'static str>,
+}
+
+impl<'a> DetailFields<'a> {
+    pub(super) fn of_column(column: &'a ColumnDetail) -> Self {
+        let (matched, sampled) = match column.evidence {
+            Evidence::Values { matched, sampled } => (Some(matched), Some(sampled)),
+            Evidence::ColumnName => (None, None),
+        };
+        Self {
+            column: Some(&column.column),
+            confidence: Some(column.confidence.code()),
+            evidence: Some(column.evidence.code()),
+            matched,
+            sampled,
+            reason: None,
+        }
+    }
+
+    pub(super) fn of_reason(reason: NotScannedReason) -> Self {
+        Self {
+            reason: Some(reason.code()),
+            ..Self::default()
+        }
+    }
+
+    fn of(detail: Detail<'a>) -> Self {
+        match detail {
+            Detail::None => Self::default(),
+            Detail::Column(column) => Self::of_column(column),
+            Detail::NotScanned(reason) => Self::of_reason(reason),
+        }
+    }
 }
 
 impl<'a> Record<'a> {
@@ -34,6 +90,7 @@ impl<'a> Record<'a> {
             size: finding.object.size,
             storage_class: finding.object.storage_class.as_wire(),
             last_modified: format_rfc3339(finding.object.last_modified),
+            detail: DetailFields::of(finding.detail),
         }
     }
 }
@@ -110,7 +167,10 @@ mod tests {
     use std::time::SystemTime;
 
     use super::FindingsWriter;
-    use crate::model::{Finding, ObjectMeta, RuleId, Severity, StorageClass};
+    use crate::model::{
+        ColumnDetail, Confidence, Detail, Evidence, Finding, NotScannedReason, ObjectMeta, RuleId,
+        Severity, StorageClass,
+    };
 
     fn object(key: &str) -> ObjectMeta {
         ObjectMeta {
@@ -129,6 +189,7 @@ mod tests {
             rule: RuleId::SensitiveKey,
             severity: Severity::High,
             object: &obj,
+            detail: Detail::None,
         };
 
         let mut buf = Vec::new();
@@ -170,6 +231,7 @@ mod tests {
             rule: RuleId::ZeroByteObject,
             severity: Severity::Info,
             object: &obj,
+            detail: Detail::None,
         };
 
         let mut buf = Vec::new();
@@ -193,6 +255,85 @@ mod tests {
     }
 
     #[test]
+    fn content_findings_carry_their_detail_and_listing_findings_do_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let obj = object("t.parquet");
+        let detail = ColumnDetail::new(
+            "contact.email",
+            Confidence::Confirmed,
+            Evidence::Values {
+                matched: 950,
+                sampled: 1000,
+            },
+        );
+        let name = ColumnDetail::new("dob", Confidence::Likely, Evidence::ColumnName);
+        let mut buf = Vec::new();
+        {
+            let mut writer = FindingsWriter::new(&mut buf);
+            writer.write(Finding {
+                rule: RuleId::PiiEmail,
+                severity: Severity::High,
+                object: &obj,
+                detail: Detail::Column(&detail),
+            })?;
+            writer.write(Finding {
+                rule: RuleId::PiiDateOfBirth,
+                severity: Severity::Medium,
+                object: &obj,
+                detail: Detail::Column(&name),
+            })?;
+            writer.write(Finding {
+                rule: RuleId::ContentNotScanned,
+                severity: Severity::Info,
+                object: &obj,
+                detail: Detail::NotScanned(NotScannedReason::Encrypted),
+            })?;
+            writer.write(Finding {
+                rule: RuleId::ZeroByteObject,
+                severity: Severity::Info,
+                object: &obj,
+                detail: Detail::None,
+            })?;
+            writer.finish()?;
+        }
+        let text = String::from_utf8(buf)?;
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let [pii, by_name, not_scanned, listing] = records.as_slice() else {
+            return Err("expected four records".into());
+        };
+        assert_eq!(
+            by_name.get("evidence"),
+            Some(&serde_json::json!("column-name"))
+        );
+        assert_eq!(by_name.get("matched"), None);
+        assert_eq!(by_name.get("sampled"), None);
+        assert_eq!(pii.get("evidence"), Some(&serde_json::json!("values")));
+        assert_eq!(pii.get("column"), Some(&serde_json::json!("contact.email")));
+        assert_eq!(pii.get("confidence"), Some(&serde_json::json!("confirmed")));
+        assert_eq!(pii.get("matched"), Some(&serde_json::json!(950)));
+        assert_eq!(pii.get("sampled"), Some(&serde_json::json!(1000)));
+        assert_eq!(
+            not_scanned.get("reason"),
+            Some(&serde_json::json!("encrypted"))
+        );
+        assert_eq!(not_scanned.get("column"), None);
+        for field in [
+            "column",
+            "confidence",
+            "evidence",
+            "matched",
+            "sampled",
+            "reason",
+        ] {
+            assert_eq!(listing.get(field), None, "{field}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn multiple_findings_each_produce_their_own_line() -> Result<(), Box<dyn std::error::Error>> {
         let obj_a = object("a");
         let obj_b = object("b");
@@ -204,11 +345,13 @@ mod tests {
                 rule: RuleId::SensitiveKey,
                 severity: Severity::High,
                 object: &obj_a,
+                detail: Detail::None,
             })?;
             writer.write(Finding {
                 rule: RuleId::ZeroByteObject,
                 severity: Severity::Info,
                 object: &obj_b,
+                detail: Detail::None,
             })?;
             writer.finish()?;
         }

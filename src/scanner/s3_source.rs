@@ -93,6 +93,16 @@ impl S3Source {
     }
 }
 
+impl S3Source {
+    /// A handle on this source's S3 client, for reading object contents
+    /// with the same configuration the listing uses (cheap: the SDK
+    /// client is reference-counted).
+    #[must_use]
+    pub fn client(&self) -> aws_sdk_s3::Client {
+        self.client.clone()
+    }
+}
+
 impl PageSource for S3Source {
     async fn fetch_page(
         &mut self,

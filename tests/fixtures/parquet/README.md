@@ -1,0 +1,80 @@
+# Parquet fixtures for content scanning
+
+Small, committed Parquet files used by the unit tests
+(`src/content/tests.rs`, read straight from disk) and the end-to-end tests
+(`tests/e2e_pii.rs`, uploaded to moto by `examples/seed_local.rs`). They are
+synthetic: every name, email, number and address is generated.
+
+| File | Writer | Rows | Row groups |
+|---|---|---:|---:|
+| `pyarrow/customers.parquet` | pyarrow 25.0.1 | 12,000 | 3 |
+| `polars/customers.parquet` | polars 1.44.2 | 12,000 | 3 |
+| `duckdb/customers.parquet` | duckdb 1.5.6 | 12,000 | 3 |
+| `spark/customers.parquet` | Spark 4.2.0 (parquet-java 1.17.0) | 12,000 | 1 |
+| `escalation.parquet` | pyarrow | 8,000 | 4 |
+| `bad/truncated.parquet` | the first 60% of `pyarrow/customers.parquet` | | |
+| `bad/not_parquet.parquet` | a CSV file named `.parquet` | | |
+
+Every writer runs at its defaults, except that the row-group size is set to
+4,000 rows for pyarrow, polars and DuckDB, so that partial reads and
+escalation have several row groups to work with. Spark writes one row group.
+
+## Ground truth
+
+`customers.parquet`, every writer:
+
+| Column | Type | Holds | Expected finding |
+|---|---|---|---|
+| `customer_id` | int64 | 1 to 12,000 | none |
+| `full_name` | string | names | `pii-person-name`, likely (name only) |
+| `email` | string | emails | `pii-email`, confirmed |
+| `contact` | string | phones: `+91 98765 43210`, `+919876543210`, 10-digit, US E.164 | `pii-phone`, confirmed |
+| `mobile_no` | int64 | 10-digit Indian mobiles | `pii-phone`, confirmed |
+| `aadhaar_no` | int64 | Verhoeff-valid Aadhaar numbers | `pii-in-aadhaar`, confirmed |
+| `pan` | string | PAN numbers | `pii-in-pan`, confirmed |
+| `card_number` | string | Luhn-valid Visa numbers, 25% space-grouped | `pii-card-number`, confirmed |
+| `last_login_ip` | string | IPv4 (80%), IPv6 (20%) | `pii-ip-address`, confirmed |
+| `dob` | date | dates of birth | `pii-date-of-birth`, likely (name only) |
+| `email_sha256` | string | SHA-256 hex digests of the emails: a decoy | none |
+| `billing` | struct | `email` (emails), `city` | `billing.email`: `pii-email`, confirmed |
+| `tags` | list of strings | | skipped (repeated) |
+| `amount` | double | | skipped (unsupported type) |
+| `signup_ts` | timestamp | | none |
+| `notes` | string | free text without personal data | none |
+
+The string PII columns are messy: 10–30% nulls, 2% blank strings, 2%
+placeholders, 2% malformed values (an email without `@`, a phone cut to six
+characters), 5% padded with whitespace, and 10% re-cased: upper-case names
+and emails, and lower-case PANs (which LakeScan validates case-insensitively). The
+placeholders are `N/A`, `unknown`, `-`, `0000000000`, `NOT PROVIDED` and
+`999`. That list deliberately differs from LakeScan's cleaning list:
+`NOT PROVIDED` and `999` are not on it, and stay in the sample as
+non-matching values. The integer columns have 15–25% nulls.
+
+`escalation.parquet`: `contact_email` is only nulls and junk (`N/A`, `""`,
+blanks, `-`, `0000000000`) in row group 0, and emails in row groups 1 to 3.
+Expected: `pii-email`, confirmed, found only by escalating past row group
+0.
+
+`bad/truncated.parquet` is `content-not-scanned` with reason `unreadable`,
+and `bad/not_parquet.parquet` with reason `not-parquet`.
+
+## Regenerating
+
+With Python 3 and Docker:
+
+```sh
+cd tests/fixtures/parquet
+python3 -m venv .venv
+.venv/bin/pip install --only-binary=:all: -r requirements.txt
+.venv/bin/python generate.py "$PWD"
+docker run --rm -v "$PWD:/data" \
+  apache/spark@sha256:fc64959c04bd87b0ac686be9aaa9008b69cdb1afc695400528279c8b01f43d89 \
+  /opt/spark/bin/spark-submit --driver-memory 2g /data/spark_write.py /data
+rm -rf _spark_src .venv
+```
+
+The Spark image is `apache/spark:4.2.0-python3`, pinned by digest. The
+generator is seeded, so the values are reproducible with the pinned
+versions in `requirements.txt`. The file bytes can differ with other writer
+versions.

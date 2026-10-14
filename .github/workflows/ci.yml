@@ -98,8 +98,8 @@ jobs:
       - name: Wait for moto
         run: curl --silent --output /dev/null --retry 30 --retry-delay 1 --retry-all-errors "$LAKESCAN_E2E_ENDPOINT"
 
-      - name: Seed the demo bucket
+      - name: Seed the demo and PII buckets
         run: cargo run --example seed_local -- "$LAKESCAN_E2E_ENDPOINT"
 
       - name: End-to-end tests
-        run: cargo test --test e2e -- --ignored
+        run: cargo test --test e2e --test e2e_pii -- --ignored

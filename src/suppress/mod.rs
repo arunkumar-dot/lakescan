@@ -21,6 +21,10 @@
 //! - **active** — it applies. After the scan, an active entry that
 //!   suppressed nothing is reported as **unused**.
 //!
+//! An entry with a `column` covers only findings that carry exactly that
+//! column path (PII findings); an entry without one covers every finding
+//! of its rule, with or without a column.
+//!
 //! When several active entries cover one finding, the first in file order
 //! wins and gets the hit.
 //!
@@ -35,11 +39,12 @@
 //!
 //! **Memory is bounded by the config, never by the bucket:** at most
 //! [`MAX_ENTRIES`] entries, each with a key or prefix of at most 1 KiB, a
-//! reason of at most 1 KiB, and a bucket name of at most 63 bytes, plus
-//! one hit counter each. Exact keys are held twice (entry and index), so a
-//! pathological maximal config is about 3.3 KB per entry, ~33 MB (31.3 MiB)
-//! in all; a realistic one is kilobytes. Scanning ten objects or ten billion leaves this
-//! unchanged.
+//! reason of at most 1 KiB, a bucket name of at most 63 bytes, and a
+//! column path of at most 256 bytes, plus one hit counter each. Exact keys
+//! are held twice (entry and index), so a pathological maximal config is
+//! about 3.6 KB per entry (3,392 bytes of strings plus ~200 bytes of entry,
+//! counter and index slot), ~36 MB (34.3 MiB) in all; a realistic one is
+//! kilobytes. Scanning ten objects or ten billion leaves this unchanged.
 
 pub mod config;
 mod date;
@@ -80,8 +85,9 @@ pub struct Suppressor {
     entries: Vec<Entry>,
     states: Vec<State>,
     hits: Vec<u64>,
-    /// Per rule: exact key -> index of the first active entry for it.
-    exact: [HashMap<String, usize>; NUM_RULES],
+    /// Per rule: exact key -> indexes of the active entries for it, in
+    /// file order (several, when they name different columns).
+    exact: [HashMap<String, Vec<usize>>; NUM_RULES],
     /// Per rule: indexes of active prefix entries, in file order.
     prefixes: [Vec<usize>; NUM_RULES],
 }
@@ -92,7 +98,7 @@ impl Suppressor {
     #[must_use]
     pub fn new(config: Config, bucket: &str, scan_date: Date) -> Self {
         let entries = config.into_entries();
-        let mut exact: [HashMap<String, usize>; NUM_RULES] = Default::default();
+        let mut exact: [HashMap<String, Vec<usize>>; NUM_RULES] = Default::default();
         let mut prefixes: [Vec<usize>; NUM_RULES] = Default::default();
 
         let states: Vec<State> = entries
@@ -109,9 +115,8 @@ impl Suppressor {
                 match &entry.pattern {
                     Pattern::Key(key) => {
                         if let Some(map) = exact.get_mut(rule) {
-                            // `or_insert`: a later duplicate never displaces
-                            // the first entry, which wins.
-                            map.entry(key.clone()).or_insert(index);
+                            // Pushed in file order, so the first match wins.
+                            map.entry(key.clone()).or_default().push(index);
                         }
                     }
                     Pattern::Prefix(_) => {
@@ -139,13 +144,25 @@ impl Suppressor {
     pub fn suppresses(&mut self, finding: &Finding<'_>) -> bool {
         let rule = finding.rule.index();
         let key = finding.object.key.as_str();
+        let column = finding.detail.column().map(|detail| detail.column.as_str());
+        let column_matches = |index: usize| {
+            self.entries
+                .get(index)
+                .is_some_and(|entry| entry.column.is_none() || entry.column.as_deref() == column)
+        };
 
-        let exact = self.exact.get(rule).and_then(|map| map.get(key)).copied();
+        let exact = self
+            .exact
+            .get(rule)
+            .and_then(|map| map.get(key))
+            .and_then(|indexes| indexes.iter().copied().find(|&index| column_matches(index)));
         let prefix = self.prefixes.get(rule).and_then(|list| {
             list.iter().copied().find(|&index| {
-                self.entries
-                    .get(index)
-                    .is_some_and(|entry| entry.pattern.matches(key))
+                column_matches(index)
+                    && self
+                        .entries
+                        .get(index)
+                        .is_some_and(|entry| entry.pattern.matches(key))
             })
         });
 
@@ -184,7 +201,10 @@ mod tests {
 
     use super::{Config, Date, Outcome, Suppressor};
     use crate::error::LakeScanError;
-    use crate::model::{Finding, ObjectMeta, RuleId, Severity, StorageClass};
+    use crate::model::{
+        ColumnDetail, Confidence, Detail, Evidence, Finding, ObjectMeta, RuleId, Severity,
+        StorageClass,
+    };
 
     fn object(key: &str) -> ObjectMeta {
         ObjectMeta {
@@ -201,6 +221,7 @@ mod tests {
             rule,
             severity: Severity::High,
             object,
+            detail: Detail::None,
         }
     }
 
@@ -384,6 +405,52 @@ mod tests {
         assert_eq!(outcome.expired.len(), 0);
         let unused: Vec<&str> = outcome.unused.iter().map(|e| e.reason.as_str()).collect();
         assert_eq!(unused, ["stale"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_column_entry_covers_only_findings_on_that_column() -> Result<(), LakeScanError> {
+        let mut s = suppressor(
+            &[
+                "rule = \"pii-email\"\nkey = \"t.parquet\"\nreason = \"r\"\ncolumn = \"a.email\"",
+                "rule = \"pii-email\"\nprefix = \"\"\nreason = \"r\"\ncolumn = \"backup_email\"",
+            ],
+            "b",
+            TODAY,
+        )?;
+        let object = object("t.parquet");
+        let on = |column: &str| ColumnDetail::new(column, Confidence::Likely, Evidence::ColumnName);
+        let (email, other, backup) = (on("a.email"), on("b.email"), on("backup_email"));
+        let pii = |detail| Finding {
+            rule: RuleId::PiiEmail,
+            severity: Severity::High,
+            object: &object,
+            detail: Detail::Column(detail),
+        };
+        assert!(s.suppresses(&pii(&email)));
+        assert!(!s.suppresses(&pii(&other)));
+        assert!(s.suppresses(&pii(&backup)));
+        // A column entry never covers a finding without a column.
+        assert!(!s.suppresses(&finding(RuleId::PiiEmail, &object)));
+        assert_eq!(s.hits, [1, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_entry_without_a_column_covers_every_column() -> Result<(), LakeScanError> {
+        let mut s = suppressor(
+            &["rule = \"pii-email\"\nkey = \"t.parquet\"\nreason = \"r\""],
+            "b",
+            TODAY,
+        )?;
+        let object = object("t.parquet");
+        let detail = ColumnDetail::new("any.column", Confidence::Likely, Evidence::ColumnName);
+        assert!(s.suppresses(&Finding {
+            rule: RuleId::PiiEmail,
+            severity: Severity::Medium,
+            object: &object,
+            detail: Detail::Column(&detail),
+        }));
         Ok(())
     }
 

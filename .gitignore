@@ -16,3 +16,7 @@
 
 # macOS Finder metadata
 .DS_Store
+
+# Fixture generator scratch (see tests/fixtures/parquet/README.md)
+/tests/fixtures/parquet/.venv
+/tests/fixtures/parquet/_spark_src

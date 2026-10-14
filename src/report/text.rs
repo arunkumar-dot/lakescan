@@ -1,10 +1,11 @@
 //! The plain-text summary writer.
 //!
-//! Section order, always: header, verdict, inventory, findings,
+//! Section order, always: header, verdict, inventory, findings, content,
 //! suppressions, samples (per rule), largest objects, size histogram, age
 //! histogram, distinct-content. A section with nothing to list says so in
-//! one line, except suppressions, which is omitted entirely unless some
-//! `--config` entry expired or went unused. A rule's findings print one
+//! one line, except content, which is omitted entirely unless content
+//! scanning (`--pii`) was on, and suppressions, which is omitted entirely
+//! unless some `--config` entry expired or went unused. A rule's findings print one
 //! line per severity it actually raised, worst first, and skip the rest —
 //! a rule with a single High finding is one line, not a zero-padded row
 //! across every severity — followed by its suppressed count when it has
@@ -12,10 +13,10 @@
 //! only that line.
 //!
 //! No color, no box-drawing: this is meant to be `grep`-able and safe to
-//! pipe. Every object key is attacker-controlled, so every key is written
-//! through [`write_escaped`], which renders control and bidi-override
-//! characters as `\u{XXXX}` instead of letting them reach the terminal (see
-//! `escape`'s module doc).
+//! pipe. Every object key and every Parquet column path is
+//! attacker-controlled, so each is written through [`write_escaped`], which
+//! renders control and bidi-override characters as `\u{XXXX}` instead of
+//! letting them reach the terminal (see `escape`'s module doc).
 
 use std::io::Write;
 
@@ -23,9 +24,9 @@ use super::escape::write_escaped;
 use super::human_size::human_bytes;
 use super::rfc3339::format_rfc3339;
 use super::{ScanInfo, TOOL_NAME, TOOL_VERSION};
-use crate::aggregate::{Aggregates, Sample};
+use crate::aggregate::{Aggregates, Sample, SampleDetail};
 use crate::error::LakeScanError;
-use crate::model::{RuleId, Severity};
+use crate::model::{Evidence, NotScannedReason, RuleId, Severity};
 use crate::suppress::{Entry, Pattern};
 
 /// `write!`/`writeln!` to `out`, mapping any I/O error to
@@ -177,11 +178,58 @@ fn write_entry<W: Write>(out: &mut W, entry: &Entry) -> Result<(), LakeScanError
     } else {
         write_escaped(out, value).map_err(LakeScanError::Report)?;
     }
+    if let Some(column) = &entry.column {
+        w!(out, "  column=")?;
+        write_escaped(out, column).map_err(LakeScanError::Report)?;
+    }
     if let Some(expires) = entry.expires {
         w!(out, "  expires={expires}")?;
     }
     w!(out, "  reason: ")?;
     write_escaped(out, &entry.reason).map_err(LakeScanError::Report)?;
+    wl_empty!(out)
+}
+
+fn write_content<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
+    let Some(content) = aggregates.content() else {
+        return Ok(());
+    };
+    wl!(out, "CONTENT")?;
+    wl!(out, "  parquet files:      {}", content.files_eligible)?;
+    wl!(out, "    scanned whole:     {}", content.scanned_whole)?;
+    wl!(out, "    scanned partially: {}", content.scanned_partially)?;
+    w!(
+        out,
+        "    not scanned:       {}",
+        content.not_scanned_total()
+    )?;
+    let reasons: Vec<String> = NotScannedReason::ALL
+        .into_iter()
+        .filter(|&reason| content.not_scanned(reason) > 0)
+        .map(|reason| format!("{}={}", reason.code(), content.not_scanned(reason)))
+        .collect();
+    if reasons.is_empty() {
+        wl_empty!(out)?;
+    } else {
+        wl!(out, " ({})", reasons.join(", "))?;
+    }
+    wl!(out, "  columns examined:   {}", content.columns_examined)?;
+    wl!(
+        out,
+        "  columns skipped:    {} (repeated={}, unsupported-type={}, page-too-large={}, unreadable={})",
+        content.columns_skipped(),
+        content.skipped_repeated,
+        content.skipped_unsupported_type,
+        content.skipped_page_too_large,
+        content.skipped_unreadable
+    )?;
+    wl!(
+        out,
+        "  bytes read:         {} ({})",
+        content.bytes_read,
+        human_bytes(content.bytes_read)
+    )?;
+    wl!(out, "  GET requests:       {}", content.get_requests)?;
     wl_empty!(out)
 }
 
@@ -216,6 +264,21 @@ fn write_samples<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), L
         for sample in samples {
             w!(out, "    ")?;
             write_key(out, sample)?;
+            match &sample.detail {
+                SampleDetail::None => {}
+                SampleDetail::Column(detail) => {
+                    w!(out, "  column=")?;
+                    write_escaped(out, &detail.column).map_err(LakeScanError::Report)?;
+                    w!(out, " confidence={}", detail.confidence.code())?;
+                    match detail.evidence {
+                        Evidence::Values { matched, sampled } => {
+                            w!(out, " evidence=values matched={matched}/{sampled}")?;
+                        }
+                        Evidence::ColumnName => w!(out, " evidence=column-name")?,
+                    }
+                }
+                SampleDetail::NotScanned(reason) => w!(out, "  reason={}", reason.code())?,
+            }
             let severity = sample.severity.map_or("?", Severity::code);
             wl!(
                 out,
@@ -363,6 +426,7 @@ pub(super) fn write<W: Write>(
     write_verdict(out, aggregates)?;
     write_inventory(out, aggregates)?;
     write_findings(out, aggregates)?;
+    write_content(out, aggregates)?;
     write_suppressions(out, info)?;
     write_samples(out, aggregates)?;
     write_largest_objects(out, aggregates)?;
@@ -389,6 +453,7 @@ mod tests {
             reason: "r".to_owned(),
             expires: None,
             bucket: None,
+            column: None,
         };
         let mut buf = Vec::new();
         super::write_entry(&mut buf, &entry)?;

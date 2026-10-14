@@ -41,7 +41,9 @@
 //! or renaming a field, changing its type, or changing what an existing
 //! field means is **breaking** and bumps `schema_version`. The
 //! `suppressed`, `suppressions`, and `distinct_content.duplicates_significant`
-//! fields below were added under this policy, so the version is still 1.
+//! fields (M6), and `content`, a suppression entry's `column`, and a
+//! sample's `column`, `confidence`, `evidence`, `matched`, `sampled` and
+//! `reason` (M7) were added under this policy, so the version is still 1.
 //!
 //! ```text
 //! {
@@ -84,13 +86,35 @@
 //!                                  // not included in counts/bytes above
 //!     }
 //!   ],
+//!   "content": {                   // null unless --pii was given
+//!     "files_eligible": integer,   // keys ending .parquet/.parq (any case)
+//!     "scanned_whole": integer,    // read in one GetObject
+//!     "scanned_partially": integer,// footer + sampled pages
+//!     "not_scanned": {             // one key per NotScannedReason::code(),
+//!       "not-parquet": integer,    // always all five, zero when none
+//!       "unreadable": integer,
+//!       "access-denied": integer,
+//!       "encrypted": integer,
+//!       "footer-too-large": integer
+//!     },
+//!     "columns_examined": integer, // candidate columns sampled and classified
+//!     "columns_skipped": {
+//!       "repeated": integer,        // list/map columns, never read
+//!       "unsupported_type": integer,// booleans, floats, decimals, times
+//!       "page_too_large": integer,  // a page over the 8 MiB cap
+//!       "unreadable": integer       // pages that could not be decoded
+//!     },
+//!     "bytes_read": integer,       // bytes returned by every GetObject
+//!     "get_requests": integer      // GetObject requests made
+//!   },
 //!   "suppressions": {              // --config entries worth attention,
 //!     "expired": [ entry ],        // each list in file order; both empty
 //!     "unused":  [ entry ]         // without --config
 //!   },                             // entry: { "rule": string,
 //!                                  //   "key": string  OR  "prefix": string,
 //!                                  //   "reason": string,
-//!                                  //   "expires": string | null }  // YYYY-MM-DD
+//!                                  //   "expires": string | null,  // YYYY-MM-DD
+//!                                  //   "column": string }  // only if set
 //!   "samples": {                   // one key per rule with >=1 finding,
 //!     "<rule code>": [             // keys unordered (plain JSON object);
 //!       {                         // each list is best-first (severity
@@ -99,7 +123,18 @@
 //!         "severity": string,
 //!         "size": integer,
 //!         "storage_class": string,
-//!         "last_modified": string  // RFC 3339
+//!         "last_modified": string, // RFC 3339
+//!         "column": string,        // PII rules only: the column path,
+//!                                  // at most 256 bytes
+//!         "confidence": string,    // PII rules only: Confidence::code()
+//!         "evidence": string,      // PII rules only: "values", or
+//!                                  // "column-name" when the finding rests
+//!                                  // on the column's name alone (always
+//!                                  // for person names and dates of birth)
+//!         "matched": integer,      // evidence "values" only: cleaned
+//!         "sampled": integer,      //   sampled values that matched / in all
+//!         "reason": string         // content-not-scanned only:
+//!                                  // NotScannedReason::code()
 //!       }
 //!     ]
 //!   },
@@ -121,6 +156,10 @@
 //!   }
 //! }
 //! ```
+//!
+//! A sample never carries a sampled value: only the column path and
+//! counts. The findings stream (`--findings`) carries the same optional
+//! fields per record.
 //!
 //! Severities are rendered via [`crate::model::Severity::code`], storage
 //! classes via [`crate::model::StorageClass::as_wire`], rules via

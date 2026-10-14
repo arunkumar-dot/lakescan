@@ -255,9 +255,30 @@ mod tests {
                 etag: "etag".to_owned(),
                 storage_class: StorageClass::Other("c".repeat(2000)),
             };
+            // ...and a column path far over its limit.
+            let detail = crate::model::ColumnDetail::new(
+                &"p".repeat(2000),
+                crate::model::Confidence::Confirmed,
+                crate::model::Evidence::ColumnName,
+            );
+            let column = detail.column.clone();
             top.offer(
-                |worst| rank_against(Some(Severity::Critical), object.size, &object.key, worst),
-                || Sample::for_finding(&object, Severity::Critical),
+                |worst| {
+                    rank_against(
+                        Some(Severity::Critical),
+                        object.size,
+                        &object.key,
+                        &column,
+                        worst,
+                    )
+                },
+                || {
+                    Sample::for_finding(
+                        &object,
+                        Severity::Critical,
+                        crate::model::Detail::Column(&detail),
+                    )
+                },
             );
         }
 

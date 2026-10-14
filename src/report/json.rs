@@ -7,11 +7,12 @@ use std::io::Write;
 
 use serde::Serialize;
 
+use super::findings::DetailFields;
 use super::rfc3339::format_rfc3339;
 use super::{TOOL_NAME, TOOL_VERSION};
-use crate::aggregate::{Aggregates, CountBytes, Sample};
+use crate::aggregate::{Aggregates, ContentSummary, CountBytes, Sample, SampleDetail};
 use crate::error::LakeScanError;
-use crate::model::{RuleId, Severity};
+use crate::model::{NotScannedReason, RuleId, Severity};
 use crate::suppress::{Entry, Outcome, Pattern};
 
 #[derive(Serialize)]
@@ -136,6 +137,8 @@ struct SuppressionEntry<'a> {
     prefix: Option<&'a str>,
     reason: &'a str,
     expires: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    column: Option<&'a str>,
 }
 
 impl<'a> SuppressionEntry<'a> {
@@ -150,6 +153,7 @@ impl<'a> SuppressionEntry<'a> {
             prefix,
             reason: &entry.reason,
             expires: entry.expires.map(|date| date.to_string()),
+            column: entry.column.as_deref(),
         }
     }
 }
@@ -185,6 +189,8 @@ struct SampleEntry<'a> {
     size: u64,
     storage_class: &'a str,
     last_modified: String,
+    #[serde(flatten)]
+    detail: DetailFields<'a>,
 }
 
 impl<'a> SampleEntry<'a> {
@@ -196,6 +202,55 @@ impl<'a> SampleEntry<'a> {
             size: sample.size,
             storage_class: sample.storage_class.as_wire(),
             last_modified: format_rfc3339(sample.last_modified),
+            detail: match &sample.detail {
+                SampleDetail::None => DetailFields::default(),
+                SampleDetail::Column(column) => DetailFields::of_column(column),
+                SampleDetail::NotScanned(reason) => DetailFields::of_reason(*reason),
+            },
+        }
+    }
+}
+
+/// The `content` section: what `--pii` content scanning did.
+#[derive(Serialize)]
+struct ContentSection {
+    files_eligible: u64,
+    scanned_whole: u64,
+    scanned_partially: u64,
+    not_scanned: BTreeMap<&'static str, u64>,
+    columns_examined: u64,
+    columns_skipped: ColumnsSkipped,
+    bytes_read: u64,
+    get_requests: u64,
+}
+
+#[derive(Serialize)]
+struct ColumnsSkipped {
+    repeated: u64,
+    unsupported_type: u64,
+    page_too_large: u64,
+    unreadable: u64,
+}
+
+impl ContentSection {
+    fn from_summary(summary: &ContentSummary) -> Self {
+        Self {
+            files_eligible: summary.files_eligible,
+            scanned_whole: summary.scanned_whole,
+            scanned_partially: summary.scanned_partially,
+            not_scanned: NotScannedReason::ALL
+                .into_iter()
+                .map(|reason| (reason.code(), summary.not_scanned(reason)))
+                .collect(),
+            columns_examined: summary.columns_examined,
+            columns_skipped: ColumnsSkipped {
+                repeated: summary.skipped_repeated,
+                unsupported_type: summary.skipped_unsupported_type,
+                page_too_large: summary.skipped_page_too_large,
+                unreadable: summary.skipped_unreadable,
+            },
+            bytes_read: summary.bytes_read,
+            get_requests: summary.get_requests,
         }
     }
 }
@@ -241,6 +296,7 @@ struct Summary<'a> {
     verdict: VerdictSection,
     inventory: InventorySection<'a>,
     findings: Vec<FindingSummary>,
+    content: Option<ContentSection>,
     suppressions: SuppressionsSection<'a>,
     samples: SamplesSection<'a>,
     largest_objects: Vec<SampleEntry<'a>>,
@@ -371,6 +427,7 @@ fn build<'a>(info: &'a super::ScanInfo, aggregates: &'a Aggregates) -> Summary<'
         },
         inventory: inventory_section(aggregates),
         findings: findings_section(aggregates),
+        content: aggregates.content().map(ContentSection::from_summary),
         suppressions: SuppressionsSection::from_outcome(&info.suppressions),
         samples: samples_section(aggregates),
         largest_objects: aggregates

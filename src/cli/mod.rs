@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! lakescan scan <TARGET> [OPTIONS]   scan s3://bucket[/prefix]
-//!                                    (--config <PATH> for suppressions)
+//!                                    (--config <PATH> for suppressions,
+//!                                    --pii to scan Parquet content)
 //! lakescan rules                     list every rule's code and title
 //! ```
 //!
@@ -26,8 +27,9 @@ use std::path::{Path, PathBuf};
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use self::driver::Outputs;
+use self::driver::{Content, Outputs};
 use self::target::Target;
+use crate::content::{DEFAULT_WHOLE_FILE_MAX, MAX_WHOLE_FILE_MAX, S3ObjectReader};
 use crate::error::{ExitCode, LakeScanError};
 use crate::model::{RuleId, Severity};
 use crate::report::Format;
@@ -90,6 +92,21 @@ struct ScanArgs {
     /// No progress output and no suppression warnings.
     #[arg(long)]
     quiet: bool,
+
+    /// Also scan Parquet files (keys ending in .parquet or .parq) for
+    /// personal data. Reads object contents: needs s3:GetObject.
+    #[arg(long)]
+    pii: bool,
+
+    /// With --pii, read Parquet files of at most BYTES whole, in one
+    /// request; larger ones are read partially. 0 to 67108864 (64 MiB).
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = DEFAULT_WHOLE_FILE_MAX,
+        requires = "pii"
+    )]
+    pii_whole_file_max: u64,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -141,6 +158,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    install_panic_hook();
     let stdout = io::stdout();
     // Help is colored only where clap itself would color it: on a
     // terminal, and not with NO_COLOR set.
@@ -154,6 +172,24 @@ where
             ExitCode::from(&err)
         }
     }
+}
+
+/// Replaces the default panic hook with one that says where a panic
+/// happened but never what its message was: a panic inside the `parquet`
+/// parser (contained by `content`, see `lib.rs`) could quote bytes of the
+/// file being scanned, and no scanned value may reach any output.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let at = info
+            .location()
+            .map(|location| format!(" at {}:{}", location.file(), location.line()))
+            .unwrap_or_default();
+        let _ = writeln!(
+            io::stderr(),
+            "lakescan: internal panic{at}; its message is withheld because it may quote \
+             scanned data"
+        );
+    }));
 }
 
 /// Parses `args` and runs the chosen command. `--help`, `--version`, and
@@ -243,6 +279,12 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
             "invalid --endpoint-url {url:?}: expected an http:// or https:// URL"
         )));
     }
+    if args.pii_whole_file_max > MAX_WHOLE_FILE_MAX {
+        return Err(LakeScanError::Usage(format!(
+            "--pii-whole-file-max {} is too large: at most {MAX_WHOLE_FILE_MAX} (64 MiB)",
+            args.pii_whole_file_max
+        )));
+    }
 
     let source = S3Source::new(
         target.bucket.clone(),
@@ -263,7 +305,11 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
 
     let stderr = io::stderr();
     let progress = (!args.quiet && stderr.is_terminal()).then_some(io::stderr());
-    let warnings = (!args.quiet).then_some(stderr);
+    let warnings = (!args.quiet).then_some(io::stderr());
+    let content = args.pii.then(|| Content {
+        reader: S3ObjectReader::new(source.client(), target.bucket.clone()),
+        whole_file_max: args.pii_whole_file_max,
+    });
 
     driver::scan(
         source,
@@ -271,11 +317,13 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         config,
         args.format.into(),
         args.fail_on.threshold(),
+        content,
         Outputs {
             summary,
             findings,
             progress,
             warnings,
+            errors: stderr,
         },
     )
     .await
@@ -427,6 +475,23 @@ mod tests {
                 "localhost:5000",
             ],
             &["lakescan", "scan", "s3://b", "--region", ""],
+            &[
+                "lakescan",
+                "scan",
+                "s3://b",
+                "--pii",
+                "--pii-whole-file-max",
+                "67108865",
+            ],
+            &[
+                "lakescan",
+                "scan",
+                "s3://b",
+                "--pii",
+                "--pii-whole-file-max",
+                "-1",
+            ],
+            &["lakescan", "scan", "s3://b", "--pii-whole-file-max", "1024"],
         ] {
             assert!(usage_error(args).await.is_some(), "{args:?}");
         }

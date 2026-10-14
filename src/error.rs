@@ -46,6 +46,7 @@ pub enum LakeScanError {
 /// | `Auth`                    | 3    |
 /// | `Transport`               | 4    |
 /// | `Report`                  | 5    |
+/// | `ContentNotScanned`       | 6    |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum ExitCode {
@@ -70,17 +71,25 @@ pub enum ExitCode {
     /// [`LakeScanError::Report`]. Retrying without fixing the destination
     /// will not help.
     Report = 5,
+
+    /// `--pii` was set and at least one eligible Parquet file existed, but
+    /// none could be content-scanned (every one was unreadable, encrypted,
+    /// refused, or not Parquet at all). The summary is still written; this
+    /// takes precedence over [`Self::FindingsExceedThreshold`], since a PII
+    /// scan that read nothing must not pass silently.
+    ContentNotScanned = 6,
 }
 
 impl ExitCode {
     /// Every exit code, in ascending numeric order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Ok,
         Self::FindingsExceedThreshold,
         Self::Usage,
         Self::Auth,
         Self::Transport,
         Self::Report,
+        Self::ContentNotScanned,
     ];
 
     /// Returns the integer this code hands back to the operating system.
@@ -120,6 +129,7 @@ mod tests {
         assert_eq!(ExitCode::Auth.as_i32(), 3);
         assert_eq!(ExitCode::Transport.as_i32(), 4);
         assert_eq!(ExitCode::Report.as_i32(), 5);
+        assert_eq!(ExitCode::ContentNotScanned.as_i32(), 6);
     }
 
     #[test]
@@ -159,6 +169,7 @@ mod tests {
                 ExitCode::Auth => 3,
                 ExitCode::Transport => 4,
                 ExitCode::Report => 5,
+                ExitCode::ContentNotScanned => 6,
             }
         }
         for (index, code) in ExitCode::ALL.into_iter().enumerate() {

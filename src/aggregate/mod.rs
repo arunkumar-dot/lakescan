@@ -12,11 +12,12 @@
 //! objects, which is exactly why its bound is explicit and checked.
 //!
 //! [`Aggregates::MAX_BYTES`] is a compile-time-checked sum of every summary's
-//! own `MAX_BYTES`: **112,840 bytes (~110 KiB)** as of this milestone,
-//! asserted below to be no more than 18 MiB. The real total is far smaller
-//! than that ceiling, because every fixed capacity here (10 samples per
-//! rule, 20 largest objects, 16 KiB of `Hll` registers) is sized for what a
-//! report needs, not for the budget. Every summary here is mergeable and
+//! own `MAX_BYTES`: **270,848 bytes (~265 KiB)** as of M7 (15 rules, each
+//! sample able to carry a 256-byte column path, plus the fixed-size
+//! [`ContentSummary`]), asserted below to be no more than 18 MiB. The real
+//! total is far smaller than that ceiling, because every fixed capacity
+//! here (10 samples per rule, 20 largest objects, 16 KiB of `Hll`
+//! registers) is sized for what a report needs, not for the budget. Every summary here is mergeable and
 //! order-independent: observing the same objects and findings in any order,
 //! or splitting them across any number of [`Aggregates`] and folding the
 //! results together with [`Aggregates::merge`], produces the identical
@@ -24,6 +25,7 @@
 //! module is designed around.
 
 mod age_histogram;
+mod content;
 mod hyperloglog;
 mod inventory;
 mod matrix;
@@ -41,9 +43,11 @@ use matrix::FindingsMatrix;
 use size_histogram::SizeHistogram;
 use topk::TopK;
 
-pub use sample::Sample;
+pub use content::ContentSummary;
+pub use sample::{Sample, SampleDetail};
 pub use stats::CountBytes;
 
+use crate::content::FileScan;
 use crate::model::{Finding, ObjectMeta, RuleId, Severity, StorageClass};
 
 /// How many rules exist; sizes the per-rule sample array.
@@ -75,11 +79,13 @@ pub struct Aggregates {
     size_histogram: SizeHistogram,
     age_histogram: AgeHistogram,
     hll: Hll,
+    /// Content-scanning totals; `None` unless content scanning is on.
+    content: Option<ContentSummary>,
 }
 
 impl Aggregates {
     /// The combined worst-case size of every summary this struct holds:
-    /// the plain sum of each summary type's own `MAX_BYTES`. 112,840 bytes
+    /// the plain sum of each summary type's own `MAX_BYTES`. 270,848 bytes
     /// as of this milestone (see this module's doc); checked below to be
     /// within the 18 MiB module budget.
     pub const MAX_BYTES: usize = Inventory::MAX_BYTES
@@ -89,7 +95,8 @@ impl Aggregates {
         + size_of::<[CountBytes; NUM_RULES]>()
         + SizeHistogram::MAX_BYTES
         + AgeHistogram::MAX_BYTES
-        + Hll::MAX_BYTES;
+        + Hll::MAX_BYTES
+        + ContentSummary::MAX_BYTES;
 
     /// Starts an empty summary. `now` should be the same scan-start
     /// instant passed to [`crate::rules::EvalContext`], so that this
@@ -107,7 +114,28 @@ impl Aggregates {
             size_histogram: SizeHistogram::default(),
             age_histogram: AgeHistogram::default(),
             hll: Hll::default(),
+            content: None,
         }
+    }
+
+    /// Turns on the content summary, so it is reported even if no file
+    /// turns out to be eligible.
+    pub fn enable_content(&mut self) {
+        self.content.get_or_insert_with(ContentSummary::default);
+    }
+
+    /// Records one content-scanned (or unscannable) file. Enables the
+    /// content summary if it was not already.
+    pub fn observe_content(&mut self, scan: &FileScan) {
+        self.content
+            .get_or_insert_with(ContentSummary::default)
+            .observe(scan);
+    }
+
+    /// The content summary, or `None` if content scanning was off.
+    #[must_use]
+    pub fn content(&self) -> Option<&ContentSummary> {
+        self.content.as_ref()
     }
 
     /// Records one listed object: the inventory, both histograms, the
@@ -121,7 +149,7 @@ impl Aggregates {
         self.hll.observe(&object.etag, object.size);
 
         self.largest.offer(
-            |worst| sample::rank_against(None, object.size, &object.key, worst),
+            |worst| sample::rank_against(None, object.size, &object.key, "", worst),
             || Sample::for_object(object),
         );
     }
@@ -135,9 +163,12 @@ impl Aggregates {
         if let Some(slot) = self.samples.get_mut(finding.rule.index()) {
             let severity = finding.severity;
             let object = finding.object;
+            let column = finding.detail.column().map_or("", |d| d.column.as_str());
             slot.offer(
-                |worst| sample::rank_against(Some(severity), object.size, &object.key, worst),
-                || Sample::for_finding(object, severity),
+                |worst| {
+                    sample::rank_against(Some(severity), object.size, &object.key, column, worst)
+                },
+                || Sample::for_finding(object, severity, finding.detail),
             );
         }
     }
@@ -165,6 +196,11 @@ impl Aggregates {
         self.size_histogram.merge(&other.size_histogram);
         self.age_histogram.merge(&other.age_histogram);
         self.hll.merge(&other.hll);
+        match (&mut self.content, other.content) {
+            (Some(mine), Some(theirs)) => mine.merge(&theirs),
+            (mine @ None, theirs) => *mine = theirs,
+            (Some(_), None) => {}
+        }
     }
 
     /// The total number of objects observed.

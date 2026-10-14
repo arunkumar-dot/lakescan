@@ -9,6 +9,7 @@
 //! reason = "Public example key"   # required, non-blank
 //! expires = 2027-01-31            # optional; a TOML date or a "YYYY-MM-DD" string
 //! bucket = "my-bucket"            # optional; only applies when scanning this bucket
+//! column = "customer.email"       # optional; only findings on this exact column
 //! ```
 //!
 //! Loaded only from an explicit `--config` path, never discovered. Every
@@ -41,6 +42,10 @@ const MAX_REASON_BYTES: usize = 1024;
 /// The longest `bucket` accepted: S3's own bucket-name limit.
 const MAX_BUCKET_BYTES: usize = 63;
 
+/// The longest `column` accepted: a finding's column path is cut to this
+/// length, so a longer one could never match.
+const MAX_COLUMN_BYTES: usize = crate::model::MAX_COLUMN_BYTES;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -60,6 +65,7 @@ struct RawEntry {
     /// date and a quoted string are accepted and validated in one place.
     expires: Option<toml::Value>,
     bucket: Option<String>,
+    column: Option<String>,
 }
 
 /// Which keys an entry covers.
@@ -106,6 +112,9 @@ pub struct Entry {
     pub expires: Option<Date>,
     /// The only bucket the entry applies to, if restricted.
     pub bucket: Option<String>,
+    /// The only column the entry applies to, if restricted: it then covers
+    /// only findings that carry exactly this column path (PII findings).
+    pub column: Option<String>,
 }
 
 /// A validated config file: its entries, in file order.
@@ -196,6 +205,7 @@ fn validate(raw: RawEntry) -> Result<Entry, String> {
         reason,
         expires,
         bucket,
+        column,
     } = raw;
 
     let rule_id = RuleId::ALL
@@ -240,12 +250,21 @@ fn validate(raw: RawEntry) -> Result<Entry, String> {
         ));
     }
 
+    if let Some(column) = &column
+        && (column.is_empty() || column.len() > MAX_COLUMN_BYTES)
+    {
+        return Err(format!(
+            "column {column:?} is not a valid column path (1 to {MAX_COLUMN_BYTES} bytes)"
+        ));
+    }
+
     Ok(Entry {
         rule: rule_id,
         pattern,
         reason,
         expires,
         bucket,
+        column,
     })
 }
 
@@ -360,6 +379,12 @@ bucket = "my-bucket"
 rule = "zero-byte-object"
 prefix = ""
 reason = "Placeholders are expected here"
+
+[[suppress]]
+rule = "pii-email"
+prefix = "crm/"
+reason = "Contact column, accepted"
+column = "contact.email"
 "#,
         )?;
 
@@ -372,6 +397,7 @@ reason = "Placeholders are expected here"
                     reason: "Public example key used in our docs".to_owned(),
                     expires: Date::new(2027, 1, 31),
                     bucket: Some("my-bucket".to_owned()),
+                    column: None,
                 },
                 Entry {
                     rule: RuleId::ZeroByteObject,
@@ -379,6 +405,15 @@ reason = "Placeholders are expected here"
                     reason: "Placeholders are expected here".to_owned(),
                     expires: None,
                     bucket: None,
+                    column: None,
+                },
+                Entry {
+                    rule: RuleId::PiiEmail,
+                    pattern: Pattern::Prefix("crm/".to_owned()),
+                    reason: "Contact column, accepted".to_owned(),
+                    expires: None,
+                    bucket: None,
+                    column: Some("contact.email".to_owned()),
                 },
             ]
         );
@@ -490,6 +525,17 @@ reason = "Placeholders are expected here"
         let over_cap = format!("version = 1\n{}", entry.repeat(MAX_ENTRIES + 1));
         assert_rejected(&over_cap, &["10001", "at most 10000"]);
         Ok(())
+    }
+
+    #[test]
+    fn an_empty_or_over_long_column_is_rejected() {
+        for column in ["\"\"".to_owned(), format!("\"{}\"", "c".repeat(257))] {
+            let text = format!(
+                "version = 1\n[[suppress]]\nrule = \"pii-email\"\nkey = \"k\"\n\
+                 reason = \"r\"\ncolumn = {column}\n"
+            );
+            assert_rejected(&text, &["entry #1", "column"]);
+        }
     }
 
     #[test]
