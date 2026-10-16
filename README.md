@@ -704,5 +704,13 @@ That README lists each fixture's ground truth and how to regenerate it.
 
 ## License
 
-Licensed under the [Functional Source License, Version 1.1, ALv2 Future License](LICENSE)
-(FSL-1.1-ALv2).
+LakeScan is source-available under the Functional Source License, Version 1.1,
+ALv2 Future License (FSL-1.1-ALv2). In plain words:
+
+- You are free to use, modify and run LakeScan inside your own organization.
+- You may not offer it, or something built from it, as a competing commercial
+  product or service.
+- Each version becomes available under the Apache License, Version 2.0, two
+  years after its release.
+
+The full terms are in [LICENSE](LICENSE).
