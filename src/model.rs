@@ -461,17 +461,24 @@ pub enum NotScannedReason {
     /// them was skipped (page too large, unreadable, unsupported codec), so
     /// no value was examined.
     NoColumnExamined,
+    /// A `GetObject` still failed after the SDK's retries (throttling,
+    /// timeouts, 5xx, a vanished object).
+    FetchFailed,
+    /// The schema has more leaf columns than the per-file cap (16,384).
+    TooManyColumns,
 }
 
 impl NotScannedReason {
     /// Every reason, in declaration order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::NotParquet,
         Self::Unreadable,
         Self::AccessDenied,
         Self::Encrypted,
         Self::FooterTooLarge,
         Self::NoColumnExamined,
+        Self::FetchFailed,
+        Self::TooManyColumns,
     ];
 
     /// The stable code, e.g. `"not-parquet"`. **Frozen contract**.
@@ -484,6 +491,8 @@ impl NotScannedReason {
             Self::Encrypted => "encrypted",
             Self::FooterTooLarge => "footer-too-large",
             Self::NoColumnExamined => "no-column-examined",
+            Self::FetchFailed => "fetch-failed",
+            Self::TooManyColumns => "too-many-columns",
         }
     }
 
@@ -497,6 +506,8 @@ impl NotScannedReason {
             Self::Encrypted => 3,
             Self::FooterTooLarge => 4,
             Self::NoColumnExamined => 5,
+            Self::FetchFailed => 6,
+            Self::TooManyColumns => 7,
         }
     }
 }
@@ -720,6 +731,8 @@ mod tests {
             NotScannedReason::NoColumnExamined.code(),
             "no-column-examined"
         );
+        assert_eq!(NotScannedReason::FetchFailed.code(), "fetch-failed");
+        assert_eq!(NotScannedReason::TooManyColumns.code(), "too-many-columns");
         assert_eq!(Evidence::ColumnName.code(), "column-name");
         assert_eq!(
             Evidence::Values {

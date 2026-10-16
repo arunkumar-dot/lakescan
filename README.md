@@ -51,6 +51,12 @@ cargo run --example seed_local -- http://localhost:5001
 cargo run --release -- scan s3://lakescan-demo --endpoint-url http://localhost:5001
 echo "exit code: $?"    # 1: the bucket has High findings
 
+# 5. Write the same results as a self-contained HTML report, then open
+#    report.html in a browser (it loads nothing from the network).
+cargo run --release -- scan s3://lakescan-demo --endpoint-url http://localhost:5001 \
+  --html report.html --quiet > /dev/null
+open report.html        # macOS; xdg-open on Linux, start on Windows
+
 docker stop lakescan-moto
 ```
 
@@ -85,6 +91,10 @@ container or instance credentials.
 | `--quiet` | off | No progress line and no suppression warnings on stderr. |
 | `--pii` | off | Also scan Parquet files (keys ending in `.parquet` or `.parq`, any case) for personal data. Reads object contents; see [PII content scanning](#pii-content-scanning). Without it, no object is read. |
 | `--pii-whole-file-max <BYTES>` | `8388608` (8 MiB) | With `--pii`: Parquet files of at most `BYTES` are read whole, in one request. Larger ones are read partially. `0` to `67108864` (64 MiB). Requires `--pii`. |
+| `--concurrency <N>` | `16` | With `--pii`: Parquet files scanned at once, `1` to `256`. Output is identical for any value. Requires `--pii`. See [Speed and memory](#speed-and-memory). |
+| `--memory-budget <BYTES>` | `268435456` (256 MiB) | With `--pii`: the most bytes in-flight file scans hold at once. Must cover the most one file can need (~103 MiB at the default `--pii-whole-file-max`, ~132 MiB at 64 MiB); less is a usage error. Requires `--pii`. |
+| `--coalesce-gap <BYTES>` | `1048576` (1 MiB) | With `--pii`: page ranges of one file at most `BYTES` apart are read as one request (merged reads stay within 8 MiB). `0` reads each range alone. Requires `--pii`. |
+| `--html <PATH>` | off | Also write a self-contained [HTML report](#html-report) to `PATH`. `-` means stdout, which then requires every other output to go to a file. Works with or without `--pii`. |
 | `--inventory <PATH>` | off | With `--pii`: also write the [PII inventory](#pii-inventory-and-coverage) as CSV to `PATH`, one row per table, column and rule. `-` means stdout, which then requires `--output` to name a file, and `--findings` not to be `-`. Requires `--pii`. |
 
 A progress line (`scanned N objects, M findings`) is shown on stderr only when
@@ -102,7 +112,7 @@ The numbers are a stable contract. CI can branch on them.
 | 3 | `Auth` | Credentials are missing, expired, or rejected. |
 | 4 | `Transport` | The network or S3 failed (DNS, TLS, timeouts, 5xx, an unparseable response). Often worth retrying. |
 | 5 | `Report` | The summary or findings stream could not be written (full disk, bad path, permissions). |
-| 6 | `ContentNotScanned` | `--pii` was given and at least one Parquet file could not be content-scanned (unreadable, encrypted, refused, not Parquet, or with every readable column skipped) without a `content-not-scanned` suppression documenting it. Coverage fails closed: one such file among thousands of readable ones is enough. The summary is still written, and stderr gives the counts by reason. Takes precedence over 1. |
+| 6 | `ContentNotScanned` | `--pii` was given and at least one Parquet file could not be content-scanned (unreadable, encrypted, refused, a read that kept failing, not Parquet, or with every readable column skipped) without a `content-not-scanned` suppression documenting it. Coverage fails closed: one such file among thousands of readable ones is enough. The summary is still written, and stderr gives the counts by reason. Takes precedence over 1. |
 
 A closed pipe (`lakescan ... | head`) is not an error.
 
@@ -144,21 +154,24 @@ names one column, and its severity follows from its confidence (see
 | `pii-ip-address` | A column of IPv4 or IPv6 addresses. |
 | `pii-person-name` | A column whose name says it holds people's names (`full_name`, `lastName`, …). Detected by name only. |
 | `pii-date-of-birth` | A column whose name says it holds dates of birth (`dob`, `birth_date`, …). Detected by name only. |
-| `content-not-scanned` | `info`: a Parquet file that could not be scanned, with a reason: `not-parquet`, `unreadable`, `access-denied`, `encrypted`, `footer-too-large`, or `no-column-examined` (it has string or integer columns, but every one was skipped, so no value was examined). It never stops the scan, but unless suppressed it fails the run with exit code 6 (see [Coverage](#coverage-fails-closed)). |
+| `content-not-scanned` | `info`: a Parquet file that could not be scanned, with a reason: `not-parquet`, `unreadable`, `access-denied`, `encrypted`, `footer-too-large`, `no-column-examined` (it has string or integer columns, but every one was skipped, so no value was examined), `fetch-failed` (a `GetObject` still failed after the SDK's retries: throttling, timeouts, 5xx, an object deleted mid-scan), or `too-many-columns` (the schema has more than 16,384 leaf columns). It never stops the scan, but unless suppressed it fails the run with exit code 6 (see [Coverage](#coverage-fails-closed)). |
 
 ## PII content scanning
 
 `--pii` reads the contents of every object whose key ends in `.parquet` or
-`.parq` (in any case), one file at a time.
+`.parq` (in any case), up to `--concurrency` files at once (see [Speed and
+memory](#speed-and-memory)).
 
 **What is read.** A file of at most `--pii-whole-file-max` bytes (8 MiB by
 default) is read whole, in one request. For a larger file, LakeScan reads:
 
 - the footer, with one 64 KiB tail read (plus a second read if the footer is
-  longer than that);
+  longer than that), and the offset indexes, if the writer wrote them: free
+  when they are in the tail, else one read for all of them;
 - for each candidate column, its dictionary page, if any, and the first data
   page of row group 0. With an offset index, that is one exact range.
-  Without one, the range is found by reading page headers.
+  Without one, the range is found by reading page headers. A row group's
+  ranges are coalesced (see [Speed and memory](#speed-and-memory)).
 
 A column whose sample is too small or too ambiguous after row group 0 is
 sampled again in the middle row group, then the last: never more than 3 row
@@ -262,12 +275,46 @@ fails the run with exit code 6 unless documented (see
 refused, stderr also names the missing permissions.
 
 The cost is S3 `GET` requests: one for a small file, and for a large one
-about one for the footer plus one or two per sampled column and row group.
-On the test fixtures (15 columns), that was 14–16 requests per file. Add
-data transfer for the bytes read when you run outside the bucket's AWS
-region. The
-`CONTENT` section (`content` in JSON) reports `bytes_read` and
-`get_requests`, so you can see what a scan cost.
+one for the footer, one for the offset indexes if they aren't in it, and
+one or two per sampled column and row group, fewer when coalescing merges
+them (see below). Add data transfer for the bytes read when you run
+outside the bucket's AWS region. The `CONTENT` section (`content` in JSON)
+reports `bytes_read` and `get_requests`, so you can see what a scan cost.
+
+### Speed and memory
+
+Content scanning runs up to `--concurrency` files at once (16 by
+default). Results are applied in listing order, so the summary, the
+findings stream and the inventory are identical for any `--concurrency`.
+Decoding runs on a separate thread pool, so it doesn't stall reads.
+`GetObject` uses the SDK's adaptive retry mode, which slows down when S3
+throttles (503 `SlowDown`); a read that still fails becomes
+`content-not-scanned` with reason `fetch-failed`, which fails the run (exit
+code 6) unless documented.
+
+**Memory is bounded by `--memory-budget`** (256 MiB by default). Every read
+and every decode takes permits for its bytes (the bytes fetched, or the
+page sizes a header declares) before it starts, and gives them back when
+its buffers are freed. One file never needs more than ~103 MiB under
+LakeScan's caps (~132 MiB with `--pii-whole-file-max 64MiB`), and a budget
+below that is a usage error, since that file could never start. Files
+share the budget so that none can wait forever: each in-flight file may
+hold an equal share freely, and one file at a time may go beyond it. On
+top of the budget, each in-flight file holds a few kilobytes of state and
+up to ~0.8 MiB of page locations. A bigger budget lets more files run at
+full speed at high `--concurrency`: with 256 MiB, going past 16 adds
+little for typical files.
+
+**Coalescing trades bytes for requests.** Within a partially read file,
+each round's page reads (the first pages of every column in row group 0,
+then of the columns that need more) are sorted and merged when they are at
+most `--coalesce-gap` apart (1 MiB by default; merged reads stay within 8
+MiB), and up to 4 are fetched at once. The bytes between merged ranges are
+read too. That pays off for files with small row groups, and does little
+for files with a few large ones. S3 bills per request, and egress per byte
+outside its region: where egress costs more than requests and time, set
+`--coalesce-gap 0`. Simulated measurements, and their limits, are in
+[docs/experiments/scan-speed.md](docs/experiments/scan-speed.md).
 
 ### PII inventory and coverage
 
@@ -367,6 +414,34 @@ a cap, the lexicographically smallest tables and entries are kept, the
 same whatever order files arrive in, with every kept count exact. What is
 left out is counted (files and findings) and reported in a `truncated:`
 line, `left_out` in JSON. Scan a narrower prefix to see the rest.
+
+### HTML report
+
+`--html report.html` writes the same results as one file to open in a
+browser, print, or send: the scan's target, version, timing and exit code
+with its meaning; an **Action needed** banner listing what to do
+(undocumented PII columns, undocumented unscanned files, findings at the
+failing threshold), or **No action needed**; headline cards; the PII
+inventory by table, ordered as in the text summary, with status badges and
+documented reasons, and filters (All, Undocumented, Documented); the files
+not scanned, by table and reason; and the metadata findings per rule.
+Without `--pii` it has the metadata sections only.
+
+- **Offline.** All CSS and JavaScript are inline, fonts are the system's,
+  and a Content-Security-Policy (`default-src 'none'`) stops the page from
+  loading anything: opening it makes no network request.
+- **No values.** Like every other output, it holds no sampled personal
+  data: keys, table and column names, counts, and your documented reasons.
+- **Escaped names.** Keys, table and column names and reasons are
+  attacker-controlled. Each is escaped like the text summary (control and
+  bidi characters as `\u{XXXX}`, backslashes doubled), then HTML-escaped,
+  so a name like `<script>…</script>` shows as text. The small script reads
+  its data from a JSON block in which `<` is written `\u003c`, and only sets
+  text, never HTML.
+- **Works without JavaScript**: every row is shown and the filters are
+  hidden. Printing shows every row, without the filters.
+- **Deterministic**: the same for any `--concurrency`, apart from its start
+  time and duration.
 
 ### Coverage fails closed
 
@@ -538,8 +613,11 @@ changing what it means bumps `schema_version`.
 - **It samples rather than reads everything.** A column is judged from the
   first data page of up to three row groups (at most 2,000 values each). A
   column whose personal data appears only in other pages can be missed.
-- **Sequential.** Files are read one at a time, so a lake of many small files
-  takes one round trip per file, or more.
+- **One listing stream.** Listing is sequential (one `ListObjectsV2` page
+  at a time), so for very large buckets, and for scans without `--pii`, it
+  becomes the bottleneck. Scan big buckets by prefix, in parallel runs.
+- **Speed is measured on a simulated S3 only.** See
+  [docs/experiments/scan-speed.md](docs/experiments/scan-speed.md).
 - **Tables are guessed from keys.** The inventory groups files by directory,
   minus Hive partitions and an Iceberg `data/` directory. It does not read
   Glue, Hive, Iceberg or Delta metadata, so a table laid out differently is

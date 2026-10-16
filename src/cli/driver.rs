@@ -9,15 +9,17 @@
 //! tests below run a whole scan against in-memory buffers, a scripted
 //! [`PageSource`], and in-memory Parquet files.
 
+use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use super::target::Target;
 use crate::aggregate::{Aggregates, ContentSummary};
-use crate::content::{self, ObjectReader};
+use crate::content::{self, FileOutcome, FileScan, MemoryBudget, ObjectReader, ScanOptions};
 use crate::error::{ExitCode, LakeScanError};
 use crate::model::RuleId;
-use crate::model::{Finding, NotScannedReason, Severity};
+use crate::model::{Finding, NotScannedReason, ObjectMeta, Severity};
 use crate::report::{self, FindingsWriter, Format, ScanInfo};
 use crate::rules::{self, EvalContext};
 use crate::scanner::{PageSource, Scanner};
@@ -27,14 +29,24 @@ use crate::suppress::{Config, Date, Entry, Outcome, Suppressor};
 /// entire line".
 const CLEAR_LINE: &str = "\r\x1b[2K";
 
-/// Content scanning for one run: where object contents come from, and
-/// which files are small enough to read whole.
+/// Content scanning for one run: where object contents come from, how
+/// files are read, how many at once, and the memory they share.
 pub(crate) struct Content<R> {
     /// Reads object byte ranges.
     pub(crate) reader: R,
-    /// Files at or below this size are read whole.
-    pub(crate) whole_file_max: u64,
+    /// The whole-file maximum and the coalescing gap.
+    pub(crate) options: ScanOptions,
+    /// Files scanned at once (`--concurrency`), at least 1.
+    pub(crate) concurrency: usize,
+    /// The bytes in-flight scans may hold (`--memory-budget`).
+    pub(crate) budget: Arc<MemoryBudget>,
 }
+
+/// How many listed objects may wait behind an unfinished file scan, on top
+/// of `--concurrency`: bounds the ordered window (an `ObjectMeta` each,
+/// about 1 KiB at most), so a slow file never makes the queue grow with
+/// the bucket.
+const LOOKAHEAD: usize = 1024;
 
 /// Where one scan's output goes.
 pub(crate) struct Outputs<O, F, P, D, E> {
@@ -45,6 +57,8 @@ pub(crate) struct Outputs<O, F, P, D, E> {
     /// The PII inventory as CSV (`--inventory`), if requested; written
     /// after the summary.
     pub(crate) inventory: Option<F>,
+    /// The HTML report (`--html`), if requested; written after the CSV.
+    pub(crate) html: Option<F>,
     /// The progress line's destination, or `None` for no progress output.
     /// The caller decides (terminal or not, `--quiet` or not); the driver
     /// only writes to it.
@@ -67,8 +81,11 @@ pub(crate) struct Outputs<O, F, P, D, E> {
 /// `None` never fails on findings.
 ///
 /// With `content`, every eligible object (see [`content::is_eligible`]) is
-/// content-scanned as it is listed, one at a time, and its findings take
-/// the same path as listing findings.
+/// content-scanned as it is listed, up to `concurrency` files at once,
+/// and its findings take the same path as listing findings. Objects are
+/// applied (aggregates, suppressor, findings stream) strictly in listing
+/// order through an ordered window, so every output is the same for any
+/// concurrency.
 ///
 /// "Now" is captured once, at the start, and shared by the rule engine, the
 /// aggregates, and the suppressor (whose expiry check uses its UTC date),
@@ -119,6 +136,7 @@ where
         summary,
         findings,
         inventory,
+        html,
         mut progress,
         warnings,
         mut errors,
@@ -159,9 +177,15 @@ where
         elapsed,
         suppressions: suppressor.finish(),
     };
+    // Decided before any report is written, so the HTML report can state
+    // it; a report that then fails to write still ends the run with 5.
+    let code = decide(&aggregates, fail_on);
     report::write_summary(summary, format, &info, &aggregates)?;
     if let Some(out) = inventory {
         report::write_inventory_csv(out, &info, &aggregates)?;
+    }
+    if let Some(out) = html {
+        report::write_html(out, &info, &aggregates, code)?;
     }
 
     if let Some(mut out) = warnings {
@@ -169,14 +193,23 @@ where
         let _ = write_warnings(&mut out, &info.suppressions);
     }
 
-    if let Some(content) = aggregates.content()
-        && content.coverage().not_scanned_unsuppressed > 0
+    if code == ExitCode::ContentNotScanned
+        && let Some(content) = aggregates.content()
     {
         // Best effort: the exit code carries the verdict regardless.
         let _ = write_not_scanned(&mut errors, content);
-        return Ok(ExitCode::ContentNotScanned);
     }
-    Ok(verdict(aggregates.worst_severity(), fail_on))
+    Ok(code)
+}
+
+/// The run's exit code from what it found: [`ExitCode::ContentNotScanned`]
+/// when an eligible file was not scanned and no suppression documents it
+/// (fail closed, winning over a failing severity), else the verdict.
+fn decide(aggregates: &Aggregates, fail_on: Option<Severity>) -> ExitCode {
+    match aggregates.coverage() {
+        Some(coverage) if coverage.not_scanned_unsuppressed > 0 => ExitCode::ContentNotScanned,
+        _ => verdict(aggregates.worst_severity(), fail_on),
+    }
 }
 
 /// Explains [`ExitCode::ContentNotScanned`]: the undocumented files by
@@ -277,13 +310,14 @@ impl<F: Write> Sinks<'_, F> {
 
 /// Pulls every page from `scanner`, feeding each object into the
 /// aggregates and each finding it raises (listing rules, then, for an
-/// eligible Parquet object, content scanning) through `sinks`, and
-/// rewrites the progress line after every page. Every content buffer is
-/// dropped before the next object.
+/// eligible Parquet object, content scanning) through `sinks`, in listing
+/// order, and rewrites the progress line after every page. Eligible files
+/// are scanned as tasks, at most `concurrency` at once, their buffers held
+/// only under the shared memory budget.
 async fn walk<S, R, F, P>(
     scanner: &mut Scanner<S>,
     ctx: &EvalContext,
-    mut content: Option<&mut Content<R>>,
+    content: Option<&mut Content<R>>,
     sinks: &mut Sinks<'_, F>,
     mut progress: Option<&mut P>,
 ) -> Result<(), LakeScanError>
@@ -294,37 +328,32 @@ where
     P: Write,
 {
     let mut object_count: u64 = 0;
-    let mut file_count: u64 = 0;
+    let mut window = Window::default();
 
     while let Some(page) = scanner.next_page().await? {
         for object in page {
-            sinks.aggregates.observe_object(object);
-            for finding in rules::evaluate(object, ctx) {
-                sinks.route(finding)?;
-            }
-            if let Some(content) = content.as_deref_mut()
-                && content::is_eligible(&object.key)
-            {
-                let scan =
-                    content::scan_file(&mut content.reader, object, content.whole_file_max).await;
-                // Whether the file's content-not-scanned finding, if any,
-                // was suppressed: that decides the exit code.
-                let mut suppressed = false;
-                for finding in scan.findings(object) {
-                    let covered = sinks.route(finding)?;
-                    if finding.rule == RuleId::ContentNotScanned {
-                        suppressed = covered;
-                    }
+            let Some(content) = content.as_deref() else {
+                // No content scanning: nothing to wait for, so no window.
+                Window::apply_listed(object, ctx, sinks)?;
+                continue;
+            };
+            if content::is_eligible(&object.key) {
+                while window.scanning >= content.concurrency {
+                    window.apply_front(ctx, sinks).await?;
                 }
-                sinks.aggregates.observe_content(object, &scan, suppressed);
-                file_count = file_count.saturating_add(1);
+                window.push_scan(object, content);
+            } else {
+                window.push(Slot::Listed(object.clone()));
+            }
+            while window.slots.len() > content.concurrency + LOOKAHEAD {
+                window.apply_front(ctx, sinks).await?;
             }
         }
         object_count = object_count.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX));
 
         if let Some(out) = progress.as_deref_mut() {
             let files = if content.is_some() {
-                format!(", {file_count} parquet files")
+                format!(", {} parquet files", window.files_done)
             } else {
                 String::new()
             };
@@ -337,8 +366,110 @@ where
             .and_then(|()| out.flush());
         }
     }
+    while !window.slots.is_empty() {
+        window.apply_front(ctx, sinks).await?;
+    }
 
     Ok(())
+}
+
+/// A spawned file scan, aborted if dropped unfinished (a listing error
+/// ends the run), which frees its permits.
+struct ScanTask(tokio::task::JoinHandle<FileScan>);
+
+impl Drop for ScanTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One listed object waiting its turn.
+enum Slot {
+    /// Nothing to wait for.
+    Listed(ObjectMeta),
+    /// An eligible Parquet file being scanned.
+    Scanning(ObjectMeta, ScanTask),
+}
+
+/// The ordered window: listed objects, in listing order, applied only from
+/// the front, so results reach the sinks in listing order whatever order
+/// the scans finish in.
+#[derive(Default)]
+struct Window {
+    slots: VecDeque<Slot>,
+    /// Scans in the window.
+    scanning: usize,
+    /// Scans applied.
+    files_done: u64,
+}
+
+impl Window {
+    fn push(&mut self, slot: Slot) {
+        self.slots.push_back(slot);
+    }
+
+    /// Starts scanning `object` as a task, under its own budget account.
+    fn push_scan<R: ObjectReader>(&mut self, object: &ObjectMeta, content: &Content<R>) {
+        let reader = content.reader.clone();
+        let file = object.clone();
+        let options = content.options;
+        let budget = content.budget.for_file();
+        let task =
+            tokio::spawn(async move { content::scan_file(reader, &file, options, budget).await });
+        self.scanning += 1;
+        self.slots
+            .push_back(Slot::Scanning(object.clone(), ScanTask(task)));
+    }
+
+    /// Applies one listed object that needs no content scan: the
+    /// aggregates and every listing finding.
+    fn apply_listed<F: Write>(
+        object: &ObjectMeta,
+        ctx: &EvalContext,
+        sinks: &mut Sinks<'_, F>,
+    ) -> Result<(), LakeScanError> {
+        sinks.aggregates.observe_object(object);
+        for finding in rules::evaluate(object, ctx) {
+            sinks.route(finding)?;
+        }
+        Ok(())
+    }
+
+    /// Applies the front object, waiting for its scan if it has one. A
+    /// scan task that panicked or was cancelled is `unreadable`.
+    async fn apply_front<F: Write>(
+        &mut self,
+        ctx: &EvalContext,
+        sinks: &mut Sinks<'_, F>,
+    ) -> Result<(), LakeScanError> {
+        let Some(slot) = self.slots.pop_front() else {
+            return Ok(());
+        };
+        match slot {
+            Slot::Listed(object) => Self::apply_listed(&object, ctx, sinks),
+            Slot::Scanning(object, mut task) => {
+                Self::apply_listed(&object, ctx, sinks)?;
+                let scan = (&mut task.0).await.unwrap_or_else(|_| FileScan {
+                    outcome: FileOutcome::NotScanned(NotScannedReason::Unreadable),
+                    columns: Vec::new(),
+                    stats: content::FileStats::default(),
+                });
+                self.scanning -= 1;
+                self.files_done += 1;
+                // Whether the file's content-not-scanned finding, if any,
+                // was suppressed: that decides the exit code.
+                let mut suppressed = false;
+                for finding in scan.findings(&object) {
+                    let covered = sinks.route(finding)?;
+                    if finding.rule == RuleId::ContentNotScanned {
+                        suppressed = covered;
+                    }
+                }
+                sinks.aggregates.observe_content(&object, &scan, suppressed);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// The run's exit code: a failing verdict exactly when there was a finding
@@ -354,6 +485,7 @@ fn verdict(worst: Option<Severity>, fail_on: Option<Severity>) -> ExitCode {
 mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     use super::{CLEAR_LINE, Content, Outputs, scan, verdict};
@@ -361,6 +493,7 @@ mod tests {
     use crate::content::testing::{
         Layout, MemoryReader, Values, aadhaars, emails, mobiles, parquet_file,
     };
+    use crate::content::{MemoryBudget, ScanOptions};
     use crate::error::{ExitCode, LakeScanError};
     use crate::model::{NotScannedReason, ObjectMeta, Severity, StorageClass};
     use crate::report::Format;
@@ -471,6 +604,7 @@ mod tests {
                 summary: &mut summary,
                 findings: Some(&mut findings),
                 inventory: None,
+                html: None,
                 progress: None::<Vec<u8>>,
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
@@ -522,6 +656,7 @@ mod tests {
                     summary: Vec::new(),
                     findings: None::<Vec<u8>>,
                     inventory: None,
+                    html: None,
                     progress: None::<Vec<u8>>,
                     warnings: None::<Vec<u8>>,
                     errors: Vec::<u8>::new(),
@@ -548,6 +683,7 @@ mod tests {
                 summary: Vec::new(),
                 findings: None::<Vec<u8>>,
                 inventory: None,
+                html: None,
                 progress: Some(&mut progress),
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
@@ -588,6 +724,7 @@ mod tests {
                 summary: &mut summary,
                 findings: None::<Vec<u8>>,
                 inventory: None,
+                html: None,
                 progress: Some(&mut progress),
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
@@ -607,58 +744,445 @@ mod tests {
         summary: String,
         findings: String,
         inventory: String,
+        html: String,
         warnings: String,
         errors: String,
     }
 
-    /// Lists `files` (key, body) as one page and scans them with `--pii`,
-    /// reading everything at or below `whole_file_max` whole.
-    async fn content_run(
+    /// How a test content run is set up.
+    struct RunSettings {
+        whole_file_max: u64,
+        concurrency: usize,
+        coalesce_gap: u64,
+        memory_budget: u64,
+        latency: crate::content::Latency,
+        seed: u64,
+        failing: Vec<&'static str>,
+        /// Listing page size: files split into pages of this many.
+        page: usize,
+    }
+
+    impl Default for RunSettings {
+        fn default() -> Self {
+            Self {
+                whole_file_max: 8 * 1024 * 1024,
+                concurrency: 4,
+                coalesce_gap: crate::content::DEFAULT_COALESCE_GAP,
+                memory_budget: crate::content::DEFAULT_MEMORY_BUDGET,
+                latency: crate::content::Latency::NONE,
+                seed: 1,
+                failing: Vec::new(),
+                page: 1000,
+            }
+        }
+    }
+
+    /// Lists `files` (key, body) and scans them with `--pii` under
+    /// `settings`; also returns the store and the budget, to inspect.
+    async fn content_run_with(
         files: &[(&str, Vec<u8>)],
         config: Config,
         format: Format,
-        whole_file_max: u64,
-    ) -> Result<ContentRun, Box<dyn std::error::Error>> {
-        let mut reader = MemoryReader::default();
+        settings: &RunSettings,
+    ) -> Result<(ContentRun, MemoryReader, Arc<MemoryBudget>), Box<dyn std::error::Error>> {
+        let reader = MemoryReader::new(settings.latency);
+        reader.set_latency(settings.latency, settings.seed);
         let mut listed = Vec::new();
         for (key, body) in files {
-            reader = reader.with(key, body.clone());
-            listed.push(object(
-                key,
-                u64::try_from(body.len())?,
-                StorageClass::Standard,
-            ));
+            reader.insert(key, Arc::new(body.clone()));
+            let mut listed_object = object(key, u64::try_from(body.len())?, StorageClass::Standard);
+            // A fixed date, so runs compare equal.
+            listed_object.last_modified = SystemTime::UNIX_EPOCH + Duration::from_hours(480_000);
+            listed.push(listed_object);
         }
-        let (mut summary, mut findings, mut inventory, mut warnings, mut errors) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for key in &settings.failing {
+            reader.fail(key);
+        }
+        let budget = Arc::new(
+            MemoryBudget::new(
+                settings.memory_budget,
+                settings.concurrency,
+                crate::content::file_need(settings.whole_file_max),
+            )
+            .map_err(|_| "budget too small")?,
+        );
+        reader.watch(&budget);
+        let mut pages: Vec<Step> = Vec::new();
+        let chunks: Vec<Vec<ObjectMeta>> = listed
+            .chunks(settings.page.max(1))
+            .map(<[ObjectMeta]>::to_vec)
+            .collect();
+        let count = chunks.len();
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let token = (index + 1 < count).then(|| format!("tok-{index}"));
+            pages.push(Step::Page(chunk, token));
+        }
+        if pages.is_empty() {
+            pages.push(Step::Page(Vec::new(), None));
+        }
+        let (mut summary, mut findings, mut inventory, mut html, mut warnings, mut errors) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         let code = scan(
-            source(vec![Step::Page(listed, None)]),
+            source(pages),
             target(),
             config,
             format,
             Some(Severity::High),
             Some(Content {
-                reader,
-                whole_file_max,
+                reader: reader.clone(),
+                options: ScanOptions {
+                    whole_file_max: settings.whole_file_max,
+                    coalesce_gap: settings.coalesce_gap,
+                },
+                concurrency: settings.concurrency,
+                budget: Arc::clone(&budget),
             }),
             Outputs {
                 summary: &mut summary,
                 findings: Some(&mut findings),
                 inventory: Some(&mut inventory),
+                html: Some(&mut html),
                 progress: None::<Vec<u8>>,
                 warnings: Some(&mut warnings),
                 errors: &mut errors,
             },
         )
         .await?;
-        Ok(ContentRun {
+        let run = ContentRun {
             code,
             summary: String::from_utf8(summary)?,
             findings: String::from_utf8(findings)?,
             inventory: String::from_utf8(inventory)?,
+            html: String::from_utf8(html)?,
             warnings: String::from_utf8(warnings)?,
             errors: String::from_utf8(errors)?,
-        })
+        };
+        Ok((run, reader, budget))
+    }
+
+    /// Lists `files` (key, body) as one page and scans them with `--pii`,
+    /// four at a time, reading everything at or below `whole_file_max`
+    /// whole.
+    async fn content_run(
+        files: &[(&str, Vec<u8>)],
+        config: Config,
+        format: Format,
+        whole_file_max: u64,
+    ) -> Result<ContentRun, Box<dyn std::error::Error>> {
+        let settings = RunSettings {
+            whole_file_max,
+            ..RunSettings::default()
+        };
+        Ok(content_run_with(files, config, format, &settings).await?.0)
+    }
+
+    /// Every committed fixture (tests/fixtures/parquet) under a lake-like
+    /// key, several times over: readable files of four writers and three
+    /// codecs, an escalation file, two bad files and a fully skipped one.
+    /// `(key, body)` of each listed object.
+    type Lake = Vec<(String, Vec<u8>)>;
+
+    fn fixture_lake(copies: usize) -> Result<Lake, Box<dyn std::error::Error>> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parquet");
+        let paths = [
+            "pyarrow/customers.parquet",
+            "polars/customers.parquet",
+            "duckdb/customers.parquet",
+            "spark/customers.parquet",
+            "gzip/pyarrow/customers.parquet",
+            "gzip/spark/customers.parquet",
+            "brotli/pyarrow/customers.parquet",
+            "escalation.parquet",
+            "bad/truncated.parquet",
+            "bad/not_parquet.parquet",
+            "skipped/too_large.parquet",
+        ];
+        let mut out = Vec::new();
+        for copy in 0..copies {
+            for (index, path) in paths.iter().enumerate() {
+                let body = std::fs::read(root.join(path))?;
+                out.push((format!("lake/t{index}/dt={copy}/part-0.parquet"), body));
+                // A listing-only object between files: its findings must
+                // keep their place in the stream.
+                out.push((format!("lake/t{index}/dt={copy}/id_rsa"), b"key".to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `text` without the lines and fields that time a run.
+    fn untimed(text: &str) -> String {
+        text.lines()
+            .filter(|line| {
+                !line.starts_with("started:")
+                    && !line.starts_with("elapsed:")
+                    && !line.contains("class=\"timing\"")
+            })
+            .map(|line| {
+                let mut line = line.to_owned();
+                for field in ["\"started_at\":\"", "\"elapsed_ms\":"] {
+                    if let Some(at) = line.find(field) {
+                        let from = at + field.len();
+                        let end = line
+                            .get(from..)
+                            .and_then(|rest| rest.find([',', '}']))
+                            .map_or(line.len(), |len| from + len);
+                        line.replace_range(from..end, "");
+                    }
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_output_is_identical_for_any_concurrency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lake = fixture_lake(2)?;
+        let files: Vec<(&str, Vec<u8>)> = lake
+            .iter()
+            .map(|(key, body)| (key.as_str(), body.clone()))
+            .collect();
+        let mut outputs = Vec::new();
+        for (concurrency, seed, whole_file_max) in
+            [(1, 7, 0), (64, 11, 0), (1, 3, 8 << 20), (64, 5, 8 << 20)]
+        {
+            // Random latency, so files finish in a different order each run.
+            let settings = RunSettings {
+                concurrency,
+                whole_file_max,
+                seed,
+                latency: crate::content::Latency {
+                    per_request: Duration::from_micros(100),
+                    bytes_per_second: 0,
+                    jitter: Duration::from_millis(3),
+                },
+                page: 7,
+                ..RunSettings::default()
+            };
+            let mut runs = Vec::new();
+            for format in [Format::Text, Format::Json] {
+                let (run, _, _) =
+                    content_run_with(&files, Config::default(), format, &settings).await?;
+                runs.push(run);
+            }
+            outputs.push((whole_file_max, runs));
+        }
+        let render = |runs: &[ContentRun]| {
+            runs.iter()
+                .map(|run| {
+                    format!(
+                        "{:?}\n{}\n{}\n{}\n{}\n{}",
+                        run.code,
+                        untimed(&run.summary),
+                        run.findings,
+                        run.inventory,
+                        untimed(&run.html),
+                        run.errors
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for pair in outputs.chunks(2) {
+            let [(_, sequential), (_, concurrent)] = pair else {
+                return Err("expected pairs".into());
+            };
+            assert_eq!(render(sequential), render(concurrent));
+        }
+        // And the runs did something: findings, both kinds of file.
+        let first = outputs
+            .first()
+            .and_then(|(_, runs)| runs.first())
+            .ok_or("no run")?;
+        assert!(first.findings.contains("pii-email"));
+        assert!(first.findings.contains("sensitive-key"));
+        assert_eq!(first.code, ExitCode::ContentNotScanned);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_flight_bytes_never_exceed_the_memory_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lake = fixture_lake(2)?;
+        let files: Vec<(&str, Vec<u8>)> = lake
+            .iter()
+            .map(|(key, body)| (key.as_str(), body.clone()))
+            .collect();
+        // Partial reads (escalation and concurrent ranges included) and
+        // whole ones, at a budget just above one file's need, with many
+        // files in flight.
+        for whole_file_max in [0, 8 << 20] {
+            let need = crate::content::file_need(whole_file_max);
+            let settings = RunSettings {
+                concurrency: 32,
+                whole_file_max,
+                memory_budget: need + (4 << 20),
+                latency: crate::content::Latency {
+                    per_request: Duration::from_micros(200),
+                    bytes_per_second: 0,
+                    jitter: Duration::from_millis(2),
+                },
+                ..RunSettings::default()
+            };
+            let (run, store, budget) =
+                content_run_with(&files, Config::default(), Format::Text, &settings).await?;
+            assert!(run.summary.contains("PII INVENTORY"));
+            assert!(store.requests() > 0);
+            assert_eq!(store.unpermitted(), 0, "a fetch without permits");
+            assert_eq!(store.over_budget(), 0, "over budget");
+            assert!(
+                budget.peak() <= settings.memory_budget,
+                "peak {} over budget {}",
+                budget.peak(),
+                settings.memory_budget
+            );
+            assert!(budget.peak() > 0);
+            assert_eq!(budget.held(), 0, "every permit released");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_fetch_failed_and_fails_closed_unless_documented()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let files = [
+            ("lake/a.parquet", customers_file(50)?),
+            ("lake/b.parquet", customers_file(50)?),
+        ];
+        let settings = RunSettings {
+            failing: vec!["lake/b.parquet"],
+            ..RunSettings::default()
+        };
+        let (run, _, _) =
+            content_run_with(&files, Config::default(), Format::Json, &settings).await?;
+        assert_eq!(run.code, ExitCode::ContentNotScanned);
+        assert!(run.errors.contains("(fetch-failed=1)"), "{}", run.errors);
+        assert!(
+            run.findings.contains(r#""reason":"fetch-failed""#),
+            "{}",
+            run.findings
+        );
+        let summary: serde_json::Value = serde_json::from_str(&run.summary)?;
+        assert_eq!(
+            summary.pointer("/content/not_scanned/fetch-failed"),
+            Some(&serde_json::json!(1))
+        );
+
+        let config = Config::parse(
+            "version = 1\n[[suppress]]\nrule = \"content-not-scanned\"\n\
+             key = \"lake/b.parquet\"\nreason = \"Restored from backup, INC-9\"\n",
+            "test.toml",
+        )?;
+        let (run, _, _) = content_run_with(&files, config, Format::Json, &settings).await?;
+        assert_eq!(run.code, ExitCode::FindingsExceedThreshold);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_panicking_decode_costs_one_file_under_concurrency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = 100;
+        let armed = parquet_file(
+            &[
+                ("email", Values::Text(emails(rows))),
+                ("blows_up", Values::Text(emails(rows))),
+            ],
+            Layout::default(),
+        )?;
+        let mut files = vec![("lake/armed.parquet", armed)];
+        let keys: Vec<String> = (0..12).map(|i| format!("lake/ok-{i:02}.parquet")).collect();
+        for key in &keys {
+            files.push((key.as_str(), customers_file(rows)?));
+        }
+        crate::content::read_fault::arm("blows_up");
+        let settings = RunSettings {
+            concurrency: 8,
+            ..RunSettings::default()
+        };
+        let result = content_run_with(&files, Config::default(), Format::Json, &settings).await;
+        crate::content::read_fault::disarm("blows_up");
+        let (run, _, _) = result?;
+        let summary: serde_json::Value = serde_json::from_str(&run.summary)?;
+        assert_eq!(
+            summary.pointer("/content/not_scanned/unreadable"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            summary.pointer("/coverage/files_scanned"),
+            Some(&serde_json::json!(12))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hostile_names_render_as_inert_text_in_the_html_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hostile = [
+            "<script>alert(1)</script>",
+            "</script>",
+            "\"><img src=x onerror=alert(1)>",
+            "esc\u{1b}[31m",
+            "rtl\u{202e}gnp.exe",
+        ];
+        let rows = 100;
+        let columns: Vec<(&str, Values)> = hostile
+            .iter()
+            .map(|name| (*name, Values::Text(emails(rows))))
+            .collect();
+        let body = parquet_file(&columns, Layout::default())?;
+        let keys: Vec<String> = hostile
+            .iter()
+            .map(|name| format!("lake/{name}/dt=1/part-0.parquet"))
+            .collect();
+        let mut files: Vec<(&str, Vec<u8>)> = keys
+            .iter()
+            .map(|key| (key.as_str(), body.clone()))
+            .collect();
+        // A documented reason that is hostile too, and an unreadable file
+        // under a hostile name.
+        let bad = "lake/<b>bad</b>/x.parquet";
+        files.push((bad, b"PAR1 not really".to_vec()));
+        let config = Config::parse(
+            "version = 1\n[[suppress]]\nrule = \"pii-email\"\nprefix = \"lake/\"\n\
+             column = \"</script>\"\nreason = \"<script>alert('reason')</script>\"\n",
+            "test.toml",
+        )?;
+        let (run, _, _) =
+            content_run_with(&files, config, Format::Text, &RunSettings::default()).await?;
+        let html = run.html;
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
+        assert!(html.contains("&lt;script&gt;alert(&#39;reason&#39;)&lt;/script&gt;"));
+        assert!(html.contains("&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(html.contains("esc\\u{001b}[31m"));
+        assert!(html.contains("rtl\\u{202e}gnp.exe"));
+        // Nothing hostile survives raw: the page's only tags are its own.
+        for raw in [
+            "<script>alert",
+            "<img",
+            "<b>",
+            "onerror=alert(1)>",
+            "\u{1b}",
+            "\u{202e}",
+        ] {
+            assert!(!html.contains(raw), "{raw:?} reached the page");
+        }
+        assert_eq!(
+            html.matches("<script").count(),
+            2,
+            "only the page's two scripts"
+        );
+        assert_eq!(html.matches("</script>").count(), 2);
+        Ok(())
     }
 
     fn customers_file(rows: usize) -> Result<Vec<u8>, parquet::errors::ParquetError> {
@@ -735,6 +1259,7 @@ mod tests {
                 summary: &mut summary,
                 findings: None::<Vec<u8>>,
                 inventory: None,
+                html: None,
                 progress: None::<Vec<u8>>,
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
@@ -1074,10 +1599,12 @@ reason = "Never matches"
             let run = content_run(&files, config.clone(), format, whole_file_max).await?;
             // The broken file is undocumented, so the run fails closed.
             assert_eq!(run.code, ExitCode::ContentNotScanned);
+            assert!(run.html.contains("PII inventory"));
             for text in [
                 run.summary,
                 run.findings,
                 run.inventory,
+                run.html,
                 run.warnings,
                 run.errors,
             ] {
@@ -1128,6 +1655,7 @@ reason = "Never matches anything in this scan"
                 summary: &mut summary,
                 findings: Some(&mut findings),
                 inventory: None,
+                html: None,
                 progress: None::<Vec<u8>>,
                 warnings: Some(&mut warnings),
                 errors: Vec::<u8>::new(),

@@ -103,3 +103,8 @@ jobs:
 
       - name: End-to-end tests
         run: cargo test --test e2e --test e2e_pii -- --ignored
+
+      - name: PII end-to-end tests, one file at a time
+        run: cargo test --test e2e_pii -- --ignored
+        env:
+          LAKESCAN_E2E_CONCURRENCY: "1"

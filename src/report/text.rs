@@ -309,19 +309,24 @@ fn write_table_heading<W: Write>(out: &mut W, table: &Table) -> Result<(), LakeS
     Ok(())
 }
 
-/// `"1 file"` or `"N files"`.
-fn files(n: u64) -> String {
+/// `"1 <one>"` or `"N <many>"`.
+pub(super) fn counted(n: u64, one: &str, many: &str) -> String {
     if n == 1 {
-        "1 file".to_owned()
+        format!("1 {one}")
     } else {
-        format!("{n} files")
+        format!("{n} {many}")
     }
+}
+
+/// `"1 file"` or `"N files"`.
+pub(super) fn files(n: u64) -> String {
+    counted(n, "file", "files")
 }
 
 /// An undocumented row's file counts, non-zero ones only: `"4 files
 /// confirmed"`, `"3 files confirmed, 1 likely"`, `"2 files likely, 1
 /// suppressed"`.
-fn undocumented_counts(entry: &InventoryEntry) -> String {
+pub(super) fn undocumented_counts(entry: &InventoryEntry) -> String {
     let parts: Vec<(u64, &str)> = [
         (entry.files_confirmed, "confirmed"),
         (entry.files_likely, "likely"),
@@ -381,15 +386,23 @@ fn write_pii_inventory<W: Write>(
     };
     wl!(out, "PII INVENTORY")?;
     let summary = inventory.summary();
+    let gaps = if summary.tables_not_fully_scanned > 0 {
+        format!(
+            " ({} documented)",
+            summary.tables_not_fully_scanned_documented
+        )
+    } else {
+        String::new()
+    };
     wl!(
         out,
-        "  {} tables with PII, {} PII columns: {} undocumented (action needed), {} documented. \
-         {} tables not fully scanned.",
-        summary.tables_with_pii,
-        summary.pii_columns,
+        "  {} with PII, {}: {} undocumented (action needed), {} documented. {} not fully \
+         scanned{gaps}.",
+        counted(summary.tables_with_pii, "table", "tables"),
+        counted(summary.pii_columns, "PII column", "PII columns"),
         summary.undocumented,
         summary.documented,
-        summary.tables_not_fully_scanned
+        counted(summary.tables_not_fully_scanned, "table", "tables"),
     )?;
     if inventory.tables().is_empty() {
         wl!(out, "  no Parquet files")?;
@@ -756,8 +769,8 @@ mod tests {
         assert_eq!(
             section,
             "PII INVENTORY\n\
-             \x20 1 tables with PII, 3 PII columns: 2 undocumented (action needed), 1 documented. \
-             2 tables not fully scanned.\n\
+             \x20 1 table with PII, 3 PII columns: 2 undocumented (action needed), 1 documented. \
+             2 tables not fully scanned (1 documented).\n\
              \x20 clean  files: 1 scanned, 0 not scanned\n\
              \x20   no PII found in 1 scanned file\n\
              \x20 dark  files: 0 scanned, 1 not scanned (unreadable=1 undocumented)\n\

@@ -23,12 +23,31 @@ fn object(key: &str, size: usize) -> ObjectMeta {
     }
 }
 
-/// Scans `body` stored as `key` with `whole_file_max`.
-async fn scan(key: &str, body: Vec<u8>, whole_file_max: u64) -> (FileScan, MemoryReader) {
+/// A budget account for one test file: room for any single file.
+fn budget() -> super::FileBudget {
+    super::MemoryBudget::single(super::file_need(super::MAX_WHOLE_FILE_MAX)).for_file()
+}
+
+/// Scans `body` stored as `key` with `whole_file_max` and `coalesce_gap`.
+async fn scan_with_gap(
+    key: &str,
+    body: Vec<u8>,
+    whole_file_max: u64,
+    coalesce_gap: u64,
+) -> (FileScan, MemoryReader) {
     let meta = object(key, body.len());
-    let mut reader = MemoryReader::default().with(key, body);
-    let scan = scan_file(&mut reader, &meta, whole_file_max).await;
+    let reader = MemoryReader::default().with(key, body);
+    let options = super::ScanOptions {
+        whole_file_max,
+        coalesce_gap,
+    };
+    let scan = scan_file(reader.clone(), &meta, options, budget()).await;
     (scan, reader)
+}
+
+/// Scans `body` stored as `key` with `whole_file_max` and the default gap.
+async fn scan(key: &str, body: Vec<u8>, whole_file_max: u64) -> (FileScan, MemoryReader) {
+    scan_with_gap(key, body, whole_file_max, super::DEFAULT_COALESCE_GAP).await
 }
 
 /// `(column, type, confidence)` for every finding, in column order.
@@ -106,7 +125,7 @@ async fn a_small_file_is_read_whole_in_one_request() -> TestResult {
     let (scan, reader) = scan("t.parquet", body, super::DEFAULT_WHOLE_FILE_MAX).await;
     assert_eq!(scan.outcome, FileOutcome::ScannedWhole);
     assert_eq!(verdicts(&scan), expected_customers());
-    assert_eq!(reader.reads.len(), 1);
+    assert_eq!(reader.requests(), 1);
     assert_eq!(scan.stats.get_requests, 1);
     assert_eq!(scan.stats.bytes_read, u64::try_from(size)?);
     // 6 candidate columns (dob is checked by name), repeated and double skipped.
@@ -131,6 +150,37 @@ async fn partial_reads_with_an_offset_index_agree_with_whole_reads() -> TestResu
         scan.stats.bytes_read < size,
         "{} of {size}",
         scan.stats.bytes_read
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn coalescing_a_wide_file_s_reads_cuts_requests_and_keeps_findings() -> TestResult {
+    // Twelve small columns with an offset index: their first pages sit
+    // close together in each row group.
+    let mut columns = customers(6000);
+    for i in 0..6 {
+        let name: &'static str = ["e1", "e2", "e3", "e4", "e5", "e6"]
+            .get(i)
+            .copied()
+            .unwrap_or("e");
+        columns.push((name, Values::Text(emails(6000))));
+    }
+    let layout = Layout {
+        row_group_rows: 2000,
+        page_bytes: 16 * 1024,
+        ..Layout::default()
+    };
+    let body = parquet_file(&columns, layout)?;
+    let (apart, _) = scan_with_gap("w.parquet", body.clone(), 0, 0).await;
+    let (merged, _) = scan_with_gap("w.parquet", body, 0, super::DEFAULT_COALESCE_GAP).await;
+    assert_eq!(verdicts(&apart), verdicts(&merged));
+    assert_ne!(verdicts(&merged).len(), 0);
+    assert!(
+        merged.stats.get_requests * 2 <= apart.stats.get_requests,
+        "{} coalesced requests vs {} apart",
+        merged.stats.get_requests,
+        apart.stats.get_requests
     );
     Ok(())
 }
@@ -300,12 +350,50 @@ async fn files_that_cannot_be_scanned_say_why() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_file_wider_than_the_column_cap_is_too_many_columns() -> TestResult {
+    let names: Vec<String> = (0..=super::MAX_COLUMNS).map(|i| format!("c{i}")).collect();
+    let wide: Vec<(&str, Values)> = names
+        .iter()
+        .map(|name| (name.as_str(), Values::Int64(vec![Some(1)])))
+        .collect();
+    let body = parquet_file(&wide, Layout::default())?;
+    let narrow: Vec<(&str, Values)> = names
+        .iter()
+        .take(super::MAX_COLUMNS)
+        .map(|name| (name.as_str(), Values::Int64(vec![Some(1)])))
+        .collect();
+    let at_cap = parquet_file(&narrow, Layout::default())?;
+    // Over the footer cap? Read partially if so: both paths agree.
+    for whole_file_max in [0, super::MAX_WHOLE_FILE_MAX] {
+        let (refused, _) = scan("wide.parquet", body.clone(), whole_file_max).await;
+        assert_eq!(
+            refused.outcome,
+            FileOutcome::NotScanned(NotScannedReason::TooManyColumns)
+        );
+        let (scanned, _) = scan("at_cap.parquet", at_cap.clone(), whole_file_max).await;
+        assert!(
+            matches!(
+                scanned.outcome,
+                FileOutcome::ScannedWhole | FileOutcome::ScannedPartially
+            ),
+            "{:?}",
+            scanned.outcome
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_refused_read_is_access_denied() -> TestResult {
     let body = parquet_file(&customers(50), Layout::default())?;
     let meta = object("t.parquet", body.len());
-    let mut reader = MemoryReader::default().with("t.parquet", body);
-    reader.denied.insert("t.parquet".to_owned());
-    let scan = scan_file(&mut reader, &meta, 0).await;
+    let reader = MemoryReader::default().with("t.parquet", body);
+    reader.deny("t.parquet");
+    let options = super::ScanOptions {
+        whole_file_max: 0,
+        coalesce_gap: 0,
+    };
+    let scan = scan_file(reader, &meta, options, budget()).await;
     assert_eq!(
         scan.outcome,
         FileOutcome::NotScanned(NotScannedReason::AccessDenied)
@@ -317,8 +405,12 @@ async fn a_refused_read_is_access_denied() -> TestResult {
 async fn an_object_shorter_than_listed_is_unreadable() -> TestResult {
     let body = parquet_file(&customers(50), Layout::default())?;
     let meta = object("t.parquet", body.len() + 10);
-    let mut reader = MemoryReader::default().with("t.parquet", body);
-    let scan = scan_file(&mut reader, &meta, super::DEFAULT_WHOLE_FILE_MAX).await;
+    let reader = MemoryReader::default().with("t.parquet", body);
+    let options = super::ScanOptions {
+        whole_file_max: super::DEFAULT_WHOLE_FILE_MAX,
+        coalesce_gap: 0,
+    };
+    let scan = scan_file(reader, &meta, options, budget()).await;
     assert_eq!(
         scan.outcome,
         FileOutcome::NotScanned(NotScannedReason::Unreadable)
@@ -381,16 +473,29 @@ async fn every_writer_fixture_is_classified_by_both_read_paths() -> TestResult {
         let body = fixture(&format!("{writer}/customers.parquet"))?;
         let size = u64::try_from(body.len())?;
         let (whole, _) = scan("c.parquet", body.clone(), super::DEFAULT_WHOLE_FILE_MAX).await;
-        let (partial, _) = scan("c.parquet", body, 0).await;
+        // Partial reads, coalesced (the default) and not: the same verdicts.
+        let (partial, _) = scan("c.parquet", body.clone(), 0).await;
+        let (apart, _) = scan_with_gap("c.parquet", body, 0, 0).await;
         assert_eq!(whole.outcome, FileOutcome::ScannedWhole, "{writer}");
         assert_eq!(partial.outcome, FileOutcome::ScannedPartially, "{writer}");
         assert_eq!(verdicts(&whole), expected, "{writer}, whole");
         assert_eq!(verdicts(&partial), expected, "{writer}, partial");
+        assert_eq!(verdicts(&apart), expected, "{writer}, partial, gap 0");
         assert_eq!(whole.stats.skipped_repeated, 1, "{writer}: tags");
+        // Uncoalesced, a partial read reads less than the file. Coalesced,
+        // on files this small (1-2 MB, gaps under 1 MiB), it may read
+        // nearly all of it, in fewer requests: the trade-off
+        // --coalesce-gap sets.
         assert!(
-            partial.stats.bytes_read < size,
+            apart.stats.bytes_read < size,
             "{writer}: partial read {} of {size}",
-            partial.stats.bytes_read
+            apart.stats.bytes_read
+        );
+        assert!(
+            partial.stats.get_requests <= apart.stats.get_requests,
+            "{writer}: {} coalesced requests, {} apart",
+            partial.stats.get_requests,
+            apart.stats.get_requests
         );
     }
     Ok(())
@@ -470,16 +575,16 @@ async fn a_page_declaring_a_huge_uncompressed_size_is_never_decoded() -> TestRes
         dictionary: false,
         ..Layout::default()
     };
-    let body = parquet_file(&[("email", Values::Text(emails(500)))], layout)?;
+    let body = parquet_file(&[("email_huge", Values::Text(emails(500)))], layout)?;
     let (offset, _, compressed) = first_page(&body)?;
     let header =
         super::header::tests::encode(super::header::DATA_PAGE, i32::MAX - 7, compressed, None);
     let crafted = patched(body, offset, &header);
     for whole_file_max in [0, super::DEFAULT_WHOLE_FILE_MAX] {
-        let before = super::read::fault::decodes();
+        let before = super::read::fault::decodes("email_huge");
         let (scan, _) = scan("crafted.parquet", crafted.clone(), whole_file_max).await;
         assert_eq!(
-            super::read::fault::decodes(),
+            super::read::fault::decodes("email_huge"),
             before,
             "a decode was attempted"
         );
@@ -496,7 +601,10 @@ async fn a_page_declaring_a_huge_uncompressed_size_is_never_decoded() -> TestRes
 
 #[tokio::test]
 async fn a_dictionary_declaring_billions_of_values_is_never_decoded() -> TestResult {
-    let body = parquet_file(&[("email", Values::Text(emails(500)))], Layout::default())?;
+    let body = parquet_file(
+        &[("email_dict", Values::Text(emails(500)))],
+        Layout::default(),
+    )?;
     let (offset, uncompressed, compressed) = first_page(&body)?;
     let header = super::header::tests::encode(
         super::header::DICTIONARY_PAGE,
@@ -506,10 +614,10 @@ async fn a_dictionary_declaring_billions_of_values_is_never_decoded() -> TestRes
     );
     let crafted = patched(body, offset, &header);
     for whole_file_max in [0, super::DEFAULT_WHOLE_FILE_MAX] {
-        let before = super::read::fault::decodes();
+        let before = super::read::fault::decodes("email_dict");
         let (scan, _) = scan("crafted.parquet", crafted.clone(), whole_file_max).await;
         assert_eq!(
-            super::read::fault::decodes(),
+            super::read::fault::decodes("email_dict"),
             before,
             "a decode was attempted"
         );
@@ -590,14 +698,18 @@ async fn a_compressed_page_whose_output_differs_from_its_declared_size_is_unread
             dictionary: false,
             ..Layout::default()
         };
-        let body = parquet_file(&[("email", Values::Text(emails(500)))], layout)?;
+        let body = parquet_file(&[("email_declared", Values::Text(emails(500)))], layout)?;
         for delta in [-1, 1] {
             let crafted = redeclared(body.clone(), delta)?;
             for whole_file_max in [0, super::DEFAULT_WHOLE_FILE_MAX] {
-                let before = super::read::fault::decodes();
+                let before = super::read::fault::decodes("email_declared");
                 let (scan, _) = scan("z.parquet", crafted.clone(), whole_file_max).await;
                 let case = format!("{compression:?} declared {delta:+}");
-                assert_eq!(super::read::fault::decodes(), before, "{case}");
+                assert_eq!(
+                    super::read::fault::decodes("email_declared"),
+                    before,
+                    "{case}"
+                );
                 assert_eq!(scan.stats.skipped_unreadable, 1, "{case}");
                 assert_eq!(
                     scan.outcome,
@@ -726,10 +838,13 @@ async fn snappy_zstd_and_lz4_pages_are_decoded() -> TestResult {
 
 #[tokio::test]
 async fn a_panic_inside_decoding_costs_one_file_not_the_scan() -> TestResult {
+    let mut columns = customers(100);
+    columns.push(("explodes", Values::Text(emails(100))));
+    let armed = parquet_file(&columns, Layout::default())?;
     let body = parquet_file(&customers(100), Layout::default())?;
-    super::read::fault::arm();
-    let (panicked, _) = scan("a.parquet", body.clone(), super::DEFAULT_WHOLE_FILE_MAX).await;
-    super::read::fault::disarm();
+    super::read::fault::arm("explodes");
+    let (panicked, _) = scan("a.parquet", armed, super::DEFAULT_WHOLE_FILE_MAX).await;
+    super::read::fault::disarm("explodes");
     assert_eq!(
         panicked.outcome,
         FileOutcome::NotScanned(NotScannedReason::Unreadable)

@@ -178,6 +178,9 @@ mod tests {
             // RIGHT-TO-LEFT OVERRIDE: a name cannot display as another.
             ("lake/\u{202e}lmth.exe", "lake/\\u{202e}lmth.exe"),
             ("\u{2066}iso\u{2069}", "\\u{2066}iso\\u{2069}"),
+            // A backslash doubles, so a literal \u{001b} stays distinct
+            // from an escaped ESC.
+            ("lake/\\u{001b}", "lake/\\\\u{001b}"),
             // Other scripts and emoji pass through.
             ("lake/ünï/📦", "lake/ünï/📦"),
         ] {

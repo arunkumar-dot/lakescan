@@ -19,25 +19,32 @@
 //! - `classify`: the confidence rules, at most one verdict per column.
 //!
 //! [`ObjectReader`] is the read seam: [`S3ObjectReader`] in production,
-//! in-memory readers in tests.
+//! [`SimStore`] (in memory, with a simulated latency model) in tests and
+//! the benchmark.
 //!
-//! **Memory budget.** One file at a time, and every buffer is dropped
-//! before the next file. The largest thing held is either the whole file
-//! (at most the whole-file maximum, 8 MiB by default and 64 MiB at most)
-//! or, for a partial read, the footer (at most [`FOOTER_CAP`], 16 MiB) and
-//! one column window (a dictionary page and a first data page, each at
-//! most [`PAGE_CAP`], 8 MiB): [`memory_bound`] is the larger of the two.
-//! On top of that: the 64 KiB tail read; page headers (at most 1 MiB
-//! each); one decompressed page, at most 8 MiB, because every header is
-//! checked against the page cap before `parquet` allocates for it (for
-//! GZIP and BROTLI, which `LakeScan` decompresses itself, the dictionary
-//! and data page are both held decompressed, at most 16 MiB, plus a
-//! Brotli window of at most 16 MiB); a dictionary's value slots, at most
-//! 1,048,576 of them (~32 MiB); and each
-//! column's sample, at most 3 row groups × 2,000 values × 257 bytes
-//! (~1.5 MB). None of it depends on what a file merely declares, and
-//! nothing here grows with the bucket.
+//! **Speed.** The driver scans up to `--concurrency` files at once; within
+//! a partially read file, each round's page reads are coalesced (see
+//! `read::coalesce`, `--coalesce-gap`) and up to four are in flight at
+//! once. Decoding runs on tokio's blocking pool, inside `catch_unwind`.
+//!
+//! **Memory budget.** Every fetch and decode holds permits from one
+//! [`MemoryBudget`] (`--memory-budget`) for the bytes it fetches or the
+//! sizes it declares, released when the buffers are dropped; see `budget`
+//! for how that stays deadlock-free. [`file_need`] is the most one file can
+//! hold under the caps: a whole read (the file, its metadata, one decode
+//! of two pages at [`PAGE_CAP`] plus a dictionary's slots, and one
+//! column's samples), or a partial one (metadata up to [`FOOTER_CAP`], plus
+//! the larger of opening and sampling: prefetched ranges, one decode, and
+//! a batch of columns' samples). 108,474,240 bytes (~103 MiB) at the default whole-file
+//! maximum. A budget below it is a usage error. Outside the budget, each
+//! in-flight file holds only its key, counts and findings (a few
+//! kilobytes) and up to 12,288 page locations (~0.8 MiB at most); its
+//! metadata and its per-column scan records (at most [`MAX_COLUMNS`]
+//! columns, or the file is `too-many-columns`) are under permits. None of
+//! it depends on what a
+//! file merely declares, and nothing here grows with the bucket.
 
+mod budget;
 mod classify;
 mod clean;
 mod detect;
@@ -45,9 +52,15 @@ mod fetch;
 mod header;
 mod names;
 mod read;
+mod sim;
 
+pub use budget::{BudgetTooSmall, FileBudget, MemoryBudget, Permit};
 pub use fetch::{FetchError, ObjectReader, S3ObjectReader};
-pub use read::{FOOTER_CAP, MAX_ROW_GROUPS, MAX_VALUES_PER_ROW_GROUP, PAGE_CAP, TAIL_BYTES};
+pub use read::{
+    COALESCE_MAX, DEFAULT_COALESCE_GAP, FOOTER_CAP, MAX_COLUMNS, MAX_ROW_GROUPS,
+    MAX_VALUES_PER_ROW_GROUP, PAGE_CAP, TAIL_BYTES, file_need,
+};
+pub use sim::{Latency, SimStore};
 
 use crate::model::{
     ColumnDetail, Detail, Finding, NotScannedReason, ObjectMeta, PiiType, RuleId, Severity,
@@ -60,17 +73,22 @@ pub const DEFAULT_WHOLE_FILE_MAX: u64 = 8 * 1024 * 1024;
 /// The largest `--pii-whole-file-max` accepted.
 pub const MAX_WHOLE_FILE_MAX: u64 = 64 * 1024 * 1024;
 
-/// The content stage's memory bound for a given whole-file maximum: the
-/// larger of the whole file, or the footer cap plus two page caps. See
-/// this module's doc for what comes on top.
-#[must_use]
-pub const fn memory_bound(whole_file_max: u64) -> u64 {
-    let partial = FOOTER_CAP + 2 * PAGE_CAP;
-    if whole_file_max > partial {
-        whole_file_max
-    } else {
-        partial
-    }
+/// The default `--memory-budget`: 256 MiB.
+pub const DEFAULT_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// The default `--concurrency`.
+pub const DEFAULT_CONCURRENCY: usize = 16;
+
+/// The largest `--concurrency` accepted.
+pub const MAX_CONCURRENCY: usize = 256;
+
+/// How one file is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanOptions {
+    /// Files at or below this size are read whole.
+    pub whole_file_max: u64,
+    /// Page reads this close together are read as one (0: never).
+    pub coalesce_gap: u64,
 }
 
 /// Whether `key` names a Parquet file: it ends in `.parquet` or `.parq`,
@@ -165,27 +183,33 @@ impl FileScan {
     }
 }
 
-/// Scans one eligible object through `reader`. Never fails: a file that
-/// cannot be read or parsed is a [`FileOutcome::NotScanned`].
+/// Scans one eligible object through `reader`, holding buffers only under
+/// permits from `budget`. Never fails: a file that cannot be read or
+/// parsed is a [`FileOutcome::NotScanned`].
 pub async fn scan_file<R: ObjectReader>(
-    reader: &mut R,
+    reader: R,
     object: &ObjectMeta,
-    whole_file_max: u64,
+    options: ScanOptions,
+    budget: FileBudget,
 ) -> FileScan {
-    let mut stats = FileStats::default();
-    let result = {
-        let mut session = read::session(reader, &object.key, object.size, &mut stats);
-        match session.open(whole_file_max).await {
-            Ok((metadata, opened)) => {
-                let whole = matches!(opened, read::Opened::Whole(_));
-                session
-                    .scan(&metadata, &opened)
-                    .await
-                    .map(|scanned| (whole, scanned))
-            }
-            Err(reason) => Err(reason),
+    let mut session = read::session(
+        reader,
+        &object.key,
+        object.size,
+        budget,
+        options.coalesce_gap,
+    );
+    let result = match session.open(options.whole_file_max).await {
+        Ok((metadata, _metadata_permit, opened)) => {
+            let whole = matches!(opened, read::Opened::Whole(_));
+            session
+                .scan(&metadata, &opened)
+                .await
+                .map(|scanned| (whole, scanned))
         }
+        Err(reason) => Err(reason),
     };
+    let stats = session.stats;
     match result {
         Ok((whole, scanned)) => FileScan {
             // Findings from column names alone (dates of birth) stand even
@@ -207,6 +231,10 @@ pub async fn scan_file<R: ObjectReader>(
         },
     }
 }
+
+/// Test-only decode fault injection (see `read::fault`).
+#[cfg(test)]
+pub(crate) use read::fault as read_fault;
 
 #[cfg(test)]
 pub(crate) mod testing;

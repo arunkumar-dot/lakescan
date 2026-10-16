@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LakeScan report: s3://example-bucket/logs/</title>
+<style>
+:root { color-scheme: light; --ink: #1f2328; --muted: #59636e; --line: #d1d9e0;
+  --bad: #b42318; --bad-bg: #fef3f2; --ok: #1a7f37; --ok-bg: #effaf3; --warn-bg: #fff8e5; }
+* { box-sizing: border-box; }
+body { margin: 0 auto; max-width: 72rem; padding: 1.5rem; color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+h1 { font-size: 1.6rem; margin: 0 0 .5rem; }
+h2 { font-size: 1.25rem; margin: 2rem 0 .75rem; border-bottom: 1px solid var(--line); padding-bottom: .25rem; }
+h3 { font-size: 1.05rem; margin: 1.5rem 0 .25rem; word-break: break-all; }
+dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: .15rem 1rem; margin: 0; }
+dl.meta dt { color: var(--muted); }
+dl.meta dd { margin: 0; word-break: break-all; }
+code, .key { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
+.banner { border-radius: .5rem; padding: .75rem 1rem; margin: 1.25rem 0; border: 1px solid; }
+.banner h2 { border: 0; margin: 0 0 .25rem; padding: 0; }
+.banner.action { background: var(--bad-bg); border-color: var(--bad); }
+.banner.ok { background: var(--ok-bg); border-color: var(--ok); }
+.banner ul { margin: .25rem 0 0; padding-left: 1.25rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .75rem; margin: 1rem 0; }
+.card { border: 1px solid var(--line); border-radius: .5rem; padding: .75rem 1rem; }
+.card .value { font-size: 1.6rem; font-weight: 600; display: block; }
+.card .label { color: var(--muted); }
+table { border-collapse: collapse; width: 100%; margin: .25rem 0 1rem; }
+th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; background: #f6f8fa; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td { word-break: break-word; }
+.badge { display: inline-block; border-radius: 1rem; padding: 0 .55rem; font-size: .8rem; font-weight: 600; border: 1px solid; }
+.badge.undocumented { color: var(--bad); background: var(--bad-bg); border-color: var(--bad); }
+.badge.documented { color: var(--ok); background: var(--ok-bg); border-color: var(--ok); }
+.note { color: var(--muted); }
+.unknown { background: var(--warn-bg); border-radius: .35rem; padding: .35rem .6rem; display: inline-block; }
+.filters { margin: .5rem 0 1rem; display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+.filters button { font: inherit; padding: .3rem .8rem; border: 1px solid var(--line); border-radius: .4rem; background: #fff; cursor: pointer; }
+.filters button[aria-pressed="true"] { background: var(--ink); color: #fff; border-color: var(--ink); }
+footer { margin-top: 2.5rem; padding-top: .75rem; border-top: 1px solid var(--line); color: var(--muted); }
+@media print {
+  .filters, #shown { display: none !important; }
+  tr[hidden] { display: table-row !important; }
+  body { max-width: none; padding: 0; }
+  .banner, .card { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+<header>
+<h1>LakeScan report</h1>
+<dl class="meta">
+<dt>Bucket</dt><dd class="key">example-bucket</dd>
+<dt>Prefix</dt><dd class="key">logs/</dd>
+<dt>LakeScan</dt><dd>lakescan 0.1.0</dd>
+<dt>Started</dt><dd class="timing">2023-11-14T22:13:20Z</dd>
+<dt>Elapsed</dt><dd class="timing">1.234s</dd>
+<dt>Exit code</dt><dd><strong>1 (FindingsExceedThreshold)</strong>: The scan completed, but an unsuppressed finding reached the failing threshold.</dd>
+</dl>
+</header>
+<main>
+<section class="banner action" role="alert">
+<h2>Action needed</h2>
+<ul>
+<li>2 PII columns are undocumented: document each with a suppression and its reason, or remove the data.</li>
+<li>Unsuppressed findings reached the failing threshold (worst severity: high; exit code 1).</li>
+</ul>
+</section>
+<section class="cards" aria-label="Headline">
+<div class="card"><span class="value">1</span><span class="label">table with PII</span></div>
+<div class="card"><span class="value">2 / 1</span><span class="label">PII columns undocumented / documented</span></div>
+<div class="card"><span class="value">75.0%</span><span class="label">coverage: 3 of 4 Parquet files scanned</span></div>
+<div class="card"><span class="value">1</span><span class="label">files not scanned: 0 undocumented, 1 documented</span></div>
+</section>
+<section id="inventory">
+<h2>PII inventory</h2>
+<p>1 table with PII, 3 PII columns: 2 undocumented (action needed), 1 documented. 1 table not fully scanned (1 documented).</p>
+<div class="filters" role="group" aria-label="Show PII columns" hidden>
+<button type="button" data-filter="all" aria-pressed="true">All</button>
+<button type="button" data-filter="undocumented" aria-pressed="false">Undocumented</button>
+<button type="button" data-filter="documented" aria-pressed="false">Documented</button>
+<span id="shown" aria-live="polite"></span>
+</div>
+<h3 class="key">(bucket root)</h3>
+<p class="note">1 file scanned, 0 not scanned</p>
+<p>No PII found in 1 scanned file.</p>
+<h3 class="key">warehouse/customers</h3>
+<p class="note">2 files scanned, 0 not scanned. Example: <span class="key">warehouse/customers/dt=2023-11-01/part-0.parquet</span></p>
+<table>
+<thead><tr><th scope="col">Column</th><th scope="col">Rule</th><th scope="col">Highest confidence</th><th scope="col">Evidence</th><th scope="col">Files</th><th scope="col">Status</th></tr></thead>
+<tbody>
+<tr data-status="undocumented"><td class="key">contact.phone</td><td><code>pii-phone</code></td><td>likely</td><td>values</td><td>1 file likely</td><td><span class="badge undocumented">Undocumented</span></td></tr>
+<tr data-status="undocumented"><td class="key">email</td><td><code>pii-email</code></td><td>confirmed</td><td>values</td><td>2 files confirmed</td><td><span class="badge undocumented">Undocumented</span></td></tr>
+<tr data-status="documented"><td class="key">full_name</td><td><code>pii-person-name</code></td><td>likely</td><td>column-name</td><td>2 files</td><td><span class="badge documented">Documented</span> Names are needed for invoicing (DPA section 4)</td></tr>
+</tbody>
+</table>
+<h3 class="key">warehouse/orders</h3>
+<p class="note">0 files scanned, 1 not scanned</p>
+<p><span class="unknown">Not scanned: PII unknown</span></p>
+</section>
+<section id="not-scanned">
+<h2>Files not scanned</h2>
+<table>
+<thead><tr><th scope="col">Table</th><th scope="col">Reason</th><th scope="col" class="num">Undocumented</th><th scope="col" class="num">Documented</th></tr></thead>
+<tbody>
+<tr><td class="key">warehouse/orders</td><td><code>unreadable</code></td><td class="num">0</td><td class="num">1</td></tr>
+</tbody>
+</table>
+</section>
+<section id="findings">
+<h2>Metadata findings</h2>
+<table>
+<thead><tr><th scope="col">Rule</th><th scope="col" class="num">critical</th><th scope="col" class="num">high</th><th scope="col" class="num">medium</th><th scope="col" class="num">low</th><th scope="col" class="num">info</th><th scope="col" class="num">Bytes</th><th scope="col" class="num">Suppressed</th></tr></thead>
+<tbody>
+<tr><td><code>sensitive-key</code><br><span class="note">Key looks like a credential or secret file</span></td><td class="num">0</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">512</td><td class="num">1</td></tr>
+<tr><td><code>reduced-redundancy</code><br><span class="note">Object uses the deprecated REDUCED_REDUNDANCY storage class</span></td><td class="num">0</td><td class="num">0</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">4096</td><td class="num">0</td></tr>
+<tr><td><code>stale-standard</code><br><span class="note">Large STANDARD object has gone unmodified for a long time</span></td><td class="num">0</td><td class="num">0</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">2147483648</td><td class="num">0</td></tr>
+<tr><td><code>small-object-cold-tier</code><br><span class="note">Small object sits in a cold storage tier that bills a size minimum</span></td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td><td class="num">0</td><td class="num">1000</td><td class="num">0</td></tr>
+<tr><td><code>zero-byte-object</code><br><span class="note">Zero-byte object that is not a folder marker</span></td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td><td class="num">0</td><td class="num">0</td></tr>
+<tr><td><code>unknown-storage-class</code><br><span class="note">Object reports a storage class this build of LakeScan does not recognize</span></td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td><td class="num">777</td><td class="num">0</td></tr>
+</tbody>
+</table>
+<details>
+<summary>Examples: <code>sensitive-key</code></summary>
+<ul>
+<li><span class="key">id_rsa</span> (high, 512 bytes)</li>
+</ul>
+</details>
+<details>
+<summary>Examples: <code>reduced-redundancy</code></summary>
+<ul>
+<li><span class="key">backups/archive.tar</span> (medium, 4096 bytes)</li>
+</ul>
+</details>
+<details>
+<summary>Examples: <code>stale-standard</code></summary>
+<ul>
+<li><span class="key">old/dataset.bin</span> (medium, 2147483648 bytes)</li>
+</ul>
+</details>
+<details>
+<summary>Examples: <code>small-object-cold-tier</code></summary>
+<ul>
+<li><span class="key">cold/thumbnail.jpg</span> (low, 1000 bytes)</li>
+</ul>
+</details>
+<details>
+<summary>Examples: <code>zero-byte-object</code></summary>
+<ul>
+<li><span class="key">placeholder/empty.txt</span> (info, 0 bytes)</li>
+</ul>
+</details>
+<details>
+<summary>Examples: <code>unknown-storage-class</code></summary>
+<ul>
+<li><span class="key">unknown/object.dat</span> (info, 777 bytes)</li>
+</ul>
+</details>
+</section>
+</main>
+<footer><p>No personal-data values appear in this report: only file keys, table and column names, counts, and the reasons you documented. It is a single file that loads nothing from the network.</p></footer>
+<script type="application/json" id="lakescan-data">{"rows":{"all":3,"documented":1,"undocumented":2},"target":"s3://example-bucket/logs/"}</script>
+<script>
+(function () {
+  var data = JSON.parse(document.getElementById('lakescan-data').textContent);
+  var filters = document.querySelector('.filters');
+  if (!filters) { return; }
+  var buttons = Array.prototype.slice.call(filters.querySelectorAll('button'));
+  var rows = Array.prototype.slice.call(document.querySelectorAll('tr[data-status]'));
+  var shown = document.getElementById('shown');
+  function apply(filter) {
+    var visible = 0;
+    rows.forEach(function (row) {
+      var hide = filter !== 'all' && row.getAttribute('data-status') !== filter;
+      row.hidden = hide;
+      if (!hide) { visible += 1; }
+    });
+    buttons.forEach(function (button) {
+      button.setAttribute('aria-pressed', String(button.getAttribute('data-filter') === filter));
+    });
+    shown.textContent = 'Showing ' + visible + ' of ' + rows.length + ' PII columns in ' + data.target;
+  }
+  buttons.forEach(function (button) {
+    var filter = button.getAttribute('data-filter');
+    button.textContent = button.textContent + ' (' + data.rows[filter] + ')';
+    button.addEventListener('click', function () { apply(filter); });
+  });
+  filters.hidden = false;
+  apply('all');
+})();
+</script>
+</body>
+</html>

@@ -7,15 +7,16 @@
 //! key *display* as a different one. [`write_escaped`] renders every
 //! [`char::is_control`] character and the bidi-override/isolate controls
 //! (`U+202A`–`U+202E`, `U+2066`–`U+2069`) as `\u{XXXX}` instead of passing
-//! them through, and leaves everything else — including other scripts and
-//! emoji — untouched. JSON output needs none of this: `serde_json` already
+//! them through, and a backslash as `\\`, so a key that literally contains
+//! `\u{001b}` cannot pass for an escaped ESC. Everything else — including
+//! other scripts and emoji — passes through untouched. JSON output needs none of this: `serde_json` already
 //! escapes control characters on its own.
 
 use std::io::{self, Write};
 
 /// `true` for exactly the characters [`write_escaped`] renders as
 /// `\u{XXXX}` instead of passing through.
-fn is_escaped(c: char) -> bool {
+pub(super) fn is_escaped(c: char) -> bool {
     c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
@@ -25,7 +26,9 @@ fn is_escaped(c: char) -> bool {
 /// rather than building an escaped copy of `s` first.
 pub(super) fn write_escaped<W: Write>(out: &mut W, s: &str) -> io::Result<()> {
     for c in s.chars() {
-        if is_escaped(c) {
+        if c == '\\' {
+            out.write_all(b"\\\\")?;
+        } else if is_escaped(c) {
             write!(out, "\\u{{{:04x}}}", u32::from(c))?;
         } else {
             write!(out, "{c}")?;
@@ -84,6 +87,16 @@ mod tests {
     fn bidi_isolate_is_escaped() -> Result<(), io::Error> {
         // U+2066 LEFT-TO-RIGHT ISOLATE.
         assert_eq!(escaped("\u{2066}")?, "\\u{2066}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_backslash_is_doubled_so_an_escape_cannot_be_forged() -> Result<(), io::Error> {
+        // A literal backslash-u sequence in a key, and a real ESC, render
+        // differently.
+        assert_eq!(escaped("a\\u{001b}b")?, "a\\\\u{001b}b");
+        assert_eq!(escaped("a\x1bb")?, "a\\u{001b}b");
+        assert_eq!(escaped("C:\\dir")?, "C:\\\\dir");
         Ok(())
     }
 

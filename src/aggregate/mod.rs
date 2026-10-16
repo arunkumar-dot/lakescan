@@ -14,12 +14,12 @@
 //! objects, which is exactly why its bound is explicit and checked.
 //!
 //! [`Aggregates::MAX_BYTES`] is a compile-time-checked sum of every summary's
-//! own `MAX_BYTES`: **17,541,072 bytes (~16.7 MiB)** as of M8, asserted
+//! own `MAX_BYTES`: **17,672,176 bytes (~16.9 MiB)** as of M10, asserted
 //! below to be no more than 18 MiB. Nearly all of it is the
-//! [`PiiInventory`] at its caps (17,268,800 bytes: 4,096 tables, 16,384
+//! [`PiiInventory`] at its caps (17,399,872 bytes: 4,096 tables, 16,384
 //! entries, with 1 KiB names and keys and 256-byte column paths);
 //! everything else (15 rules' samples, the fixed-size [`ContentSummary`],
-//! 16 KiB of `Hll` registers) is 272,272 bytes. The real total is far smaller than that ceiling
+//! 16 KiB of `Hll` registers) is 272,304 bytes. The real total is far smaller than that ceiling
 //! unless a lake really has thousands of tables. Every summary here is mergeable and
 //! order-independent: observing the same objects and findings in any order,
 //! or splitting them across any number of [`Aggregates`] and folding the
@@ -96,7 +96,7 @@ pub struct Aggregates {
 
 impl Aggregates {
     /// The combined worst-case size of every summary this struct holds:
-    /// the plain sum of each summary type's own `MAX_BYTES`. 17,541,072
+    /// the plain sum of each summary type's own `MAX_BYTES`. 17,672,176
     /// bytes as of this milestone (see this module's doc); checked below
     /// to be within the 18 MiB module budget.
     pub const MAX_BYTES: usize = Inventory::MAX_BYTES

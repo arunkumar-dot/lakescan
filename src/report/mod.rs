@@ -16,7 +16,9 @@
 //!   renders the whole-bucket picture — inventory, the findings matrix,
 //!   samples, histograms, the distinct-content estimate — as either
 //!   [`Format::Text`] or [`Format::Json`]. This is always a single,
-//!   complete snapshot, written once at the end of a scan.
+//!   complete snapshot, written once at the end of a scan. The same
+//!   snapshot is also rendered as CSV ([`write_inventory_csv`]) and as a
+//!   self-contained HTML report ([`write_html`]), on request.
 //! - An **optional per-finding stream**, from [`crate::rules::evaluate`]:
 //!   [`FindingsWriter`] renders one JSON Lines record per [`Finding`] *as it
 //!   arrives*, independent of the summary and independent of whether a
@@ -43,8 +45,10 @@
 //! `suppressed`, `suppressions`, and `distinct_content.duplicates_significant`
 //! fields (M6), `content`, a suppression entry's `column`, and a
 //! sample's `column`, `confidence`, `evidence`, `matched`, `sampled` and
-//! `reason` (M7), and `coverage` and `pii_inventory` with its `summary`
-//! and per-table `status` (M8) were added under
+//! `reason` (M7), `coverage` and `pii_inventory` with its `summary` and
+//! per-table `status` (M8), and the `fetch-failed` reason and
+//! `summary.tables_not_fully_scanned_documented` (M9), and the
+//! `too-many-columns` reason (M10) were added under
 //! this policy, so the version is still 1. M8 also made a PII rule's
 //! `bytes` and `suppressed.bytes` always 0: they double-counted files
 //! (once per column), and a consumer summing them was already wrong.
@@ -99,13 +103,16 @@
 //!     "scanned_whole": integer,    // read in one GetObject
 //!     "scanned_partially": integer,// footer + sampled pages
 //!     "not_scanned": {             // one key per NotScannedReason::code(),
-//!       "not-parquet": integer,    // always all six, zero when none
+//!       "not-parquet": integer,    // always all eight, zero when none
 //!       "unreadable": integer,
 //!       "access-denied": integer,
 //!       "encrypted": integer,
 //!       "footer-too-large": integer,
-//!       "no-column-examined": integer // Parquet, but every column whose
+//!       "no-column-examined": integer, // Parquet, but every column whose
 //!                                  // values could be read was skipped
+//!       "fetch-failed": integer,   // a GetObject still failed after the
+//!                                  // SDK's retries (M9)
+//!       "too-many-columns": integer // over 16,384 leaf columns (M10)
 //!     },
 //!     "columns_examined": integer, // candidate columns sampled and classified
 //!     "columns_skipped": {
@@ -135,7 +142,9 @@
 //!       "pii_columns": integer,    // (table, column, rule) locations
 //!       "undocumented": integer,   // of those: the action items
 //!       "documented": integer,
-//!       "tables_not_fully_scanned": integer // with any file not scanned
+//!       "tables_not_fully_scanned": integer, // with any file not scanned
+//!       "tables_not_fully_scanned_documented": integer // of those, every
+//!                                  // unscanned file documented
 //!     },
 //!     "tables": [                  // sorted by table; a table is
 //!       {                          // aggregate::table_of(key): the key's
@@ -250,6 +259,7 @@ mod escape;
 mod findings;
 #[cfg(test)]
 mod fixture;
+mod html;
 mod human_size;
 mod json;
 mod rfc3339;
@@ -263,7 +273,7 @@ pub use findings::FindingsWriter;
 use sink::Sink;
 
 use crate::aggregate::{Aggregates, Status};
-use crate::error::LakeScanError;
+use crate::error::{ExitCode, LakeScanError};
 use crate::suppress::Outcome;
 
 /// This build's name and version, for the report's `tool` section —
@@ -345,6 +355,25 @@ pub fn write_inventory_csv<W: Write>(
 ) -> Result<(), LakeScanError> {
     let mut sink = Sink::new(out);
     csv::write(&mut sink, &info.suppressions, aggregates)?;
+    sink.flush().map_err(LakeScanError::Report)
+}
+
+/// Writes the HTML report (`--html`) for a run ending with `code`; see the
+/// `html` submodule for its guarantees (self-contained, offline, every
+/// bucket-derived string escaped). Behind the same 64 KB buffer as
+/// [`write_summary`], with the same broken-pipe rule.
+///
+/// # Errors
+/// Returns [`LakeScanError::Report`] for any write or flush error other
+/// than a broken pipe.
+pub fn write_html<W: Write>(
+    out: W,
+    info: &ScanInfo,
+    aggregates: &Aggregates,
+    code: ExitCode,
+) -> Result<(), LakeScanError> {
+    let mut sink = Sink::new(out);
+    html::write(&mut sink, info, aggregates, code)?;
     sink.flush().map_err(LakeScanError::Report)
 }
 

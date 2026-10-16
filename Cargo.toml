@@ -9,7 +9,10 @@ license = "FSL-1.1-ALv2"
 # Dependencies are only added or upgraded to releases at least 14 days old.
 [dependencies]
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# sync (the memory budget's semaphore) and time (the simulated store's
+# latency) were already enabled through the AWS SDK; declared so the code
+# that uses them doesn't depend on that.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 serde = { version = "1", features = ["derive"] }

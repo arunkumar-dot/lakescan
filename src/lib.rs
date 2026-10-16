@@ -31,11 +31,12 @@
 //!                      v (--pii only)         |         | optional, streamed    | summaries
 //!               +-------------+ Finding       |         | as JSON Lines         |
 //!               |   content   | --------------+         v                       v
-//!               | <= 64 MiB   | + column detail  +-------------------------------------+
-//!               +-------------+                  |                report               |
-//!               one file at a time, read with    |                 1 MB                |
-//!               ranged GetObject, freed before   +-------------------------------------+
-//!               the next file                    64 KB buffered streaming writer
+//!               | --memory-   | + column detail  +-------------------------------------+
+//!               | budget      |                  |                report               |
+//!               +-------------+                  |                 1 MB                |
+//!               --concurrency files at once,     +-------------------------------------+
+//!               ranged GetObject, coalesced;     64 KB buffered streaming writer
+//!               results applied in listing order
 //!                                                                 |
 //!                                                                 v
 //!                                                          stdout / file
@@ -46,16 +47,22 @@
 //! to 1 KiB each is held twice at once, once as the raw response body and
 //! once as parsed `ObjectMeta` entries.
 //!
-//! The content stage's bound is the larger of the whole-file maximum
-//! (`--pii-whole-file-max`, 8 MiB by default, 64 MiB at most) or the
-//! footer cap plus two page caps (16 + 2 × 8 = 32 MiB): see
-//! [`content::memory_bound`]. A file is either read whole, or its footer
-//! and one column's dictionary and first data page are held at a time. On
-//! top come a 64 KiB tail read, one decompressed page (at most 8 MiB, checked
-//! from its header before anything is allocated), a dictionary's value
-//! slots (at most 1,048,576, ~32 MiB), and a column's sample of at most
-//! 6,000 values of at most 257 bytes. It depends on those caps,
-//! never on the bucket, and every buffer is freed before the next file.
+//! The content stage's bound is `--memory-budget` (256 MiB by default) plus
+//! a small fixed overhead per in-flight file. Up to `--concurrency` files
+//! (16 by default) are scanned at once, and every fetched buffer, every
+//! decode (its pages' declared sizes and a dictionary's slots, checked from
+//! the headers before anything is allocated), the parsed footer, and every
+//! column's sample are held under permits from one byte-counting semaphore
+//! of that size; see `content::MemoryBudget`. One file never needs more
+//! than [`content::file_need`] (~103 MiB at the default
+//! `--pii-whole-file-max`, ~132 MiB at 64 MiB), and a smaller budget is a
+//! usage error. The overhead outside the budget, per in-flight file: its
+//! key, counts and findings (a few KiB), up to 12,288 first-page locations
+//! (~0.8 MiB); the per-column scan records (a file has at most 16,384
+//! leaf columns) are counted against the budget. Plus, in the driver's
+//! ordered window, at most `--concurrency` + 1,024 listed objects (~1 KiB
+//! each) waiting their turn. With the defaults: 256 MiB + 16 × ~1 MiB +
+//! ~1 MiB. It depends on those settings and caps, never on the bucket.
 //!
 //! The suppress stage's bound comes from the config caps, not from the
 //! bucket: it holds the `--config` entries and an index over them, sized

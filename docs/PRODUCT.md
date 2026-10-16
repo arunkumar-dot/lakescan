@@ -30,8 +30,8 @@ Round 2 (messy synthetic data; pyarrow, Polars, DuckDB, Spark): passed both pre-
 ## Open questions
 - Real-world placeholders, and junk that clusters (a bad batch, a backfill of nulls) instead of spreading evenly. Round 2's cleaning list matched the generator's own.
 - Free text: a better trigger than average value length (hashes and UUIDs qualified), and precision against email-like tokens in real prose.
-- Scan speed on real S3, where request count and latency matter more than bytes, especially for lakes of many small files.
+- Scan speed on real S3: M9 measured a simulated latency model only; real-S3 numbers, and parallel listing for very large buckets, are open.
 - Validation on real data, which only early users can provide.
 
 ## Status
-M0-M8: metadata pipeline, structured-PII scanning of Parquet (opt-in with --pii, GZIP and Brotli included), and a per-table PII inventory with fail-closed coverage. Next: parallel scanning with request coalescing (M9), then release builds (M10).
+M0-M10: metadata pipeline, structured-PII scanning of Parquet (opt-in with --pii, GZIP and Brotli included), a per-table PII inventory with fail-closed coverage, concurrent, memory-budgeted, coalesced content scanning (measured on a simulated S3 latency model), and a self-contained HTML report (M10). Next: release builds (M11).

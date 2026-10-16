@@ -40,6 +40,7 @@
 //! again in the middle row group, then the last: never more than
 //! [`MAX_ROW_GROUPS`] per column.
 
+use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
@@ -51,7 +52,9 @@ use parquet::column::page::{Page, PageMetadata, PageReader};
 use parquet::column::reader::{ColumnReader, get_column_reader};
 use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::errors::Result as ParquetResult;
-use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::metadata::{
+    ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+};
 use parquet::file::page_index::index_reader::decode_offset_index;
 use parquet::file::page_index::offset_index::PageLocation;
 use parquet::file::properties::ReaderProperties;
@@ -59,6 +62,7 @@ use parquet::file::reader::ChunkReader;
 use parquet::file::serialized_reader::SerializedPageReader;
 use parquet::schema::types::{ColumnDescPtr, ColumnDescriptor};
 
+use super::budget::{FileBudget, Permit};
 use super::classify::{Evidence, Kind, classify};
 use super::clean::{clean, drop_dominant};
 use super::fetch::{FetchError, ObjectReader};
@@ -92,40 +96,118 @@ const WINDOW_LIMIT: u64 = 2 * (PAGE_CAP + MAX_HEADER);
 const MAX_DICTIONARY_VALUES: u64 = 1024 * 1024;
 /// The largest offset index read for one column chunk.
 const OFFSET_INDEX_CAP: u64 = 1024 * 1024;
+/// The largest read covering every sampled offset index at once; above
+/// it, pages are found by reading headers instead.
+const INDEX_REGION_CAP: u64 = 8 * 1024 * 1024;
+/// The most first-page locations kept per file (3 row groups × 4,096
+/// columns, ~0.8 MiB); columns past it are found by reading headers.
+const MAX_LOCATIONS: usize = 3 * 4096;
+/// The most leaf columns a file may have; a wider one is
+/// `too-many-columns`.
+pub const MAX_COLUMNS: usize = 16_384;
+/// The bytes one column's scan record takes, counted against the budget
+/// for every leaf column (see [`Candidate`]).
+const CANDIDATE_BYTES: u64 = size_of::<Candidate>() as u64;
 /// Values read from a page per call.
 const BATCH: usize = 1024;
+/// The largest read that coalescing builds from several requests.
+pub const COALESCE_MAX: u64 = 8 * 1024 * 1024;
+/// The default `--coalesce-gap`: requests this close are read together.
+pub const DEFAULT_COALESCE_GAP: u64 = 1024 * 1024;
+/// Ranges of one file fetched at once.
+const RANGE_CONCURRENCY: usize = 4;
+/// The most bytes one file has in flight between fetches (a single range
+/// may be as large as [`WINDOW_LIMIT`], which this equals).
+const PREFETCH_CAP: u64 = WINDOW_LIMIT;
+/// Columns of a partially read file sampled together: their samples are
+/// held until the batch is classified.
+const COLUMN_BATCH: usize = 8;
+/// The most bytes one dictionary slot takes in `parquet`.
+const DICTIONARY_SLOT_BYTES: u64 = 32;
+/// The most a decode can allocate under the caps: two pages at the page
+/// cap and a dictionary's slots.
+const DECODE_MAX: u64 = 2 * PAGE_CAP + MAX_DICTIONARY_VALUES * DICTIONARY_SLOT_BYTES;
+/// The most one column's sample from one row group takes: up to
+/// `MAX_VALUES_PER_ROW_GROUP + BATCH` (3,024) values before the cut, each
+/// at most `clean::MAX_VALUE_BYTES` (257) plus a `String` (24 bytes).
+const SAMPLE_BYTES: u64 = 3024 * 281;
+
+/// The most bytes one file's scan can hold at once under the caps, for a
+/// whole-file maximum of `whole_file_max` (see `budget`): the larger of a
+/// whole read (the file, its metadata, one decode, one column's samples)
+/// and a partial one (the metadata, plus the larger of opening, with the
+/// tail, footer and offset-index reads, and sampling, with the prefetched
+/// ranges, one decode and a column batch's samples), plus a scan record
+/// for each of up to [`MAX_COLUMNS`] columns.
+#[must_use]
+pub const fn file_need(whole_file_max: u64) -> u64 {
+    let rows = MAX_ROW_GROUPS as u64;
+    let metadata = if whole_file_max < FOOTER_CAP {
+        whole_file_max
+    } else {
+        FOOTER_CAP
+    };
+    let whole = whole_file_max + metadata + DECODE_MAX + rows * SAMPLE_BYTES;
+    let open = TAIL_BYTES + FOOTER_CAP + INDEX_REGION_CAP;
+    let sampling = PREFETCH_CAP + DECODE_MAX + COLUMN_BATCH as u64 * rows * SAMPLE_BYTES;
+    let partial = FOOTER_CAP + if open > sampling { open } else { sampling };
+    let records = MAX_COLUMNS as u64 * CANDIDATE_BYTES;
+    records + if whole > partial { whole } else { partial }
+}
 
 const MAGIC: &[u8] = b"PAR1";
 const ENCRYPTED_MAGIC: &[u8] = b"PARE";
 
 /// What a fetched byte range must offer: `parquet`'s in-memory
-/// [`ChunkReader`], plus slicing and building from a `Vec`. The one
-/// implementation is the buffer type `AggregatedBytes::into_bytes` returns;
-/// it is never named here, only inferred (see [`session`]).
+/// [`ChunkReader`], plus slicing, building from a `Vec`, and crossing
+/// threads (fetches and decodes run as tasks). The one implementation is
+/// the buffer type `AggregatedBytes::into_bytes` returns; it is never named
+/// here, only inferred (see [`session`]).
 pub(super) trait Window:
-    ChunkReader + Deref<Target = [u8]> + Clone + From<Vec<u8>> + 'static
+    ChunkReader + Deref<Target = [u8]> + Clone + From<Vec<u8>> + Send + Sync + 'static
 {
 }
 
-impl<T> Window for T where T: ChunkReader + Deref<Target = [u8]> + Clone + From<Vec<u8>> + 'static {}
+impl<T> Window for T where
+    T: ChunkReader + Deref<Target = [u8]> + Clone + From<Vec<u8>> + Send + Sync + 'static
+{
+}
+
+/// Bytes in memory, with the permits that cover them.
+pub(super) struct Held<B> {
+    data: B,
+    _permit: Permit,
+}
 
 /// How a file was opened.
 pub(super) enum Opened<B> {
     /// Read whole; every column chunk is in memory.
-    Whole(B),
-    /// Only the tail is in memory, starting at byte `start`.
-    Partial { tail: B, start: u64 },
+    Whole(Held<B>),
+    /// Read partially: the first data page an offset index located, per
+    /// `(row group, column)`.
+    Partial {
+        first_pages: HashMap<(usize, usize), PageLocation>,
+    },
 }
 
 /// What sampling one column in one row group produced.
 enum ColumnRead {
-    /// Cleaned values, at most [`MAX_VALUES_PER_ROW_GROUP`].
-    Values(Vec<String>),
+    /// Cleaned values, at most [`MAX_VALUES_PER_ROW_GROUP`], and the
+    /// permits that cover them.
+    Values(Vec<String>, Permit),
     /// The dictionary or first data page is over [`PAGE_CAP`].
     PageTooLarge,
     /// The pages could not be decoded.
     Unreadable,
     /// The chunk's codec cannot be decoded safely.
+    UnsupportedCodec,
+}
+
+/// Why a column was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skip {
+    PageTooLarge,
+    Unreadable,
     UnsupportedCodec,
 }
 
@@ -165,58 +247,225 @@ pub(super) struct Scanned {
     pub(super) nothing_examined: bool,
 }
 
-/// One file's reads: the reader, the object, and the running counts.
-pub(super) struct Session<'a, R, B> {
-    reader: &'a mut R,
-    key: &'a str,
-    size: u64,
-    stats: &'a mut FileStats,
-    convert: fn(AggregatedBytes) -> B,
+/// One candidate column, sampled row group by row group.
+struct Candidate {
+    index: usize,
+    descr: ColumnDescPtr,
+    kind: Kind,
+    values: Vec<String>,
+    permits: Vec<Permit>,
+    evidence: Evidence,
+    skipped: Option<Skip>,
+    done: bool,
 }
 
-/// A session reading `key` (`size` bytes) through `reader`, counting into
-/// `stats`. The buffer type is whatever `AggregatedBytes::into_bytes`
-/// returns, inferred rather than named.
-pub(super) fn session<'a, R: ObjectReader>(
-    reader: &'a mut R,
-    key: &'a str,
-    size: u64,
-    stats: &'a mut FileStats,
-) -> Session<'a, R, impl Window> {
-    Session {
-        reader,
-        key,
-        size,
-        stats,
-        convert: AggregatedBytes::into_bytes,
-    }
-}
-
-impl<R: ObjectReader, B: Window> Session<'_, R, B> {
-    /// Reads `start..end`, counting the request and the bytes returned. A
-    /// short read (the object changed since it was listed) is unreadable.
-    async fn get(&mut self, start: u64, end: u64) -> Result<B, NotScannedReason> {
-        self.stats.get_requests = self.stats.get_requests.saturating_add(1);
-        let data = match self.reader.read_range(self.key, start, end).await {
-            Ok(data) => (self.convert)(data),
-            Err(FetchError::AccessDenied) => return Err(NotScannedReason::AccessDenied),
-            Err(FetchError::Failed) => return Err(NotScannedReason::Unreadable),
-        };
-        let len = u64::try_from(as_slice(&data).len()).unwrap_or(u64::MAX);
-        self.stats.bytes_read = self.stats.bytes_read.saturating_add(len);
-        if Some(len) == end.checked_sub(start) {
-            Ok(data)
-        } else {
-            Err(NotScannedReason::Unreadable)
+impl Candidate {
+    fn new(index: usize, descr: ColumnDescPtr, kind: Kind) -> Self {
+        Self {
+            index,
+            descr,
+            kind,
+            values: Vec::new(),
+            permits: Vec::new(),
+            evidence: Evidence::default(),
+            skipped: None,
+            done: false,
         }
     }
 
+    /// Takes one row group's read. Done once a skip happens or the sample
+    /// no longer needs more (see `classify::Evidence::needs_more`).
+    fn apply(&mut self, read: ColumnRead) {
+        let skip = match read {
+            ColumnRead::Values(sample, permit) => {
+                self.values.extend(sample);
+                self.permits.push(permit);
+                let mut cleaned = self.values.clone();
+                drop_dominant(&mut cleaned);
+                self.evidence = Evidence::of(&cleaned);
+                self.done = !self.evidence.needs_more();
+                return;
+            }
+            ColumnRead::PageTooLarge => Skip::PageTooLarge,
+            ColumnRead::Unreadable => Skip::Unreadable,
+            ColumnRead::UnsupportedCodec => Skip::UnsupportedCodec,
+        };
+        self.skipped = Some(skip);
+        self.done = true;
+    }
+}
+
+/// One planned read of a column chunk's first pages in one row group: its
+/// first `end - start` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Request {
+    /// The column's position among the round's columns.
+    pub(super) slot: usize,
+    /// The chunk's first byte (a file offset) and full length.
+    pub(super) start: u64,
+    pub(super) chunk_len: u64,
+    /// Where this read ends.
+    pub(super) end: u64,
+}
+
+/// Requests coalesced into one read of `start..end`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Merged {
+    pub(super) start: u64,
+    pub(super) end: u64,
+    pub(super) members: Vec<Request>,
+}
+
+/// Sorts `requests` and merges neighbours whose gap is at most `gap`, as
+/// long as a merged read stays within [`COALESCE_MAX`]. A `gap` of 0
+/// merges nothing; a single request over the cap is read alone.
+pub(super) fn coalesce(mut requests: Vec<Request>, gap: u64) -> Vec<Merged> {
+    requests.sort_by_key(|request| (request.start, request.end, request.slot));
+    let mut out: Vec<Merged> = Vec::new();
+    for request in requests {
+        if let Some(last) = out.last_mut() {
+            let end = last.end.max(request.end);
+            if gap > 0
+                && request.start <= last.end.saturating_add(gap)
+                && end - last.start <= COALESCE_MAX
+            {
+                last.end = end;
+                last.members.push(request);
+                continue;
+            }
+        }
+        out.push(Merged {
+            start: request.start,
+            end: request.end,
+            members: vec![request],
+        });
+    }
+    out
+}
+
+/// One row group being sampled: its metadata, row count and columns.
+struct Round<'a> {
+    group: &'a RowGroupMetaData,
+    rows: usize,
+    columns: &'a [(usize, ColumnDescPtr)],
+}
+
+/// What processing one request gave: a column's read, or a longer request
+/// for the next phase.
+enum Step {
+    Done(ColumnRead),
+    More(Request),
+}
+
+/// A spawned task, aborted if dropped before it finishes, so a failed file
+/// leaves nothing running (and no permits held) behind it.
+struct Task<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Task<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One ranged read, as a task runs it: the bytes returned, and the buffer.
+/// A short read (the object changed since it was listed) is unreadable; a
+/// read that failed after the SDK's retries is `fetch-failed`.
+async fn fetch_range<R: ObjectReader, B: Window>(
+    reader: R,
+    key: Arc<str>,
+    start: u64,
+    end: u64,
+    convert: fn(AggregatedBytes) -> B,
+) -> (u64, Result<B, NotScannedReason>) {
+    match reader.read_range(&key, start, end).await {
+        Ok(data) => {
+            let data = convert(data);
+            let len = u64::try_from(as_slice(&data).len()).unwrap_or(u64::MAX);
+            if Some(len) == end.checked_sub(start) {
+                (len, Ok(data))
+            } else {
+                (len, Err(NotScannedReason::Unreadable))
+            }
+        }
+        Err(FetchError::AccessDenied) => (0, Err(NotScannedReason::AccessDenied)),
+        Err(FetchError::Failed) => (0, Err(NotScannedReason::FetchFailed)),
+    }
+}
+
+/// One file's reads: the reader, the object, its budget account, and the
+/// running counts.
+pub(super) struct Session<R, B> {
+    reader: R,
+    key: Arc<str>,
+    size: u64,
+    pub(super) stats: FileStats,
+    convert: fn(AggregatedBytes) -> B,
+    budget: FileBudget,
+    coalesce_gap: u64,
+}
+
+/// A session reading `key` (`size` bytes) through `reader`, holding
+/// buffers only under permits from `budget`. The buffer type is whatever
+/// `AggregatedBytes::into_bytes` returns, inferred rather than named.
+pub(super) fn session<R: ObjectReader>(
+    reader: R,
+    key: &str,
+    size: u64,
+    budget: FileBudget,
+    coalesce_gap: u64,
+) -> Session<R, impl Window> {
+    Session {
+        reader,
+        key: Arc::from(key),
+        size,
+        stats: FileStats::default(),
+        convert: AggregatedBytes::into_bytes,
+        budget,
+        coalesce_gap,
+    }
+}
+
+impl<R: ObjectReader, B: Window> Session<R, B> {
+    fn count(&mut self, returned: u64) {
+        self.stats.get_requests = self.stats.get_requests.saturating_add(1);
+        self.stats.bytes_read = self.stats.bytes_read.saturating_add(returned);
+    }
+
+    /// Permits for `bytes`. Refused only past the largest single-file
+    /// need, which the caps rule out: the file is then unreadable.
+    async fn permit(&mut self, bytes: u64) -> Result<Permit, NotScannedReason> {
+        self.budget
+            .acquire(bytes)
+            .await
+            .ok_or(NotScannedReason::Unreadable)
+    }
+
+    /// Reads `start..end` under permits for its length, counting the
+    /// request and the bytes returned.
+    async fn get(&mut self, start: u64, end: u64) -> Result<Held<B>, NotScannedReason> {
+        let permit = self.permit(end.saturating_sub(start)).await?;
+        let (returned, data) = fetch_range(
+            self.reader.clone(),
+            Arc::clone(&self.key),
+            start,
+            end,
+            self.convert,
+        )
+        .await;
+        self.count(returned);
+        Ok(Held {
+            data: data?,
+            _permit: permit,
+        })
+    }
+
     /// Opens the file: reads it whole or reads its tail, checks the magic,
-    /// and decodes the footer.
+    /// and decodes the footer (on the blocking pool). Returns the metadata
+    /// with the permits that cover it, held for the file's lifetime.
     pub(super) async fn open(
         &mut self,
         whole_file_max: u64,
-    ) -> Result<(ParquetMetaData, Opened<B>), NotScannedReason> {
+    ) -> Result<(ParquetMetaData, Permit, Opened<B>), NotScannedReason> {
         if self.size == 0 {
             return Err(NotScannedReason::NotParquet);
         }
@@ -227,7 +476,7 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
             self.size.saturating_sub(TAIL_BYTES)
         };
         let buffer = self.get(start, self.size).await?;
-        let bytes = as_slice(&buffer);
+        let bytes = as_slice(&buffer.data);
 
         let tail_magic = bytes.len().checked_sub(4).and_then(|at| bytes.get(at..));
         if tail_magic == Some(ENCRYPTED_MAGIC) {
@@ -237,7 +486,8 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
             let head = if start == 0 {
                 bytes.get(..4).map(<[u8]>::to_vec)
             } else {
-                Some(self.get(0, 4).await?.to_vec())
+                let head = self.get(0, 4).await?;
+                Some(as_slice(&head.data).to_vec())
             };
             return Err(match head.as_deref() {
                 Some(MAGIC) => NotScannedReason::Unreadable,
@@ -261,33 +511,112 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
             .filter(|&at| at >= 4)
             .ok_or(NotScannedReason::Unreadable)?;
 
-        let decode = |bytes: Option<&[u8]>| {
-            let bytes = bytes.ok_or(NotScannedReason::Unreadable)?;
-            contain(|| ParquetMetaDataReader::decode_metadata(bytes).ok())?
-                .ok_or(NotScannedReason::Unreadable)
-        };
+        // The parsed metadata is about as large as the footer it came from.
+        let mut metadata_permit = self.permit(footer_len).await?;
         let metadata = if footer_start >= start {
             let from = usize::try_from(footer_start - start).ok();
-            decode(from.and_then(|from| bytes.get(from..bytes.len().saturating_sub(8))))?
+            let to = bytes.len().saturating_sub(8);
+            let from = from.ok_or(NotScannedReason::Unreadable)?;
+            decode_metadata(buffer.data.clone(), from, to).await?
         } else {
             let footer = self.get(footer_start, self.size - 8).await?;
-            decode(Some(&footer))?
+            let len = as_slice(&footer.data).len();
+            decode_metadata(footer.data.clone(), 0, len).await?
         };
+        // Wider files are refused before anything is built per column; the
+        // records for the rest are counted against the budget, held with
+        // the metadata.
+        let columns = metadata.file_metadata().schema_descr().num_columns();
+        if columns > MAX_COLUMNS {
+            return Err(NotScannedReason::TooManyColumns);
+        }
+        let records = u64::try_from(columns).unwrap_or(u64::MAX) * CANDIDATE_BYTES;
+        let records = self.permit(records).await?;
+        metadata_permit = metadata_permit.join(records);
 
         let opened = if whole {
             Opened::Whole(buffer)
         } else {
-            Opened::Partial {
-                tail: buffer,
-                start,
-            }
+            let first_pages = self.locate_first_pages(&metadata, &buffer, start).await?;
+            Opened::Partial { first_pages }
         };
-        Ok((metadata, opened))
+        Ok((metadata, metadata_permit, opened))
+    }
+
+    /// Where the first data page of each sampled `(row group, column)`
+    /// ends, from the offset indexes. Writers put those together near the
+    /// footer: if they are in the tail read, they cost nothing more; else
+    /// one read covers them all (if within [`INDEX_REGION_CAP`]), never one
+    /// per column. Without them, pages are found by reading headers.
+    async fn locate_first_pages(
+        &mut self,
+        metadata: &ParquetMetaData,
+        tail: &Held<B>,
+        tail_start: u64,
+    ) -> Result<HashMap<(usize, usize), PageLocation>, NotScannedReason> {
+        let mut wanted = Vec::new();
+        for row_group in row_group_order(metadata.num_row_groups()) {
+            let Some(group) = metadata.row_groups().get(row_group) else {
+                continue;
+            };
+            for (column, chunk) in group.columns().iter().enumerate() {
+                let offset = chunk
+                    .offset_index_offset()
+                    .and_then(|o| u64::try_from(o).ok());
+                let length = chunk
+                    .offset_index_length()
+                    .and_then(|l| u64::try_from(l).ok());
+                if let (Some(offset), Some(length)) = (offset, length)
+                    && wanted.len() < MAX_LOCATIONS
+                    && length > 0
+                    && length <= OFFSET_INDEX_CAP
+                    && offset
+                        .checked_add(length)
+                        .is_some_and(|end| end <= self.size)
+                {
+                    wanted.push(((row_group, column), offset, offset + length));
+                }
+            }
+        }
+        let Some(region_start) = wanted.iter().map(|&(_, start, _)| start).min() else {
+            return Ok(HashMap::new());
+        };
+        let region_end = wanted
+            .iter()
+            .map(|&(_, _, end)| end)
+            .max()
+            .unwrap_or(region_start);
+        let fetched;
+        let (data, data_start) = if region_start >= tail_start {
+            (as_slice(&tail.data), tail_start)
+        } else if region_end - region_start <= INDEX_REGION_CAP {
+            fetched = self.get(region_start, region_end).await?;
+            (as_slice(&fetched.data), region_start)
+        } else {
+            return Ok(HashMap::new());
+        };
+        let mut out = HashMap::new();
+        for (slot, start, end) in wanted {
+            let from = usize::try_from(start - data_start).ok();
+            let to = usize::try_from(end - data_start).ok();
+            let Some(bytes) = from.zip(to).and_then(|(from, to)| data.get(from..to)) else {
+                continue;
+            };
+            let first = contain(|| decode_offset_index(bytes).ok())?
+                .and_then(|index| index.page_locations().first().cloned());
+            if let Some(first) = first {
+                out.insert(slot, first);
+            }
+        }
+        Ok(out)
     }
 
     /// Samples every candidate column of an opened file and classifies
-    /// it. Fails only if a read is refused or fails outright; a column
-    /// that cannot be decoded is skipped and counted.
+    /// it. Columns go in batches (one at a time for a whole file, else
+    /// [`COLUMN_BATCH`]), each batch row group by row group: the first,
+    /// then for columns that need more, the middle, then the last. Fails
+    /// only if a read is refused or fails outright, or a task panics; a
+    /// column that cannot be decoded is skipped and counted.
     pub(super) async fn scan(
         &mut self,
         metadata: &ParquetMetaData,
@@ -295,10 +624,7 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
     ) -> Result<Scanned, NotScannedReason> {
         let schema = metadata.file_metadata().schema_descr();
         let order = row_group_order(metadata.num_row_groups());
-        let mut findings = Vec::new();
-        // String and integer columns: those whose values are read.
-        let (mut to_read, mut read) = (0_u64, 0_u64);
-
+        let mut candidates = Vec::new();
         for index in 0..schema.num_columns() {
             let descr = schema.column(index);
             if descr.max_rep_level() > 0 {
@@ -310,56 +636,86 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
                     self.stats.skipped_unsupported_type.saturating_add(1);
                 continue;
             };
+            candidates.push(Candidate::new(index, descr, kind));
+        }
 
-            let mut values: Vec<String> = Vec::new();
-            let mut evidence = Evidence::default();
-            let mut skipped = None;
-            if kind != Kind::Temporal {
-                to_read += 1;
-                for &row_group in &order {
-                    match self
-                        .sample(metadata, opened, row_group, index, &descr)
-                        .await?
-                    {
-                        ColumnRead::Values(sample) => values.extend(sample),
-                        other => {
-                            skipped = Some(other);
-                            break;
+        let batch = match opened {
+            Opened::Whole(_) => 1,
+            Opened::Partial { .. } => COLUMN_BATCH,
+        };
+        let mut findings = Vec::new();
+        // String and integer columns: those whose values are read.
+        let (mut to_read, mut read) = (0_u64, 0_u64);
+        for group in candidates.chunks_mut(batch) {
+            for &row_group in &order {
+                let active: Vec<usize> = group
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.done && c.kind != Kind::Temporal)
+                    .map(|(position, _)| position)
+                    .collect();
+                if active.is_empty() {
+                    break;
+                }
+                let columns: Vec<(usize, ColumnDescPtr)> = active
+                    .iter()
+                    .filter_map(|&position| group.get(position))
+                    .map(|c| (c.index, Arc::clone(&c.descr)))
+                    .collect();
+                let reads = match opened {
+                    Opened::Whole(data) => {
+                        let mut reads = Vec::with_capacity(columns.len());
+                        for (index, descr) in &columns {
+                            reads.push(
+                                self.sample_whole(metadata, data, row_group, *index, descr)
+                                    .await?,
+                            );
                         }
+                        reads
                     }
-                    let mut cleaned = values.clone();
-                    drop_dominant(&mut cleaned);
-                    evidence = Evidence::of(&cleaned);
-                    if !evidence.needs_more() {
-                        break;
+                    Opened::Partial { first_pages } => {
+                        self.sample_round(metadata, first_pages, row_group, &columns)
+                            .await?
+                    }
+                };
+                for (&position, read) in active.iter().zip(reads) {
+                    if let Some(candidate) = group.get_mut(position) {
+                        candidate.apply(read);
                     }
                 }
             }
 
-            let count = match skipped {
-                Some(ColumnRead::PageTooLarge) => &mut self.stats.skipped_page_too_large,
-                Some(ColumnRead::UnsupportedCodec) => &mut self.stats.skipped_unsupported_codec,
-                Some(ColumnRead::Unreadable | ColumnRead::Values(_)) => {
-                    &mut self.stats.skipped_unreadable
+            for candidate in group.iter_mut() {
+                let count = match candidate.skipped {
+                    Some(Skip::PageTooLarge) => &mut self.stats.skipped_page_too_large,
+                    Some(Skip::UnsupportedCodec) => &mut self.stats.skipped_unsupported_codec,
+                    Some(Skip::Unreadable) => &mut self.stats.skipped_unreadable,
+                    None => &mut self.stats.columns_examined,
+                };
+                *count = count.saturating_add(1);
+                if candidate.kind != Kind::Temporal {
+                    to_read += 1;
                 }
-                None => &mut self.stats.columns_examined,
-            };
-            *count = count.saturating_add(1);
-            if skipped.is_some() {
-                continue;
-            }
-            if kind != Kind::Temporal {
-                read += 1;
-            }
-            if let Some(verdict) = classify(&evidence, names::hint(descr.name()), kind) {
-                findings.push(ColumnFinding {
-                    pii: verdict.pii,
-                    detail: ColumnDetail::new(
-                        &descr.path().string(),
-                        verdict.confidence,
-                        verdict.evidence,
-                    ),
-                });
+                // The sample is no longer needed: free it, and its permits.
+                candidate.values = Vec::new();
+                candidate.permits.clear();
+                if candidate.skipped.is_some() {
+                    continue;
+                }
+                if candidate.kind != Kind::Temporal {
+                    read += 1;
+                }
+                let hint = names::hint(candidate.descr.name());
+                if let Some(verdict) = classify(&candidate.evidence, hint, candidate.kind) {
+                    findings.push(ColumnFinding {
+                        pii: verdict.pii,
+                        detail: ColumnDetail::new(
+                            &candidate.descr.path().string(),
+                            verdict.confidence,
+                            verdict.evidence,
+                        ),
+                    });
+                }
             }
         }
         Ok(Scanned {
@@ -368,14 +724,12 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
         })
     }
 
-    /// Reads and decodes the first data page (and the dictionary page, if
-    /// any) of column `index` in `row_group`. Every page header is checked
-    /// (see [`plan_pages`]) before `parquet` sees it, on both paths; a
-    /// panic inside `parquet` fails the file as unreadable.
-    async fn sample(
+    /// Samples column `index` of `row_group` from a file read whole: its
+    /// pages are checked (see [`plan_pages`]), then decoded.
+    async fn sample_whole(
         &mut self,
         metadata: &ParquetMetaData,
-        opened: &Opened<B>,
+        data: &Held<B>,
         row_group: usize,
         index: usize,
         descr: &ColumnDescPtr,
@@ -395,43 +749,55 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
         else {
             return Ok(ColumnRead::Unreadable);
         };
-        let min_value_bytes = min_value_bytes(descr);
-
-        let (tail, tail_start) = match opened {
-            Opened::Whole(data) => {
-                let from = usize::try_from(start).ok();
-                let to = usize::try_from(start + len).ok();
-                let Some(bytes) = from
-                    .zip(to)
-                    .and_then(|(from, to)| as_slice(data).get(from..to))
-                else {
-                    return Ok(ColumnRead::Unreadable);
-                };
-                return match plan_pages(bytes, len, min_value_bytes) {
-                    Plan::Ready {
-                        offset,
-                        len: page_len,
-                    } => {
-                        let checked = Checked {
-                            data: data.clone(),
-                            buffer_start: 0,
-                            chunk_start: start,
-                            chunk_len: len,
-                            page_offset: offset,
-                            page_len,
-                        };
-                        decode_contained(checked, chunk, codec, rows, descr)
-                    }
-                    Plan::TooLarge => Ok(ColumnRead::PageTooLarge),
-                    Plan::NeedMore(_) | Plan::Invalid => Ok(ColumnRead::Unreadable),
-                };
-            }
-            Opened::Partial { tail, start } => (tail, *start),
+        let from = usize::try_from(start).ok();
+        let to = usize::try_from(start + len).ok();
+        let Some(bytes) = from
+            .zip(to)
+            .and_then(|(from, to)| as_slice(&data.data).get(from..to))
+        else {
+            return Ok(ColumnRead::Unreadable);
         };
+        match plan_pages(bytes, len, min_value_bytes(descr)) {
+            Plan::Ready {
+                offset,
+                len: page_len,
+                decode_bytes,
+            } => {
+                let checked = Checked {
+                    data: data.data.clone(),
+                    buffer_start: 0,
+                    chunk_start: start,
+                    chunk_len: len,
+                    page_offset: offset,
+                    page_len,
+                };
+                self.decode(checked, chunk, codec, rows, descr, decode_bytes)
+                    .await
+            }
+            Plan::TooLarge => Ok(ColumnRead::PageTooLarge),
+            Plan::NeedMore(_) | Plan::Invalid => Ok(ColumnRead::Unreadable),
+        }
+    }
 
-        // The offset index, when present, says where the first data page
-        // ends, so the first read usually covers everything needed.
-        let first_end = match self.first_page_location(chunk, tail, tail_start).await? {
+    /// The first read for column `index` of `row_group`: one exact range
+    /// when an offset index located the first data page, else the chunk's
+    /// first [`WINDOW_START`] bytes. Or the column's read already, if it
+    /// can be decided without reading.
+    fn plan_request(
+        &self,
+        group: &RowGroupMetaData,
+        row_group: usize,
+        index: usize,
+        first_pages: &HashMap<(usize, usize), PageLocation>,
+    ) -> Result<Request, ColumnRead> {
+        let chunk = group.columns().get(index).ok_or(ColumnRead::Unreadable)?;
+        if codec(chunk.compression()).is_none() {
+            return Err(ColumnRead::UnsupportedCodec);
+        }
+        let (start, len) = chunk_range(chunk)
+            .filter(|&(start, len)| start.checked_add(len).is_some_and(|end| end <= self.size))
+            .ok_or(ColumnRead::Unreadable)?;
+        let first_end = match first_pages.get(&(row_group, index)) {
             Some(first) => {
                 let end = u64::try_from(first.offset)
                     .ok()
@@ -439,85 +805,239 @@ impl<R: ObjectReader, B: Window> Session<'_, R, B> {
                     .and_then(|(offset, size)| offset.checked_add(size))
                     .filter(|&end| end > start && end <= start + len);
                 match end {
-                    Some(end) if end - start > WINDOW_LIMIT => return Ok(ColumnRead::PageTooLarge),
+                    Some(end) if end - start > WINDOW_LIMIT => {
+                        return Err(ColumnRead::PageTooLarge);
+                    }
                     Some(end) => end - start,
                     None => len.min(WINDOW_START),
                 }
             }
             None => len.min(WINDOW_START),
         };
+        if first_end == 0 {
+            return Err(ColumnRead::Unreadable);
+        }
+        Ok(Request {
+            slot: 0,
+            start,
+            chunk_len: len,
+            end: start + first_end,
+        })
+    }
 
-        let mut window = self.get(start, start + first_end).await?;
-        loop {
-            let held = u64::try_from(as_slice(&window).len()).unwrap_or(u64::MAX);
-            match plan_pages(as_slice(&window), len, min_value_bytes) {
+    /// Samples `columns` (`(index, descriptor)`) in `row_group` of a file
+    /// read partially. Each phase coalesces its requests (see
+    /// [`coalesce`]) and fetches the merged ranges in order, up to
+    /// [`RANGE_CONCURRENCY`] at once and [`PREFETCH_CAP`] bytes in flight,
+    /// under permits; each column is decoded as its range arrives. A column
+    /// whose pages run past its range asks for more in the next phase.
+    async fn sample_round(
+        &mut self,
+        metadata: &ParquetMetaData,
+        first_pages: &HashMap<(usize, usize), PageLocation>,
+        row_group: usize,
+        columns: &[(usize, ColumnDescPtr)],
+    ) -> Result<Vec<ColumnRead>, NotScannedReason> {
+        let mut results: Vec<Option<ColumnRead>> = std::iter::repeat_with(|| None)
+            .take(columns.len())
+            .collect();
+        let Some(group) = metadata.row_groups().get(row_group) else {
+            return Ok(columns.iter().map(|_| ColumnRead::Unreadable).collect());
+        };
+        let round = Round {
+            group,
+            rows: usize::try_from(group.num_rows()).unwrap_or(0),
+            columns,
+        };
+        let mut pending = Vec::new();
+        for (slot, (index, _)) in columns.iter().enumerate() {
+            match self.plan_request(group, row_group, *index, first_pages) {
+                Ok(request) => pending.push(Request { slot, ..request }),
+                Err(read) => {
+                    if let Some(result) = results.get_mut(slot) {
+                        *result = Some(read);
+                    }
+                }
+            }
+        }
+
+        while !pending.is_empty() {
+            let mut ranges = coalesce(std::mem::take(&mut pending), self.coalesce_gap).into_iter();
+            let mut next = ranges.next();
+            let mut queue = VecDeque::new();
+            let mut in_flight: u64 = 0;
+            loop {
+                while queue.len() < RANGE_CONCURRENCY {
+                    let Some(merged) = next.take() else {
+                        break;
+                    };
+                    let len = merged.end - merged.start;
+                    if !queue.is_empty() && in_flight + len > PREFETCH_CAP {
+                        next = Some(merged);
+                        break;
+                    }
+                    let permit = self.permit(len).await?;
+                    let fetch = fetch_range(
+                        self.reader.clone(),
+                        Arc::clone(&self.key),
+                        merged.start,
+                        merged.end,
+                        self.convert,
+                    );
+                    let task = tokio::spawn(async move {
+                        let (returned, data) = fetch.await;
+                        (returned, data, permit)
+                    });
+                    in_flight += len;
+                    queue.push_back((merged, Task(task), len));
+                    next = ranges.next();
+                }
+                let Some((merged, mut task, len)) = queue.pop_front() else {
+                    break;
+                };
+                let (returned, data, permit) = (&mut task.0)
+                    .await
+                    .map_err(|_| NotScannedReason::Unreadable)?;
+                self.count(returned);
+                let held = Held {
+                    data: data?,
+                    _permit: permit,
+                };
+                for request in &merged.members {
+                    match self
+                        .sample_request(&held, merged.start, request, &round)
+                        .await?
+                    {
+                        Step::Done(read) => {
+                            if let Some(result) = results.get_mut(request.slot) {
+                                *result = Some(read);
+                            }
+                        }
+                        Step::More(longer) => pending.push(longer),
+                    }
+                }
+                in_flight -= len;
+            }
+        }
+        Ok(results
+            .into_iter()
+            .map(|result| result.unwrap_or(ColumnRead::Unreadable))
+            .collect())
+    }
+
+    /// Checks one column's pages in a fetched range starting at file
+    /// offset `held_start`, then decodes them, or asks for more.
+    async fn sample_request(
+        &mut self,
+        held: &Held<B>,
+        held_start: u64,
+        request: &Request,
+        round: &Round<'_>,
+    ) -> Result<Step, NotScannedReason> {
+        let Some((index, descr)) = round.columns.get(request.slot) else {
+            return Ok(Step::Done(ColumnRead::Unreadable));
+        };
+        let Some(chunk) = round.group.columns().get(*index) else {
+            return Ok(Step::Done(ColumnRead::Unreadable));
+        };
+        let Some(codec) = codec(chunk.compression()) else {
+            return Ok(Step::Done(ColumnRead::UnsupportedCodec));
+        };
+        let from = usize::try_from(request.start - held_start).ok();
+        let to = usize::try_from(request.end - held_start).ok();
+        let Some(bytes) = from
+            .zip(to)
+            .and_then(|(from, to)| as_slice(&held.data).get(from..to))
+        else {
+            return Ok(Step::Done(ColumnRead::Unreadable));
+        };
+        let window = request.end - request.start;
+        Ok(
+            match plan_pages(bytes, request.chunk_len, min_value_bytes(descr)) {
                 Plan::Ready {
                     offset,
-                    len: page_len,
+                    len,
+                    decode_bytes,
                 } => {
                     let checked = Checked {
-                        data: window,
-                        buffer_start: start,
-                        chunk_start: start,
-                        chunk_len: held,
+                        data: held.data.clone(),
+                        buffer_start: held_start,
+                        chunk_start: request.start,
+                        chunk_len: window,
                         page_offset: offset,
-                        page_len,
+                        page_len: len,
                     };
-                    return decode_contained(checked, chunk, codec, rows, descr);
+                    Step::Done(
+                        self.decode(checked, chunk, codec, round.rows, descr, decode_bytes)
+                            .await?,
+                    )
                 }
-                Plan::TooLarge => return Ok(ColumnRead::PageTooLarge),
-                Plan::Invalid => return Ok(ColumnRead::Unreadable),
+                Plan::TooLarge => Step::Done(ColumnRead::PageTooLarge),
+                Plan::Invalid => Step::Done(ColumnRead::Unreadable),
                 Plan::NeedMore(needed) => {
-                    let wanted = needed.min(len);
-                    if wanted <= held {
-                        return Ok(ColumnRead::Unreadable);
+                    let wanted = needed.min(request.chunk_len);
+                    if wanted <= window {
+                        Step::Done(ColumnRead::Unreadable)
+                    } else {
+                        Step::More(Request {
+                            end: request.start + wanted,
+                            ..*request
+                        })
                     }
-                    let more = self.get(start + held, start + wanted).await?;
-                    let (window_bytes, more_bytes) = (as_slice(&window), as_slice(&more));
-                    let mut combined = Vec::with_capacity(window_bytes.len() + more_bytes.len());
-                    combined.extend_from_slice(window_bytes);
-                    combined.extend_from_slice(more_bytes);
-                    window = B::from(combined);
                 }
-            }
-        }
+            },
+        )
     }
 
-    /// The first page's location from the chunk's offset index, if it has
-    /// one that can be read and decoded. Taken from the tail read when it
-    /// lies there; otherwise fetched.
-    async fn first_page_location(
+    /// Decodes checked pages on the blocking pool, inside [`contain`],
+    /// under permits for their declared sizes (`decode_bytes`) and for the
+    /// sample, which stays with the values.
+    async fn decode(
         &mut self,
+        checked: Checked<B>,
         chunk: &ColumnChunkMetaData,
-        tail: &B,
-        tail_start: u64,
-    ) -> Result<Option<PageLocation>, NotScannedReason> {
-        let offset = chunk
-            .offset_index_offset()
-            .and_then(|o| u64::try_from(o).ok());
-        let length = chunk
-            .offset_index_length()
-            .and_then(|l| u64::try_from(l).ok());
-        let (Some(offset), Some(length)) = (offset, length) else {
-            return Ok(None);
+        codec: Codec,
+        rows: usize,
+        descr: &ColumnDescPtr,
+        decode_bytes: u64,
+    ) -> Result<ColumnRead, NotScannedReason> {
+        let Some(work) = self.budget.acquire(decode_bytes).await else {
+            return Ok(ColumnRead::Unreadable);
         };
-        let end = offset.saturating_add(length);
-        if length == 0 || length > OFFSET_INDEX_CAP || end > self.size {
-            return Ok(None);
-        }
-        let decoded = if offset >= tail_start {
-            let from = usize::try_from(offset - tail_start).ok();
-            let to = usize::try_from(end - tail_start).ok();
-            match from.zip(to).and_then(|(from, to)| tail.get(from..to)) {
-                Some(bytes) => contain(|| decode_offset_index(bytes).ok())?,
-                None => None,
-            }
-        } else {
-            let bytes = self.get(offset, end).await?;
-            contain(|| decode_offset_index(&bytes).ok())?
+        let Some(sample) = self.budget.acquire(SAMPLE_BYTES).await else {
+            return Ok(ColumnRead::Unreadable);
         };
-        Ok(decoded.and_then(|index| index.page_locations().first().cloned()))
+        let chunk = chunk.clone();
+        let descr = Arc::clone(descr);
+        let decoded = tokio::task::spawn_blocking(move || {
+            decode_contained(checked, &chunk, codec, rows, &descr)
+        })
+        .await
+        .map_err(|_| NotScannedReason::Unreadable)??;
+        drop(work);
+        Ok(match decoded {
+            Some(values) => ColumnRead::Values(values, sample),
+            None => ColumnRead::Unreadable,
+        })
     }
+}
+
+/// Decodes a footer on the blocking pool, inside [`contain`].
+async fn decode_metadata<B: Window>(
+    data: B,
+    from: usize,
+    to: usize,
+) -> Result<ParquetMetaData, NotScannedReason> {
+    tokio::task::spawn_blocking(move || {
+        contain(|| {
+            as_slice(&data)
+                .get(from..to)
+                .and_then(|bytes| ParquetMetaDataReader::decode_metadata(bytes).ok())
+        })
+    })
+    .await
+    .map_err(|_| NotScannedReason::Unreadable)??
+    .ok_or(NotScannedReason::Unreadable)
 }
 
 /// `window`'s bytes. Spelled out because `ChunkReader` brings its own
@@ -661,7 +1181,13 @@ enum Plan {
     /// The first data page is `len` bytes (header and body) at `offset`
     /// from the chunk's start, wholly in hand, and every page up to it
     /// passed the checks.
-    Ready { offset: u64, len: u64 },
+    Ready {
+        offset: u64,
+        len: u64,
+        /// What decoding allocates for the pages: their declared
+        /// uncompressed sizes, and a dictionary's slots.
+        decode_bytes: u64,
+    },
     /// More bytes are needed: the chunk's first `n`.
     NeedMore(u64),
     /// A page declares more than [`PAGE_CAP`], or a dictionary more than
@@ -679,6 +1205,7 @@ fn plan_pages(bytes: &[u8], chunk_len: u64, min_value_bytes: u64) -> Plan {
     let held = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let mut pos: u64 = 0;
     let mut first = true;
+    let mut dictionary_bytes: u64 = 0;
     loop {
         let rest = usize::try_from(pos).ok().and_then(|pos| bytes.get(pos..));
         let read = rest.map_or(header::Read::Incomplete, header::read);
@@ -709,6 +1236,8 @@ fn plan_pages(bytes: &[u8], chunk_len: u64, min_value_bytes: u64) -> Plan {
                 if page.dictionary_values.saturating_mul(min_value_bytes) > page.uncompressed {
                     return Plan::Invalid;
                 }
+                dictionary_bytes =
+                    page.uncompressed + page.dictionary_values * DICTIONARY_SLOT_BYTES;
                 pos = end;
                 first = false;
             }
@@ -719,6 +1248,7 @@ fn plan_pages(bytes: &[u8], chunk_len: u64, min_value_bytes: u64) -> Plan {
                     Plan::Ready {
                         offset: pos,
                         len: end - pos,
+                        decode_bytes: dictionary_bytes + page.uncompressed,
                     }
                 };
             }
@@ -728,16 +1258,16 @@ fn plan_pages(bytes: &[u8], chunk_len: u64, min_value_bytes: u64) -> Plan {
 }
 
 /// Decodes one checked data page with [`decode`], decompressing it first
-/// if `codec` says `LakeScan` must, all inside [`contain`]: a decoding
-/// error skips the column; a panic fails the file.
+/// if `codec` says `LakeScan` must, all inside [`contain`]: the values, or
+/// `None` (a decoding error skips the column); a panic fails the file.
 fn decode_contained<B: Window>(
     checked: Checked<B>,
     chunk: &ColumnChunkMetaData,
     codec: Codec,
     rows: usize,
     descr: &ColumnDescPtr,
-) -> Result<ColumnRead, NotScannedReason> {
-    let decoded = contain(|| {
+) -> Result<Option<Vec<String>>, NotScannedReason> {
+    contain(|| {
         if codec == Codec::Parquet {
             let meta = rebase(chunk, checked.buffer_start, checked.chunk_len)?;
             let at = checked.chunk_start.checked_sub(checked.buffer_start)? + checked.page_offset;
@@ -749,8 +1279,7 @@ fn decode_contained<B: Window>(
         let meta = uncompressed(chunk, data_at, total)?;
         let location = page_location(data_at, total - data_at);
         decode(B::from(plain), &meta, rows, location, descr).ok()
-    })?;
-    Ok(decoded.map_or(ColumnRead::Unreadable, ColumnRead::Values))
+    })
 }
 
 /// Row groups to sample, in order: the first, then the middle, then the
@@ -882,7 +1411,7 @@ fn decode<B: Window>(
     descr: &ColumnDescPtr,
 ) -> ParquetResult<Vec<String>> {
     #[cfg(test)]
-    fault::maybe_panic();
+    fault::maybe_panic(descr.name());
     // No LZ4 frame fallback: it decompresses without a size limit.
     let properties = ReaderProperties::builder()
         .set_backward_compatible_lz4(false)
@@ -1006,34 +1535,46 @@ impl<P: PageReader> PageReader for FirstPageOnly<P> {
     }
 }
 
-/// Test-only fault injection: makes the next decode panic, to prove a
-/// panic inside `parquet` is contained. Not compiled into the binary.
+/// Test-only fault injection: makes decodes of a named column panic, to
+/// prove a panic inside `parquet` is contained, and counts decodes per
+/// column name. Keyed by column, not thread, because decodes run on the
+/// blocking pool. Not compiled into the binary.
 #[cfg(test)]
 pub(crate) mod fault {
-    use std::cell::Cell;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Mutex;
 
-    thread_local! {
-        static ARMED: Cell<bool> = const { Cell::new(false) };
-        static DECODES: Cell<u64> = const { Cell::new(0) };
+    static ARMED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    static DECODES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+    /// How many decodes of columns named `column` have started.
+    pub(crate) fn decodes(column: &str) -> u64 {
+        DECODES
+            .lock()
+            .ok()
+            .and_then(|counts| counts.get(column).copied())
+            .unwrap_or(0)
     }
 
-    /// How many decodes this thread has started.
-    pub(crate) fn decodes() -> u64 {
-        DECODES.with(Cell::get)
+    /// Makes every decode of a column named `column` panic until
+    /// [`disarm`].
+    pub(crate) fn arm(column: &str) {
+        if let Ok(mut armed) = ARMED.lock() {
+            armed.insert(column.to_owned());
+        }
     }
 
-    /// Makes every decode on this thread panic until [`disarm`].
-    pub(crate) fn arm() {
-        ARMED.with(|armed| armed.set(true));
+    pub(crate) fn disarm(column: &str) {
+        if let Ok(mut armed) = ARMED.lock() {
+            armed.remove(column);
+        }
     }
 
-    pub(crate) fn disarm() {
-        ARMED.with(|armed| armed.set(false));
-    }
-
-    pub(super) fn maybe_panic() {
-        DECODES.with(|count| count.set(count.get() + 1));
-        if ARMED.with(Cell::get) {
+    pub(super) fn maybe_panic(column: &str) {
+        if let Ok(mut counts) = DECODES.lock() {
+            *counts.entry(column.to_owned()).or_default() += 1;
+        }
+        if ARMED.lock().is_ok_and(|armed| armed.contains(column)) {
             std::panic::resume_unwind(Box::new("injected decode fault"));
         }
     }
@@ -1044,7 +1585,85 @@ mod tests {
     use std::io::Write as _;
 
     use super::header::PageHeader;
-    use super::{Codec, brotli_window_is_standard, inflate, row_group_order};
+    use super::{
+        COALESCE_MAX, Codec, Request, brotli_window_is_standard, coalesce, file_need, inflate,
+        row_group_order,
+    };
+
+    fn request(slot: usize, start: u64, end: u64) -> Request {
+        Request {
+            slot,
+            start,
+            chunk_len: end - start,
+            end,
+        }
+    }
+
+    #[test]
+    fn coalescing_merges_close_ranges_in_order_and_never_past_the_cap() {
+        const MIB: u64 = 1024 * 1024;
+        let requests = vec![
+            request(2, 10 * MIB, 10 * MIB + 100),
+            request(0, 0, 1000),
+            request(1, 1000 + MIB, 2 * MIB),
+            request(3, 30 * MIB, 40 * MIB),
+            request(4, 40 * MIB + 1, 40 * MIB + 2),
+        ];
+        // Gap 0: nothing merges, but the order is sorted.
+        let apart = coalesce(requests.clone(), 0);
+        assert_eq!(
+            apart.iter().map(|m| m.members.len()).collect::<Vec<_>>(),
+            [1, 1, 1, 1, 1]
+        );
+        assert_eq!(apart.first().map(|m| m.start), Some(0));
+        // 1 MiB: the first two merge; 10 MiB is too far; the 10 MiB range
+        // stands alone (over the cap), so its 1-byte neighbour does too.
+        let merged = coalesce(requests, MIB);
+        let shape: Vec<(u64, u64, Vec<usize>)> = merged
+            .iter()
+            .map(|m| (m.start, m.end, m.members.iter().map(|r| r.slot).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (0, 2 * MIB, vec![0, 1]),
+                (10 * MIB, 10 * MIB + 100, vec![2]),
+                (30 * MIB, 40 * MIB, vec![3]),
+                (40 * MIB + 1, 40 * MIB + 2, vec![4]),
+            ]
+        );
+        // Many small ranges a byte apart: merged reads never pass 8 MiB.
+        let many: Vec<Request> = (0..10_000)
+            .map(|i| {
+                request(
+                    i,
+                    u64::try_from(i).unwrap_or(0) * 4097,
+                    u64::try_from(i).unwrap_or(0) * 4097 + 4096,
+                )
+            })
+            .collect();
+        let merged = coalesce(many, MIB);
+        assert!(merged.len() > 1);
+        assert!(merged.iter().all(|m| m.end - m.start <= COALESCE_MAX));
+        assert_eq!(
+            merged.iter().map(|m| m.members.len()).sum::<usize>(),
+            10_000
+        );
+    }
+
+    #[test]
+    fn one_file_s_need_covers_both_read_paths() {
+        // ~103 MiB at the default whole-file maximum: partial reads
+        // dominate; at 64 MiB, whole reads do.
+        assert!(file_need(8 << 20) < 110 << 20);
+        assert!(file_need(8 << 20) > 90 << 20);
+        assert!(file_need(64 << 20) > file_need(8 << 20));
+        assert!(super::super::DEFAULT_MEMORY_BUDGET >= file_need(super::super::MAX_WHOLE_FILE_MAX));
+        // The sample bound matches its parts.
+        let parts = (super::MAX_VALUES_PER_ROW_GROUP + super::BATCH)
+            * (super::super::clean::MAX_VALUE_BYTES + size_of::<String>());
+        assert_eq!(u64::try_from(parts).ok(), Some(super::SAMPLE_BYTES));
+    }
 
     fn page(uncompressed: usize, levels: u64, values_compressed: bool) -> PageHeader {
         PageHeader {

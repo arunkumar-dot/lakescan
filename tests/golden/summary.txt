@@ -54,7 +54,7 @@ COVERAGE
   not scanned:    1 documented, 0 undocumented
 
 PII INVENTORY
-  1 tables with PII, 3 PII columns: 2 undocumented (action needed), 1 documented. 1 tables not fully scanned.
+  1 table with PII, 3 PII columns: 2 undocumented (action needed), 1 documented. 1 table not fully scanned (1 documented).
   (bucket root)  files: 1 scanned, 0 not scanned
     no PII found in 1 scanned file
   warehouse/customers  files: 2 scanned, 0 not scanned

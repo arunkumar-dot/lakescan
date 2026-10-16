@@ -99,6 +99,41 @@ impl ExitCode {
     pub fn as_i32(self) -> i32 {
         self as i32
     }
+
+    /// The code's name, as the README's exit-code table gives it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "Ok",
+            Self::FindingsExceedThreshold => "FindingsExceedThreshold",
+            Self::Usage => "Usage",
+            Self::Auth => "Auth",
+            Self::Transport => "Transport",
+            Self::Report => "Report",
+            Self::ContentNotScanned => "ContentNotScanned",
+        }
+    }
+
+    /// What the code means, in one sentence, for a report's reader.
+    #[must_use]
+    pub fn meaning(self) -> &'static str {
+        match self {
+            Self::Ok => {
+                "The scan completed and no unsuppressed finding reached the failing threshold."
+            }
+            Self::FindingsExceedThreshold => {
+                "The scan completed, but an unsuppressed finding reached the failing threshold."
+            }
+            Self::Usage => "The command line or config file was invalid.",
+            Self::Auth => "Credentials were missing, expired, or rejected.",
+            Self::Transport => "The network or S3 failed.",
+            Self::Report => "A report could not be written.",
+            Self::ContentNotScanned => {
+                "At least one Parquet file could not be content-scanned and no suppression \
+                 documents it."
+            }
+        }
+    }
 }
 
 impl From<&LakeScanError> for ExitCode {

@@ -405,6 +405,7 @@ struct InventorySummarySection {
     undocumented: u64,
     documented: u64,
     tables_not_fully_scanned: u64,
+    tables_not_fully_scanned_documented: u64,
 }
 
 impl From<InventorySummary> for InventorySummarySection {
@@ -415,6 +416,7 @@ impl From<InventorySummary> for InventorySummarySection {
             undocumented: summary.undocumented,
             documented: summary.documented,
             tables_not_fully_scanned: summary.tables_not_fully_scanned,
+            tables_not_fully_scanned_documented: summary.tables_not_fully_scanned_documented,
         }
     }
 }
@@ -930,7 +932,8 @@ mod tests {
                 "pii_columns": 3,
                 "undocumented": 2,
                 "documented": 1,
-                "tables_not_fully_scanned": 1
+                "tables_not_fully_scanned": 1,
+                "tables_not_fully_scanned_documented": 1
             }))
         );
         assert_eq!(

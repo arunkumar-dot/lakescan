@@ -18,7 +18,7 @@
 //! **Memory.** Table names and example keys are cut to 1 KiB, column paths
 //! are at most [`MAX_COLUMN_BYTES`], and entries live inside their table,
 //! so a table name is stored once. [`PiiInventory::MAX_BYTES`] bounds the
-//! total, growth slack included: 17,268,800 bytes (~16.5 MiB) at the caps.
+//! total, growth slack included: 17,399,872 bytes (~16.6 MiB) at the caps.
 
 use crate::content::FileOutcome;
 use crate::model::{
@@ -161,6 +161,9 @@ pub struct InventorySummary {
     pub documented: u64,
     /// Tables with at least one file not scanned.
     pub tables_not_fully_scanned: u64,
+    /// Of those, the tables whose every unscanned file is documented (its
+    /// `content-not-scanned` finding suppressed).
+    pub tables_not_fully_scanned_documented: u64,
 }
 
 /// One `(table, column path, PII rule)` location and what was found there.
@@ -501,6 +504,12 @@ impl PiiInventory {
             }
             if table.files_not_scanned() > 0 {
                 summary.tables_not_fully_scanned += 1;
+                let undocumented = NotScannedReason::ALL
+                    .iter()
+                    .any(|&reason| table.not_scanned_unsuppressed(reason) > 0);
+                if !undocumented {
+                    summary.tables_not_fully_scanned_documented += 1;
+                }
             }
             for entry in &table.entries {
                 summary.pii_columns += 1;
@@ -1072,6 +1081,8 @@ mod tests {
                 undocumented: 2,
                 documented: 1,
                 tables_not_fully_scanned: 2,
+                // half's unscanned file is documented; dark's is not.
+                tables_not_fully_scanned_documented: 1,
             }
         );
         // Review order: undocumented first, then documented, each by

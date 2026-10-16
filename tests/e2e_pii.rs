@@ -12,6 +12,11 @@
 //! cargo run --example seed_local -- "$LAKESCAN_E2E_ENDPOINT"
 //! cargo test --test e2e_pii -- --ignored
 //! ```
+//!
+//! Set `LAKESCAN_E2E_CONCURRENCY` to run every `--pii` scan at that
+//! `--concurrency` (the CLI default, 16, otherwise); CI runs the suite at 1
+//! and at 16. Whatever it is, the outputs must be identical, which one
+//! test checks directly.
 
 #[path = "support/pii_manifest.rs"]
 mod pii_manifest;
@@ -94,6 +99,7 @@ struct Run {
     summary: Value,
     findings: Vec<Value>,
     inventory: String,
+    html: String,
     stderr: String,
 }
 
@@ -109,6 +115,8 @@ fn temp_path(test: &str, extension: &str) -> PathBuf {
 fn run(test: &str, prefix: &str, extra: &[&str]) -> Result<Run, Box<dyn Error>> {
     let findings_path = temp_path(test, "jsonl");
     let inventory_path = temp_path(test, "csv");
+    let html_path = temp_path(test, "html");
+    let html_arg = html_path.to_str().ok_or("temp path is not UTF-8")?;
     let findings_arg = findings_path.to_str().ok_or("temp path is not UTF-8")?;
     let inventory_arg = inventory_path.to_str().ok_or("temp path is not UTF-8")?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_lakescan"));
@@ -122,14 +130,23 @@ fn run(test: &str, prefix: &str, extra: &[&str]) -> Result<Run, Box<dyn Error>> 
             "json",
             "--findings",
             findings_arg,
+            "--html",
+            html_arg,
         ])
         .args(extra);
     if extra.contains(&"--pii") {
         command.args(["--inventory", inventory_arg]);
+        if !extra.contains(&"--concurrency")
+            && let Ok(concurrency) = std::env::var("LAKESCAN_E2E_CONCURRENCY")
+        {
+            command.args(["--concurrency", &concurrency]);
+        }
     }
     let output = command.output()?;
     let findings_text = std::fs::read_to_string(&findings_path);
     let inventory = std::fs::read_to_string(&inventory_path).unwrap_or_default();
+    let html = std::fs::read_to_string(&html_path).unwrap_or_default();
+    std::fs::remove_file(&html_path).ok();
     std::fs::remove_file(&findings_path).ok();
     std::fs::remove_file(&inventory_path).ok();
     let stderr = String::from_utf8(output.stderr)?;
@@ -144,6 +161,7 @@ fn run(test: &str, prefix: &str, extra: &[&str]) -> Result<Run, Box<dyn Error>> 
         summary,
         findings,
         inventory,
+        html,
         stderr,
     })
 }
@@ -345,7 +363,8 @@ fn the_inventory_groups_partitioned_files_into_tables() -> TestResult {
             "pii_columns": 3 * CUSTOMERS.len() + 1,
             "undocumented": 3 * CUSTOMERS.len() + 1,
             "documented": 0,
-            "tables_not_fully_scanned": 0
+            "tables_not_fully_scanned": 0,
+            "tables_not_fully_scanned_documented": 0
         }))
     );
     assert!(tables.iter().all(|t| text(t, "status") == "pii_found"));
@@ -685,6 +704,58 @@ fn a_column_suppression_documents_that_location_in_the_inventory_and_csv() -> Te
     Ok(())
 }
 
+/// `summary` without the fields that time a run.
+fn untimed(mut summary: Value) -> Value {
+    if let Some(scan) = summary.get_mut("scan").and_then(Value::as_object_mut) {
+        scan.remove("started_at");
+        scan.remove("elapsed_ms");
+    }
+    summary
+}
+
+#[test]
+#[ignore = "needs a seeded S3-compatible server; see this file's header"]
+fn every_output_is_identical_at_concurrency_1_and_16() -> TestResult {
+    for whole_file_max in ["0", "8388608"] {
+        let mut runs = Vec::new();
+        for concurrency in ["1", "16"] {
+            runs.push(run(
+                &format!("c{concurrency}-{whole_file_max}"),
+                "",
+                &[
+                    "--pii",
+                    "--concurrency",
+                    concurrency,
+                    "--pii-whole-file-max",
+                    whole_file_max,
+                ],
+            )?);
+        }
+        let [one, sixteen] = runs.as_slice() else {
+            return Err("two runs expected".into());
+        };
+        assert_eq!(one.code, sixteen.code);
+        assert_eq!(
+            untimed(one.summary.clone()),
+            untimed(sixteen.summary.clone())
+        );
+        assert_eq!(one.findings, sixteen.findings);
+        assert_eq!(one.inventory, sixteen.inventory);
+        // The HTML report, without its timing lines.
+        let untimed_html = |html: &str| {
+            html.lines()
+                .filter(|line| !line.contains("class=\"timing\""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(untimed_html(&one.html), untimed_html(&sixteen.html));
+        assert!(one.html.contains("<h2>PII inventory</h2>"));
+        assert_eq!(one.stderr, sixteen.stderr);
+        assert_ne!(one.inventory, "");
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "needs a seeded S3-compatible server; see this file's header"]
 fn without_pii_nothing_is_read() -> TestResult {
@@ -693,5 +764,8 @@ fn without_pii_nothing_is_read() -> TestResult {
     assert_eq!(run.summary.get("coverage"), Some(&Value::Null));
     assert_eq!(run.summary.get("pii_inventory"), Some(&Value::Null));
     assert!(pii_found(&run).is_empty());
+    // Without --pii, the HTML report has the metadata sections only.
+    assert!(run.html.contains("<h2>Metadata findings</h2>"));
+    assert!(!run.html.contains("PII inventory"));
     Ok(())
 }

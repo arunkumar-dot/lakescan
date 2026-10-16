@@ -2,58 +2,17 @@
 //! small Parquet builder on top of the `parquet` crate's own writer, so
 //! unit tests build exactly the files they need.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-
-use aws_sdk_s3::primitives::{AggregatedBytes, ByteStream};
+use parquet::basic::{LogicalType, Repetition, Type as Physical};
 use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
 use parquet::errors::ParquetError;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::parser::parse_message_type;
+use parquet::schema::types::Type;
+use std::sync::Arc;
 
-use super::fetch::{FetchError, ObjectReader};
-
-/// Objects held in memory, by key. Keys in `denied` answer every read with
-/// [`FetchError::AccessDenied`].
-#[derive(Debug, Default, Clone)]
-pub(crate) struct MemoryReader {
-    pub(crate) objects: BTreeMap<String, Vec<u8>>,
-    pub(crate) denied: BTreeSet<String>,
-    /// Every `(key, start, end)` read, in order.
-    pub(crate) reads: Vec<(String, u64, u64)>,
-}
-
-impl MemoryReader {
-    pub(crate) fn with(mut self, key: &str, body: Vec<u8>) -> Self {
-        self.objects.insert(key.to_owned(), body);
-        self
-    }
-}
-
-impl ObjectReader for MemoryReader {
-    async fn read_range(
-        &mut self,
-        key: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<AggregatedBytes, FetchError> {
-        self.reads.push((key.to_owned(), start, end));
-        if self.denied.contains(key) {
-            return Err(FetchError::AccessDenied);
-        }
-        let body = self.objects.get(key).ok_or(FetchError::Failed)?;
-        let from = usize::try_from(start).map_err(|_| FetchError::Failed)?;
-        let to = usize::try_from(end).map_err(|_| FetchError::Failed)?;
-        let slice = body
-            .get(from..to.min(body.len()))
-            .ok_or(FetchError::Failed)?;
-        ByteStream::from(slice.to_vec())
-            .collect()
-            .await
-            .map_err(|_| FetchError::Failed)
-    }
-}
+/// The in-memory reader the tests use: [`SimStore`](super::SimStore)
+/// with no latency.
+pub(crate) type MemoryReader = super::SimStore;
 
 /// One column of a test file.
 pub(crate) enum Values {
@@ -70,14 +29,34 @@ pub(crate) enum Values {
 }
 
 impl Values {
-    fn schema_line(&self, name: &str) -> String {
-        match self {
-            Self::Text(_) => format!("optional binary {name} (STRING);"),
-            Self::Int64(_) => format!("optional int64 {name};"),
-            Self::Date(_) => format!("optional int32 {name} (DATE);"),
-            Self::Double(_) => format!("required double {name};"),
-            Self::RepeatedText(_) => format!("repeated binary {name} (STRING);"),
-        }
+    /// The column's schema type, built rather than parsed from text, so a
+    /// name may hold any character (hostile-name tests rely on that).
+    fn schema_type(&self, name: &str) -> parquet::errors::Result<Arc<Type>> {
+        let (physical, repetition, logical) = match self {
+            Self::Text(_) => (
+                Physical::BYTE_ARRAY,
+                Repetition::OPTIONAL,
+                Some(LogicalType::String),
+            ),
+            Self::Int64(_) => (Physical::INT64, Repetition::OPTIONAL, None),
+            Self::Date(_) => (
+                Physical::INT32,
+                Repetition::OPTIONAL,
+                Some(LogicalType::Date),
+            ),
+            Self::Double(_) => (Physical::DOUBLE, Repetition::REQUIRED, None),
+            Self::RepeatedText(_) => (
+                Physical::BYTE_ARRAY,
+                Repetition::REPEATED,
+                Some(LogicalType::String),
+            ),
+        };
+        Ok(Arc::new(
+            Type::primitive_type_builder(name, physical)
+                .with_repetition(repetition)
+                .with_logical_type(logical)
+                .build()?,
+        ))
     }
 
     fn len(&self) -> usize {
@@ -135,15 +114,15 @@ pub(crate) fn parquet_file(
     layout: Layout,
 ) -> parquet::errors::Result<Vec<u8>> {
     let rows = columns.first().map_or(0, |(_, values)| values.len());
-    let schema = format!(
-        "message test {{ {} }}",
-        columns
-            .iter()
-            .map(|(name, values)| values.schema_line(name))
-            .collect::<Vec<_>>()
-            .join(" ")
+    let fields = columns
+        .iter()
+        .map(|(name, values)| values.schema_type(name))
+        .collect::<parquet::errors::Result<Vec<_>>>()?;
+    let schema = Arc::new(
+        Type::group_type_builder("test")
+            .with_fields(fields)
+            .build()?,
     );
-    let schema = Arc::new(parse_message_type(&schema)?);
     let mut props = WriterProperties::builder()
         .set_dictionary_enabled(layout.dictionary)
         .set_data_page_row_count_limit(usize::MAX)

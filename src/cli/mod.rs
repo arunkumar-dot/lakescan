@@ -30,10 +30,17 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use self::driver::{Content, Outputs};
 use self::target::Target;
-use crate::content::{DEFAULT_WHOLE_FILE_MAX, MAX_WHOLE_FILE_MAX, S3ObjectReader};
+use std::sync::Arc;
+
+use crate::content::{
+    DEFAULT_COALESCE_GAP, DEFAULT_CONCURRENCY, DEFAULT_MEMORY_BUDGET, DEFAULT_WHOLE_FILE_MAX,
+    MAX_CONCURRENCY, MAX_WHOLE_FILE_MAX, MemoryBudget, ObjectReader, S3ObjectReader, ScanOptions,
+    file_need,
+};
 use crate::error::{ExitCode, LakeScanError};
 use crate::model::{RuleId, Severity};
 use crate::report::Format;
+use crate::scanner::PageSource;
 use crate::scanner::S3Source;
 use crate::suppress::Config;
 
@@ -48,7 +55,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Scan a bucket (or one prefix of it) and report what the rules find.
-    Scan(ScanArgs),
+    Scan(Box<ScanArgs>),
     /// List every rule's code and title.
     Rules,
 }
@@ -109,12 +116,51 @@ struct ScanArgs {
     )]
     pii_whole_file_max: u64,
 
+    /// With --pii, scan up to N Parquet files at once. 1 to 256.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_CONCURRENCY_FLAG,
+        value_parser = clap::value_parser!(u16).range(1..=256),
+        requires = "pii"
+    )]
+    concurrency: u16,
+
+    /// With --pii, the most BYTES in-flight file scans may hold at once.
+    /// Must cover the most one file can need (see the README).
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = DEFAULT_MEMORY_BUDGET,
+        requires = "pii"
+    )]
+    memory_budget: u64,
+
+    /// With --pii, read page ranges of a file at most BYTES apart as one
+    /// request (each at most 8 MiB). 0 reads each range alone.
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = DEFAULT_COALESCE_GAP,
+        requires = "pii"
+    )]
+    coalesce_gap: u64,
+
     /// With --pii, also write the PII inventory as CSV to PATH, one row
     /// per (table, column, rule) ("-" for stdout, which requires --output
     /// to name a file and --findings not to be "-").
     #[arg(long, value_name = "PATH", requires = "pii")]
     inventory: Option<PathBuf>,
+
+    /// Also write a self-contained HTML report to PATH ("-" for stdout,
+    /// which requires every other output to go to a file).
+    #[arg(long, value_name = "PATH")]
+    html: Option<PathBuf>,
 }
+
+/// `--concurrency`'s default, as the flag's type; equal to
+/// [`DEFAULT_CONCURRENCY`] (a test checks).
+const DEFAULT_CONCURRENCY_FLAG: u16 = 16;
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
 enum FormatArg {
@@ -214,7 +260,7 @@ where
     };
 
     match cli.command {
-        Command::Scan(args) => scan(args).await,
+        Command::Scan(args) => scan(*args).await,
         Command::Rules => {
             write_rules(out)?;
             Ok(ExitCode::Ok)
@@ -267,24 +313,7 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         .transpose()?
         .unwrap_or_default();
 
-    let summary_to_stdout = args.output.as_deref().is_none_or(is_stdout);
-    let findings_to_stdout = args.findings.as_deref().is_some_and(is_stdout);
-    let inventory_to_stdout = args.inventory.as_deref().is_some_and(is_stdout);
-    if summary_to_stdout && findings_to_stdout {
-        return Err(LakeScanError::Usage(
-            "--findings - streams findings to stdout, so --output must name a file".to_owned(),
-        ));
-    }
-    if summary_to_stdout && inventory_to_stdout {
-        return Err(LakeScanError::Usage(
-            "--inventory - writes the inventory to stdout, so --output must name a file".to_owned(),
-        ));
-    }
-    if findings_to_stdout && inventory_to_stdout {
-        return Err(LakeScanError::Usage(
-            "--findings - and --inventory - cannot both write to stdout".to_owned(),
-        ));
-    }
+    check_stdout(&args)?;
     if args.region.as_deref().is_some_and(str::is_empty) {
         return Err(LakeScanError::Usage(
             "--region must not be empty".to_owned(),
@@ -302,6 +331,16 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
             "--pii-whole-file-max {} is too large: at most {MAX_WHOLE_FILE_MAX} (64 MiB)",
             args.pii_whole_file_max
         )));
+    }
+
+    let concurrency = usize::from(args.concurrency);
+    let budget = content_budget(args.memory_budget, concurrency, args.pii_whole_file_max)?;
+    if args.pii
+        && !args.quiet
+        && let Some(warning) = share_warning(&budget, concurrency, args.pii_whole_file_max)
+    {
+        // Best effort: a warning that cannot be printed changes nothing.
+        let _ = writeln!(io::stderr(), "{warning}");
     }
 
     let source = S3Source::new(
@@ -325,13 +364,23 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         .as_deref()
         .map(|path| open_destination(Some(path)))
         .transpose()?;
+    let html = args
+        .html
+        .as_deref()
+        .map(|path| open_destination(Some(path)))
+        .transpose()?;
 
     let stderr = io::stderr();
     let progress = (!args.quiet && stderr.is_terminal()).then_some(io::stderr());
     let warnings = (!args.quiet).then_some(io::stderr());
     let content = args.pii.then(|| Content {
-        reader: S3ObjectReader::new(source.client(), target.bucket.clone()),
-        whole_file_max: args.pii_whole_file_max,
+        reader: S3ObjectReader::new(&source.client(), &target.bucket),
+        options: ScanOptions {
+            whole_file_max: args.pii_whole_file_max,
+            coalesce_gap: args.coalesce_gap,
+        },
+        concurrency,
+        budget,
     });
 
     driver::scan(
@@ -345,9 +394,159 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
             summary,
             findings,
             inventory,
+            html,
             progress,
             warnings,
             errors: stderr,
+        },
+    )
+    .await
+}
+
+/// At most one output may go to stdout. The summary does unless
+/// `--output` names a file; `--findings`, `--inventory` and `--html` do
+/// when given `-`.
+fn check_stdout(args: &ScanArgs) -> Result<(), LakeScanError> {
+    let mut on_stdout: Vec<&str> = Vec::new();
+    if args.output.as_deref().is_none_or(is_stdout) {
+        on_stdout.push("the summary");
+    }
+    for (flag, path) in [
+        ("--findings -", &args.findings),
+        ("--inventory -", &args.inventory),
+        ("--html -", &args.html),
+    ] {
+        if path.as_deref().is_some_and(is_stdout) {
+            on_stdout.push(flag);
+        }
+    }
+    match on_stdout.as_slice() {
+        [] | [_] => Ok(()),
+        ["the summary", flag, ..] => Err(LakeScanError::Usage(format!(
+            "{flag} writes to stdout, so --output must name a file"
+        ))),
+        [first, second, ..] => Err(LakeScanError::Usage(format!(
+            "{first} and {second} cannot both write to stdout"
+        ))),
+    }
+}
+
+/// The run's memory budget, refused (a usage error) if it is below the
+/// most one file can need, since that file could then never get its
+/// permits.
+fn content_budget(
+    memory_budget: u64,
+    concurrency: usize,
+    whole_file_max: u64,
+) -> Result<Arc<MemoryBudget>, LakeScanError> {
+    MemoryBudget::new(memory_budget, concurrency, file_need(whole_file_max))
+        .map(Arc::new)
+        .map_err(|too_small| {
+            LakeScanError::Usage(format!(
+                "--memory-budget {memory_budget} is below the most one file can need, {} bytes \
+                 at --pii-whole-file-max {whole_file_max}",
+                too_small.file_need
+            ))
+        })
+}
+
+/// The startup warning for a budget whose per-file share is below the
+/// whole-file maximum: files read whole would then take turns in the
+/// budget's overflow lane, one at a time (see `content::MemoryBudget`).
+fn share_warning(budget: &MemoryBudget, concurrency: usize, whole_file_max: u64) -> Option<String> {
+    (budget.quota() < whole_file_max).then(|| {
+        format!(
+            "lakescan: warning: --memory-budget {} leaves each of --concurrency {concurrency} \
+             files {} bytes, less than --pii-whole-file-max {whole_file_max}, so larger files \
+             will be scanned one at a time; use a larger --memory-budget or a lower \
+             --concurrency",
+            budget.total(),
+            budget.quota()
+        )
+    })
+}
+
+/// Content scanning settings for [`scan_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct ContentSettings {
+    /// `--pii-whole-file-max`.
+    pub whole_file_max: u64,
+    /// `--concurrency`.
+    pub concurrency: usize,
+    /// `--memory-budget`.
+    pub memory_budget: u64,
+    /// `--coalesce-gap`.
+    pub coalesce_gap: u64,
+}
+
+impl Default for ContentSettings {
+    fn default() -> Self {
+        Self {
+            whole_file_max: DEFAULT_WHOLE_FILE_MAX,
+            concurrency: DEFAULT_CONCURRENCY,
+            memory_budget: DEFAULT_MEMORY_BUDGET,
+            coalesce_gap: DEFAULT_COALESCE_GAP,
+        }
+    }
+}
+
+/// Runs one scan of `bucket` from any listing source and, with `content`,
+/// any object reader, writing the summary (in `format`) to `summary` and,
+/// if given, the findings stream to `findings`. No config, no failing
+/// threshold. For benchmarks and embedding; the `lakescan` command uses
+/// the same driver.
+///
+/// # Errors
+/// [`LakeScanError::Usage`] for a budget below one file's need, and
+/// whatever the scan itself returns.
+pub async fn scan_with<S, R, O, F>(
+    source: S,
+    bucket: &str,
+    content: Option<(R, ContentSettings)>,
+    format: Format,
+    summary: O,
+    findings: Option<F>,
+) -> Result<ExitCode, LakeScanError>
+where
+    S: PageSource,
+    R: ObjectReader,
+    O: Write,
+    F: Write,
+{
+    let content = match content {
+        Some((reader, settings)) => Some(Content {
+            reader,
+            options: ScanOptions {
+                whole_file_max: settings.whole_file_max,
+                coalesce_gap: settings.coalesce_gap,
+            },
+            concurrency: settings.concurrency.clamp(1, MAX_CONCURRENCY),
+            budget: content_budget(
+                settings.memory_budget,
+                settings.concurrency.clamp(1, MAX_CONCURRENCY),
+                settings.whole_file_max,
+            )?,
+        }),
+        None => None,
+    };
+    driver::scan(
+        source,
+        Target {
+            bucket: bucket.to_owned(),
+            prefix: None,
+        },
+        Config::default(),
+        format,
+        None,
+        content,
+        Outputs {
+            summary,
+            findings,
+            inventory: None,
+            html: None,
+            progress: None::<io::Sink>,
+            warnings: None::<io::Sink>,
+            errors: io::sink(),
         },
     )
     .await
@@ -458,6 +657,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_small_per_file_share_warns_once_and_the_defaults_do_not() {
+        use crate::content::{
+            DEFAULT_CONCURRENCY, DEFAULT_MEMORY_BUDGET, DEFAULT_WHOLE_FILE_MAX, MemoryBudget,
+            file_need,
+        };
+        let need = file_need(DEFAULT_WHOLE_FILE_MAX);
+        let quiet = MemoryBudget::new(DEFAULT_MEMORY_BUDGET, DEFAULT_CONCURRENCY, need);
+        assert!(quiet.as_ref().is_ok_and(|b| {
+            super::share_warning(b, DEFAULT_CONCURRENCY, DEFAULT_WHOLE_FILE_MAX).is_none()
+        }));
+        let crowded = MemoryBudget::new(DEFAULT_MEMORY_BUDGET, 64, need);
+        let warning = crowded
+            .as_ref()
+            .ok()
+            .and_then(|b| super::share_warning(b, 64, DEFAULT_WHOLE_FILE_MAX));
+        assert!(
+            warning
+                .as_ref()
+                .is_some_and(|w| w.starts_with("lakescan: warning:")
+                    && w.contains("--concurrency 64")
+                    && w.contains("larger --memory-budget")
+                    && !w.contains('\n')),
+            "{warning:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_memory_budget_below_one_file_s_need_is_a_usage_error() {
+        let need = crate::content::file_need(crate::content::DEFAULT_WHOLE_FILE_MAX);
+        let budget = (need - 1).to_string();
+        let message = usage_error(&[
+            "lakescan",
+            "scan",
+            "s3://b",
+            "--pii",
+            "--memory-budget",
+            &budget,
+        ])
+        .await;
+        assert!(
+            message
+                .as_ref()
+                .is_some_and(|m| m.contains("below the most one file can need")
+                    && m.contains(&need.to_string())),
+            "{message:?}"
+        );
+        // A bigger whole-file maximum needs more.
+        let big = usage_error(&[
+            "lakescan",
+            "scan",
+            "s3://b",
+            "--pii",
+            "--pii-whole-file-max",
+            "67108864",
+            "--memory-budget",
+            &need.to_string(),
+        ])
+        .await;
+        assert!(big.is_some(), "{big:?}");
+        assert_eq!(
+            usize::from(super::DEFAULT_CONCURRENCY_FLAG),
+            crate::content::DEFAULT_CONCURRENCY
+        );
+    }
+
     #[tokio::test]
     async fn parse_errors_are_one_line_usage_errors() {
         for args in [
@@ -473,6 +738,39 @@ mod tests {
                 message.as_ref().is_some_and(|m| !m.contains('\n')),
                 "{args:?} gave {message:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_one_output_may_write_to_stdout() {
+        for args in [
+            // --html - needs stdout to itself.
+            ["lakescan", "scan", "s3://b", "--html", "-"].as_slice(),
+            &[
+                "lakescan",
+                "scan",
+                "s3://b",
+                "--html",
+                "-",
+                "--findings",
+                "-",
+                "--output",
+                "summary.txt",
+            ],
+            &[
+                "lakescan",
+                "scan",
+                "s3://b",
+                "--pii",
+                "--html",
+                "-",
+                "--inventory",
+                "-",
+                "--output",
+                "summary.txt",
+            ],
+        ] {
+            assert!(usage_error(args).await.is_some(), "{args:?}");
         }
     }
 
@@ -516,6 +814,25 @@ mod tests {
                 "-1",
             ],
             &["lakescan", "scan", "s3://b", "--pii-whole-file-max", "1024"],
+            // --concurrency is 1 to 256; the M9 flags need --pii.
+            &["lakescan", "scan", "s3://b", "--pii", "--concurrency", "0"],
+            &[
+                "lakescan",
+                "scan",
+                "s3://b",
+                "--pii",
+                "--concurrency",
+                "257",
+            ],
+            &["lakescan", "scan", "s3://b", "--concurrency", "4"],
+            &[
+                "lakescan",
+                "scan",
+                "s3://b",
+                "--memory-budget",
+                "1000000000",
+            ],
+            &["lakescan", "scan", "s3://b", "--coalesce-gap", "0"],
             // --inventory needs --pii, and stdout to itself.
             &["lakescan", "scan", "s3://b", "--inventory", "inv.csv"],
             &["lakescan", "scan", "s3://b", "--pii", "--inventory", "-"],
