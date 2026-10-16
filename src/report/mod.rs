@@ -224,7 +224,8 @@
 //!       }
 //!     ]
 //!   },
-//!   "largest_objects": [ /* same shape as a sample, minus "severity" */ ],
+//!   "largest_objects": [ /* same shape as a sample, with "severity" */
+//!                        /* always null */ ],
 //!   "size_histogram": [            // non-empty buckets only, ascending
 //!     { "lower": integer, "upper": integer | null, "count": integer, "bytes": integer }
 //!   ],
@@ -438,6 +439,142 @@ mod tests {
             &fixture::aggregates(),
         );
         assert!(matches!(result, Err(LakeScanError::Report(_))));
+    }
+
+    /// The objects whose keys are codes rather than field names, by path
+    /// (`[]` for any list element), and the placeholder the schema doc
+    /// writes for them.
+    const CODE_MAPS: [(&str, &str); 3] = [
+        ("content.not_scanned", "\"not-parquet\": integer"),
+        ("pii_inventory.tables.[].not_scanned", "\"<reason code>\""),
+        ("samples", "\"<rule code>\""),
+    ];
+
+    /// Every object key anywhere in `value`, with the path of the object
+    /// holding it.
+    fn collect_keys(value: &serde_json::Value, path: &str, out: &mut Vec<(String, String)>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    out.push((path.to_owned(), key.clone()));
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    collect_keys(child, &child_path, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_keys(item, &format!("{path}.[]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `value` is a non-empty object or list.
+    fn filled(value: Option<&serde_json::Value>) -> bool {
+        match value {
+            Some(serde_json::Value::Object(map)) => !map.is_empty(),
+            Some(serde_json::Value::Array(items)) => !items.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// The text after the first `start` in `text`, up to the next `end`.
+    fn section<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+        let from = text
+            .find(start)
+            .map_or(text, |at| text.get(at..).unwrap_or(""));
+        let body = from.get(start.len()..).unwrap_or("");
+        body.find(end).and_then(|at| body.get(..at)).unwrap_or(body)
+    }
+
+    /// Drift guard: every key the JSON summary can carry is documented, in
+    /// README.md's "JSON output" section (as `` `key` ``) and in this
+    /// module's schema block (as `"key"`). Keys of the maps keyed by codes
+    /// (`CODE_MAPS`) are rule or reason codes: those must be documented
+    /// anywhere in README.md, and the schema shows their placeholder.
+    #[test]
+    fn every_json_summary_key_is_documented() -> Result<(), Box<dyn std::error::Error>> {
+        let readme_all = include_str!("../../README.md");
+        let readme = section(readme_all, "\n## JSON output\n", "\n## ");
+        let source = include_str!("mod.rs");
+        let schema = section(source, "//! # JSON summary schema", "//! ```\n//!\n");
+        assert!(
+            schema.contains("\"schema_version\""),
+            "schema block not found"
+        );
+
+        let mut buf = Vec::new();
+        write_summary(
+            &mut buf,
+            Format::Json,
+            &fixture::scan_info(),
+            &fixture::aggregates(),
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&buf)?;
+
+        // The fixture must populate every section, or keys could hide.
+        for pointer in [
+            "/content",
+            "/coverage",
+            "/pii_inventory/summary",
+            "/pii_inventory/tables",
+            "/suppressions/expired",
+            "/suppressions/unused",
+            "/findings",
+            "/samples",
+            "/largest_objects",
+            "/size_histogram",
+            "/age_histogram",
+        ] {
+            assert!(
+                filled(value.pointer(pointer)),
+                "the report fixture leaves {pointer} empty"
+            );
+        }
+        let tables = value
+            .pointer("/pii_inventory/tables")
+            .and_then(serde_json::Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        for field in ["columns", "not_scanned"] {
+            assert!(
+                tables.iter().any(|table| filled(table.get(field))),
+                "the report fixture has no table with {field}"
+            );
+        }
+
+        let mut keys = Vec::new();
+        collect_keys(&value, "", &mut keys);
+        let mut missing = Vec::new();
+        for (parent, key) in &keys {
+            if let Some((_, placeholder)) = CODE_MAPS.iter().find(|(path, _)| path == parent) {
+                if !readme_all.contains(&format!("`{key}`")) {
+                    missing.push(format!("README.md: code `{key}` (in {parent})"));
+                }
+                if !schema.contains(placeholder) && !schema.contains(&format!("\"{key}\"")) {
+                    missing.push(format!("schema doc: \"{key}\" (in {parent})"));
+                }
+                continue;
+            }
+            if !readme.contains(&format!("`{key}`")) {
+                missing.push(format!("README.md JSON output: `{key}` (in {parent:?})"));
+            }
+            if !schema.contains(&format!("\"{key}\"")) {
+                missing.push(format!("schema doc: \"{key}\" (in {parent:?})"));
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "undocumented JSON keys:\n{}",
+            missing.join("\n")
+        );
+        Ok(())
     }
 
     #[test]

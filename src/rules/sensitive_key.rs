@@ -27,12 +27,21 @@ const HIGH_EXACT_BASENAMES: &[&str] = &[
     "id_ed25519",
 ];
 
+/// A basename prefix that is High on its own (`.env.production`), except
+/// for [`ENV_TEMPLATE_EXCEPTIONS`].
+const HIGH_ENV_PREFIX: &str = ".env.";
+
 /// `.env.`-prefixed basenames that are templates, not real secrets, and so
-/// are exempt from the `.env.*` High match below.
+/// are exempt from the [`HIGH_ENV_PREFIX`] match.
 const ENV_TEMPLATE_EXCEPTIONS: &[&str] = &[".env.example", ".env.sample", ".env.template"];
 
 /// Basename suffixes that are High on their own.
 const HIGH_SUFFIXES: &[&str] = &[".tfstate", ".tfstate.backup", ".ppk", ".kdbx"];
+
+/// `(directory, basename)`: High when the basename sits directly inside a
+/// path segment named the directory (`.aws/credentials`, the AWS CLI's
+/// shared credentials file).
+const HIGH_IN_DIRECTORY: (&str, &str) = (".aws", "credentials");
 
 /// Basename suffixes that are Medium.
 const MEDIUM_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"];
@@ -59,7 +68,7 @@ fn is_high(key: &str, basename: &str) -> bool {
         return true;
     }
 
-    if starts_with_ignore_ascii_case(basename, ".env.")
+    if starts_with_ignore_ascii_case(basename, HIGH_ENV_PREFIX)
         && !matches_any_exact(ENV_TEMPLATE_EXCEPTIONS, basename)
     {
         return true;
@@ -69,7 +78,8 @@ fn is_high(key: &str, basename: &str) -> bool {
         return true;
     }
 
-    basename.eq_ignore_ascii_case("credentials") && preceding_segment_is(key, ".aws")
+    let (directory, name) = HIGH_IN_DIRECTORY;
+    basename.eq_ignore_ascii_case(name) && preceding_segment_is(key, directory)
 }
 
 fn is_medium(key: &str, basename: &str) -> bool {
@@ -284,5 +294,51 @@ mod tests {
 
         // A multibyte basename that genuinely ends in a matched suffix.
         assert_eq!(severity_for("日本語.pem"), Some(Severity::Medium));
+    }
+
+    /// The `sensitive-key` row of README.md's rules table, split into its
+    /// High part and its Medium part.
+    fn readme_row() -> (&'static str, &'static str) {
+        let readme = include_str!("../../README.md");
+        let row = readme
+            .lines()
+            .find(|line| line.starts_with("| `sensitive-key` |"))
+            .unwrap_or("");
+        row.split_once("Medium:").unwrap_or((row, ""))
+    }
+
+    /// Drift guard: every pattern the rule matches, read from the same
+    /// constants it uses, is documented in README.md under its severity.
+    #[test]
+    fn every_pattern_is_documented_in_the_readme_under_its_severity() {
+        let (high, medium) = readme_row();
+        assert!(high.contains("High:"), "README.md has no sensitive-key row");
+
+        let (directory, name) = super::HIGH_IN_DIRECTORY;
+        let mut expected_high: Vec<String> = super::HIGH_EXACT_BASENAMES
+            .iter()
+            .chain(super::ENV_TEMPLATE_EXCEPTIONS)
+            .chain(super::HIGH_SUFFIXES)
+            .map(|pattern| format!("`{pattern}`"))
+            .collect();
+        expected_high.push(format!("`{}*`", super::HIGH_ENV_PREFIX));
+        expected_high.push(format!("`{directory}/{name}`"));
+        for pattern in &expected_high {
+            assert!(
+                high.contains(pattern.as_str()),
+                "README.md's sensitive-key High list lacks {pattern}"
+            );
+        }
+
+        let expected_medium = super::MEDIUM_SUFFIXES
+            .iter()
+            .chain(super::MEDIUM_SEGMENTS)
+            .map(|pattern| format!("`{pattern}`"));
+        for pattern in expected_medium {
+            assert!(
+                medium.contains(pattern.as_str()),
+                "README.md's sensitive-key Medium list lacks {pattern}"
+            );
+        }
     }
 }

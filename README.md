@@ -130,7 +130,7 @@ last-modified time, ETag, and storage class.
 
 | Code | Severities | Flags | Why |
 |---|---|---|---|
-| `sensitive-key` | high, medium | High: a key whose name is a secret file on its own (`.env`, `.env.*` except `.example`/`.sample`/`.template`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `.htpasswd`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`) or ends in `.tfstate`, `.tfstate.backup`, `.ppk`, `.kdbx`. Medium: a name ending in `.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, or any key under a `.git/` or `.ssh/` directory. Matching is case-insensitive. | Credentials in a data lake get copied, shared and exposed far more easily than credentials in a secrets manager. |
+| `sensitive-key` | high, medium | High: a key whose name is a secret file on its own (`.env`, `.env.*` except `.env.example`, `.env.sample` and `.env.template`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `.htpasswd`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`), ends in `.tfstate`, `.tfstate.backup`, `.ppk`, `.kdbx`, or is `.aws/credentials` (a file named `credentials` directly inside a `.aws` directory, at any depth). Medium: a name ending in `.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, or any key with a `.git` or `.ssh` path segment (anything under a `.git/` or `.ssh/` directory). Matching is case-insensitive. | Credentials in a data lake get copied, shared and exposed far more easily than credentials in a secrets manager. |
 | `reduced-redundancy` | medium | Objects in `REDUCED_REDUNDANCY`. | The class is deprecated: it gives up durability and is no longer cheaper than `STANDARD`. |
 | `stale-standard` | low, medium | `STANDARD` objects unmodified for more than 90 days. Low at 128 KiB or more, medium at 1 GiB or more. Smaller objects are never flagged. | They are candidates for a cheaper class or a lifecycle rule. Below 128 KiB, IA classes bill a minimum size and Intelligent-Tiering won't tier the object, so moving it would cost more. |
 | `small-object-cold-tier` | low | Objects under 128 KiB in `STANDARD_IA`, `ONEZONE_IA`, `GLACIER_IR`, `GLACIER` or `DEEP_ARCHIVE`. | These classes bill a minimum object size (and Glacier adds per-object overhead), so small objects cost more there than in `STANDARD`. |
@@ -547,19 +547,26 @@ covers:
 [`src/report/mod.rs`](src/report/mod.rs). Its top-level fields:
 
 - `schema_version`: currently `1`
-- `tool`: name and version
-- `scan`: bucket, prefix, start time (RFC 3339, UTC) and elapsed milliseconds
+- `tool`: `name` and `version`
+- `scan`: `bucket`, `prefix` (or `null`), `started_at` (RFC 3339, UTC) and
+  `elapsed_ms`
 - `verdict`: `worst_severity`, or `null`
-- `inventory`: object and byte totals, overall and per storage class
-- `findings`: per rule, counts and bytes per severity plus `suppressed`
-  `{count, bytes}`. For `content-not-scanned`, `bytes` is the size of the
-  file. For PII rules, both byte totals are always `0`, as not applicable:
-  their findings are about columns, and a file's size would be counted once
-  per column. The text summary shows `-` for them.
-- `content`: with `--pii`, Parquet files found, scanned whole or partially,
-  and not scanned by reason; columns examined and skipped by reason
-  (`repeated`, `unsupported_type`, `page_too_large`, `unreadable`,
-  `unsupported_codec`); bytes read and `GET` requests. `null` without
+- `inventory`: `object_count` and `total_bytes`; `by_storage_class`, one
+  entry per known class with objects, with `storage_class`, `count` and
+  `bytes`; `unrecognized_storage_classes` (their names, at most the 8
+  smallest) and `unrecognized_storage_class_totals` (`count` and `bytes`
+  of every such object)
+- `findings`: per rule, its `rule` code and `title`; `counts` and `bytes`,
+  each keyed by severity (`critical`, `high`, `medium`, `low`, `info`);
+  and `suppressed` `{count, bytes}`. For `content-not-scanned`, `bytes` is
+  the size of the file. For PII rules, both byte totals are always `0`, as
+  not applicable: their findings are about columns, and a file's size
+  would be counted once per column. The text summary shows `-` for them.
+- `content`: with `--pii`, Parquet files found (`files_eligible`),
+  `scanned_whole`, `scanned_partially`, and `not_scanned` by reason (every
+  reason code, `0` when none); `columns_examined`, and `columns_skipped` by
+  reason (`repeated`, `unsupported_type`, `page_too_large`, `unreadable`,
+  `unsupported_codec`); `bytes_read` and `get_requests`. `null` without
   `--pii`.
 - `coverage`: with `--pii`, `files_eligible`, `files_scanned`,
   `not_scanned_suppressed`, `not_scanned_unsuppressed`, and `percent`
@@ -568,23 +575,34 @@ covers:
 - `pii_inventory`: with `--pii`, `tables` (sorted by name), each with
   `table`, `status` (`pii_found`, `no_pii_in_scanned_files` or
   `not_scanned`), `files_eligible`, `files_scanned`, `files_not_scanned`,
-  `not_scanned` (per reason with any, `{suppressed, unsuppressed}`),
+  `not_scanned` (per reason with any, its `suppressed` and `unsuppressed`
+  file counts),
   `example_key` (or `null`) and `columns` (sorted by column, then rule), each
   with `column`, `rule`, `highest_confidence`, `evidence`,
   `files_confirmed`, `files_likely`, `files_possible`, `files_suppressed`,
   `status` (`UNDOCUMENTED` or `documented`) and `reason` (or `null`); plus
   `summary` (`tables_with_pii`, `pii_columns`, `undocumented`, `documented`,
-  `tables_not_fully_scanned`), `left_out` (`files`, `findings`) and `caps`
-  (`tables`, `entries`). `null` without `--pii`.
-- `suppressions`: `expired` and `unused` entries
-- `samples`: up to 10 example findings per rule. A PII sample also has
-  `column`, `confidence` and `evidence` (`values` or `column-name`), plus
-  `matched` and `sampled` when the evidence is `values`. A
-  `content-not-scanned` sample has `reason`
-- `largest_objects`: the 20 largest objects
-- `size_histogram`, `age_histogram`
-- `distinct_content`: an ETag-based estimate of distinct content, plus
-  `duplicates_significant` (whether the duplicates exceed estimator error)
+  `tables_not_fully_scanned`, and `tables_not_fully_scanned_documented`:
+  of those, the tables whose every unscanned file is documented),
+  `left_out` (`files`, `findings`) and `caps` (`tables`, `entries`). `null`
+  without `--pii`.
+- `suppressions`: `expired` and `unused` entries, each with `rule`, `key`
+  or `prefix`, `reason`, `expires` (`YYYY-MM-DD`, or `null`), and `column`
+  when the entry has one
+- `samples`: up to 10 example findings per rule, keyed by rule code. Each
+  has `key`, `key_truncated`, `severity`, `size`, `storage_class` and
+  `last_modified`. A PII sample also has `column`, `confidence` and
+  `evidence` (`values` or `column-name`), plus `matched` and `sampled` when
+  the evidence is `values`. A `content-not-scanned` sample has `reason`
+- `largest_objects`: the 20 largest objects, shaped like a sample, with
+  `severity` always `null`
+- `size_histogram`: non-empty buckets, ascending, each with `lower` and
+  `upper` bounds in bytes (`upper` is `null` for the open-ended top
+  bucket), `count` and `bytes`; `age_histogram` likewise, with its bounds
+  as `lower_seconds` and `upper_seconds`
+- `distinct_content`: an ETag-based `estimate` of distinct content, a
+  `duplicate_lower_bound`, and `duplicates_significant` (whether the
+  duplicates exceed estimator error)
 
 `--findings` writes one JSON object per line:
 `{"key", "rule", "severity", "size", "storage_class", "last_modified"}`, plus
