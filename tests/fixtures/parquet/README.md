@@ -5,6 +5,29 @@ Small, committed Parquet files used by the unit tests
 (`tests/e2e_pii.rs`, uploaded to moto by `examples/seed_local.rs`). They are
 synthetic: every name, email, number and address is generated.
 
+## Reserved values
+
+Wherever a reserved range exists, the fixtures use only values from it, so
+no value can belong to a real person, host, phone line or card:
+
+- Emails: the domains `example.com`, `example.org` and `example.net`
+  (RFC 2606) and names under `.test` (RFC 6761).
+- IPv4: `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24` (RFC 5737).
+  IPv6: `2001:db8::/32` (RFC 3849).
+- US phone numbers: `+1 415 555-0100` to `555-0199`, the range the North
+  American Numbering Plan reserves for fiction.
+- Card numbers: the card networks' published test numbers, eleven of them
+  (four Visa, three Mastercard, two American Express, two Discover), so no
+  single number is more than about 10% of a column. LakeScan drops a value
+  that makes up over half of a sample, so a column of one test number
+  would test nothing.
+
+Aadhaar numbers, PAN numbers and Indian mobile numbers have no reserved
+ranges. Those are synthetic and randomly generated: Verhoeff-valid
+12-digit numbers, PAN-shaped strings, and 10-digit numbers starting 6 to
+9. Any match with a real number is a coincidence. Names are random
+combinations of common first and last names.
+
 | File | Writer | Rows | Row groups |
 |---|---|---:|---:|
 | `pyarrow/customers.parquet` | pyarrow 25.0.1 | 12,000 | 3 |
@@ -25,6 +48,12 @@ escalation have several row groups to work with. Spark writes one row group.
 The `gzip/` and `brotli/` files hold the same rows as the others, with only
 the codec changed (Athena writes GZIP Parquet by default for Hive tables).
 
+Spark writes no dictionary for its high-cardinality columns (`email`,
+`billing.email`, `pan`, `mobile_no`, `aadhaar_no`), so those are read from
+plain-encoded data pages. `contact`, `card_number` and `last_login_ip` draw
+from small reserved ranges, so Spark dictionary-encodes them, as the other
+writers do.
+
 ## Ground truth
 
 `customers.parquet`, every writer:
@@ -34,12 +63,12 @@ the codec changed (Athena writes GZIP Parquet by default for Hive tables).
 | `customer_id` | int64 | 1 to 12,000 | none |
 | `full_name` | string | names | `pii-person-name`, likely (name only) |
 | `email` | string | emails | `pii-email`, confirmed |
-| `contact` | string | phones: `+91 98765 43210`, `+919876543210`, 10-digit, US E.164 | `pii-phone`, confirmed |
+| `contact` | string | phones: `+91 98765 43210`, `+919876543210`, 10-digit, US E.164 in `+1415555` `0100`-`0199` | `pii-phone`, confirmed |
 | `mobile_no` | int64 | 10-digit Indian mobiles | `pii-phone`, confirmed |
 | `aadhaar_no` | int64 | Verhoeff-valid Aadhaar numbers | `pii-in-aadhaar`, confirmed |
 | `pan` | string | PAN numbers | `pii-in-pan`, confirmed |
-| `card_number` | string | Luhn-valid Visa numbers, 25% space-grouped | `pii-card-number`, confirmed |
-| `last_login_ip` | string | IPv4 (80%), IPv6 (20%) | `pii-ip-address`, confirmed |
+| `card_number` | string | published test numbers (Visa, Mastercard, American Express, Discover), 25% space-grouped as printed (4-6-5 for American Express) | `pii-card-number`, confirmed |
+| `last_login_ip` | string | IPv4 from the RFC 5737 ranges (80%), IPv6 from `2001:db8::/32` (20%) | `pii-ip-address`, confirmed |
 | `dob` | date | dates of birth | `pii-date-of-birth`, likely (name only) |
 | `email_sha256` | string | SHA-256 hex digests of the emails: a decoy | none |
 | `billing` | struct | `email` (emails), `city` | `billing.email`: `pii-email`, confirmed |

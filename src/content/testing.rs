@@ -200,10 +200,25 @@ pub(crate) fn parquet_file(
     writer.into_inner()
 }
 
-/// `n` distinct, valid email addresses.
+/// Reserved email domains (RFC 2606 and RFC 6761): no test address can
+/// belong to anyone.
+const EMAIL_DOMAINS: [&str; 7] = [
+    "example.com",
+    "example.org",
+    "example.net",
+    "mail.test",
+    "acme.test",
+    "shop.test",
+    "corp.test",
+];
+
+/// `n` distinct, valid email addresses, on reserved domains only.
 pub(crate) fn emails(n: usize) -> Vec<Option<String>> {
     (0..n)
-        .map(|i| Some(format!("person.{i}@example{}.com", i % 7)))
+        .map(|i| {
+            let domain = EMAIL_DOMAINS.get(i % EMAIL_DOMAINS.len()).copied();
+            Some(format!("person.{i}@{}", domain.unwrap_or("example.com")))
+        })
         .collect()
 }
 

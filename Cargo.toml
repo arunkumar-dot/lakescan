@@ -3,8 +3,13 @@ name = "lakescan"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
-description = "High-throughput S3 audit tool"
+description = "Finds personal data (PII) in S3 data lakes, starting with Parquet, and audits buckets from their object listing"
 license = "FSL-1.1-ALv2"
+repository = "https://github.com/arunkumar-dot/lakescan"
+homepage = "https://github.com/arunkumar-dot/lakescan"
+readme = "README.md"
+keywords = ["s3", "pii", "parquet", "audit", "privacy"]
+categories = ["command-line-utilities", "development-tools"]
 
 # Dependencies are only added or upgraded to releases at least 14 days old.
 [dependencies]

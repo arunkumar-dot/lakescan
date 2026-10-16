@@ -21,14 +21,59 @@ ten objects or ten billion uses the same memory.
 
 ## Install
 
-LakeScan is not published yet. Build it from source with Rust 1.94.1 or newer:
+Download the archive for your platform from the
+[Releases](https://github.com/arunkumar-dot/lakescan/releases) page, along
+with `SHA256SUMS`:
+
+| Platform | Archive |
+|---|---|
+| macOS, Apple silicon | `lakescan-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `lakescan-<version>-x86_64-apple-darwin.tar.gz` |
+| Linux, x86_64 | `lakescan-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux, arm64 (Graviton) | `lakescan-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+
+The Linux binaries need glibc 2.17 or newer: Amazon Linux 2023, Ubuntu 22.04
+and later, and most distributions since 2014. Each archive holds the
+`lakescan` binary, `LICENSE` and `README.md`.
+
+Verify the download against `SHA256SUMS`, then unpack it:
 
 ```sh
-git clone https://github.com/arunkumar-dot/lakescan.git
-cd lakescan
-cargo build --release
-./target/release/lakescan --version
+VERSION=0.1.0
+TARGET=x86_64-unknown-linux-gnu   # or one of the others above
+sha256sum --check --ignore-missing SHA256SUMS   # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
+tar -xzf "lakescan-$VERSION-$TARGET.tar.gz"
+cd "lakescan-$VERSION-$TARGET"
+./lakescan --version
 ```
+
+Once the repository is public, each archive also carries a signed build
+provenance attestation, linking it to the workflow run and commit that built
+it. Verify it with the [GitHub CLI](https://cli.github.com/):
+
+```sh
+gh attestation verify "lakescan-$VERSION-$TARGET.tar.gz" --repo arunkumar-dot/lakescan
+```
+
+**macOS: the binary is not signed.** macOS quarantines files downloaded by a
+browser and refuses to run an unsigned binary from one. Having verified the
+checksum, remove the quarantine attribute:
+
+```sh
+xattr -d com.apple.quarantine ./lakescan
+```
+
+(A download with `curl` or `gh release download` is not quarantined.)
+
+**From source**, with Rust 1.94.1 or newer:
+
+```sh
+cargo install --locked --git https://github.com/arunkumar-dot/lakescan.git --tag v0.1.0
+lakescan --version
+```
+
+Or clone the repository and run `cargo build --release`; the binary is
+`target/release/lakescan`.
 
 ## Quickstart: the local demo
 
@@ -544,9 +589,14 @@ covers:
 ## JSON output
 
 `--format json` writes one JSON object. The full schema is documented in
-[`src/report/mod.rs`](src/report/mod.rs). Its top-level fields:
+[`src/report/mod.rs`](src/report/mod.rs).
 
-- `schema_version`: currently `1`
+**`schema_version` 1 is stable** as of v0.1.0: it is a public contract, and
+a consumer written against it keeps working with every later release that
+still reports version 1 (see the compatibility policy below). Its top-level
+fields:
+
+- `schema_version`: `1`
 - `tool`: `name` and `version`
 - `scan`: `bucket`, `prefix` (or `null`), `started_at` (RFC 3339, UTC) and
   `elapsed_ms`
@@ -557,7 +607,8 @@ covers:
   smallest) and `unrecognized_storage_class_totals` (`count` and `bytes`
   of every such object)
 - `findings`: per rule, its `rule` code and `title`; `counts` and `bytes`,
-  each keyed by severity (`critical`, `high`, `medium`, `low`, `info`);
+  each keyed by severity (`critical`, `high`, `medium`, `low`, `info`;
+  every severity is always present, and no rule raises `critical` yet);
   and `suppressed` `{count, bytes}`. For `content-not-scanned`, `bytes` is
   the size of the file. For PII rules, both byte totals are always `0`, as
   not applicable: their findings are about columns, and a file's size
@@ -593,9 +644,12 @@ covers:
   has `key`, `key_truncated`, `severity`, `size`, `storage_class` and
   `last_modified`. A PII sample also has `column`, `confidence` and
   `evidence` (`values` or `column-name`), plus `matched` and `sampled` when
-  the evidence is `values`. A `content-not-scanned` sample has `reason`
-- `largest_objects`: the 20 largest objects, shaped like a sample, with
-  `severity` always `null`
+  the evidence is `values`. A `content-not-scanned` sample has `reason`.
+  `key_truncated` says whether `key` was cut to 1,024 bytes. It is never
+  `true` for S3, whose keys are at most 1,024 bytes, and is kept for future
+  sources with longer names
+- `largest_objects`: the 20 largest objects, each with `key`,
+  `key_truncated`, `size`, `storage_class` and `last_modified`
 - `size_histogram`: non-empty buckets, ascending, each with `lower` and
   `upper` bounds in bytes (`upper` is `null` for the open-ended top
   bucket), `count` and `bytes`; `age_histogram` likewise, with its bounds
@@ -610,10 +664,18 @@ covers:
 evidence) on a PII finding, and `reason` on a `content-not-scanned` one. Keys are written in full and JSON-escaped, so
 any key round-trips exactly.
 
+Some values appear twice and always agree: `coverage.files_eligible` is
+`content.files_eligible`, `coverage.files_scanned` is `content.scanned_whole`
+plus `content.scanned_partially`, and each table's `files_not_scanned` is its
+`files_eligible` minus its `files_scanned`.
+
 **Compatibility policy.** `schema_version` stays the same as long as changes are
-additive: new fields, new sections, new list entries. Consumers should ignore
-fields they don't recognize. Removing or renaming a field, changing its type, or
-changing what it means bumps `schema_version`.
+additive: new fields, new sections, new list entries, new codes. Consumers should
+ignore fields and codes they don't recognize. Removing or renaming a field,
+changing its type, or changing what it means bumps `schema_version`. The last
+breaking change at version 1 was made before the schema was declared stable, in
+v0.1.0: `largest_objects` entries no longer carry `severity`, which was always
+`null`.
 
 ## Limitations
 

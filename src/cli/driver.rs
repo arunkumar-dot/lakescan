@@ -1334,7 +1334,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         // One email data page over the page cap, and a double column: the
         // file is Parquet and opens, but no value could be examined.
-        let rows = 300_000;
+        let rows = 340_000;
         let too_large = parquet_file(
             &[
                 ("email", Values::Text(emails(rows))),

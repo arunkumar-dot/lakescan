@@ -34,4 +34,4 @@ Round 2 (messy synthetic data; pyarrow, Polars, DuckDB, Spark): passed both pre-
 - Validation on real data, which only early users can provide.
 
 ## Status
-M0-M10: metadata pipeline, structured-PII scanning of Parquet (opt-in with --pii, GZIP and Brotli included), a per-table PII inventory with fail-closed coverage, concurrent, memory-budgeted, coalesced content scanning (measured on a simulated S3 latency model), and a self-contained HTML report (M10). Next: release builds (M11).
+M0-M11: metadata pipeline, structured-PII scanning of Parquet (opt-in with --pii, GZIP and Brotli included), a per-table PII inventory with fail-closed coverage, concurrent, memory-budgeted, coalesced content scanning (measured on a simulated S3 latency model), and a self-contained HTML report (M10), plus release builds and a frozen JSON schema (v0.1.0). Next: launch.

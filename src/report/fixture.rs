@@ -267,6 +267,49 @@ pub(super) fn aggregates() -> Aggregates {
     run().0
 }
 
+/// A lake one table over the inventory's table cap: [`MAX_TABLES`] + 1
+/// tables of one Parquet file each, every file with an email column, so
+/// the table that sorts last is left out with its file and its finding.
+/// Every object has the same `ETag`, so duplicates are significant.
+///
+/// [`MAX_TABLES`]: crate::aggregate::MAX_TABLES
+pub(super) fn crowded() -> Aggregates {
+    let ctx = EvalContext { now: now() };
+    let mut aggregates = Aggregates::new(now());
+    aggregates.enable_content();
+    for n in 0..=crate::aggregate::MAX_TABLES {
+        let object = object(
+            &format!("lake/t{n:05}/part-0.parquet"),
+            1000,
+            0,
+            "same-etag",
+            StorageClass::Standard,
+        );
+        aggregates.observe_object(&object);
+        for finding in rules::evaluate(&object, &ctx) {
+            aggregates.observe_finding(finding);
+        }
+        let scan = FileScan {
+            outcome: FileOutcome::ScannedWhole,
+            columns: vec![column(
+                PiiType::Email,
+                "email",
+                Confidence::Confirmed,
+                Evidence::Values {
+                    matched: 40,
+                    sampled: 40,
+                },
+            )],
+            stats: FileStats::default(),
+        };
+        for finding in scan.findings(&object) {
+            aggregates.observe_finding(finding);
+        }
+        aggregates.observe_content(&object, &scan, false);
+    }
+    aggregates
+}
+
 /// The fixed [`ScanInfo`] every fixture summary is rendered with,
 /// including the fixture config's expired and unused entries.
 pub(super) fn scan_info() -> ScanInfo {

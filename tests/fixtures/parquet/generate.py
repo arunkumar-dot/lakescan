@@ -38,7 +38,21 @@ ROWS = 12_000
 ROW_GROUP = 4_000
 FIRST = "Aarav Aditi Arjun Bhavna Chetan Deepa Farhan Gaurav Ishaan Jaya Karan Kavya Meera Neha Priya Rahul Sneha Varun Alice Daniel Emma Grace Henry Liam Mia Noah Olivia Sofia Yuki Wei".split()
 LAST = "Sharma Verma Gupta Singh Patel Shah Mehta Iyer Nair Reddy Rao Menon Kulkarni Patil Smith Brown Garcia Miller Davis Lee Kim Chen Tanaka Wang".split()
-DOMAINS = "gmail.com yahoo.com outlook.com rediffmail.com example.org acme.io fintech.in".split()
+# Reserved values only (RFC 2606 / RFC 6761 domains, RFC 5737 and RFC 3849
+# address ranges, the NANP's fictional 555-0100 to 555-0199 numbers, and the
+# card networks' published test numbers), so no fixture value can belong to
+# a real person. Aadhaar, PAN and Indian mobile numbers have no reserved
+# ranges: those are synthetic and random.
+DOMAINS = "example.com example.org example.net mail.test acme.test fintech.test".split()
+IPV4_NETS = ["192.0.2", "198.51.100", "203.0.113"]
+# Several networks and several numbers each, so no single value is more
+# than half a column (LakeScan drops a value that dominates a sample).
+TEST_CARDS = [
+    "4111111111111111", "4012888888881881", "4242424242424242", "4000056655665556",  # Visa
+    "5555555555554444", "5105105105105100", "2223003122003222",  # Mastercard
+    "378282246310005", "371449635398431",  # American Express
+    "6011111111111117", "6011000990139424",  # Discover
+]
 CITIES = "Mumbai Delhi Bengaluru Pune Chennai London Singapore Toronto".split()
 # Junk the generator writes. Deliberately not the same list as LakeScan's
 # cleaning: "NOT PROVIDED" and "999" are not on it.
@@ -59,14 +73,21 @@ def verhoeff_check(base):
     return inv[c]
 
 
-def luhn_check(digits):
+def luhn_valid(number):
     total = 0
-    for j, dgt in enumerate(reversed(digits)):
-        if j % 2 == 0:
+    for j, dgt in enumerate(int(c) for c in reversed(number)):
+        if j % 2 == 1:
             dgt *= 2
             dgt = dgt - 9 if dgt > 9 else dgt
         total += dgt
-    return (10 - total % 10) % 10
+    return total % 10 == 0
+
+
+def grouped(card):
+    """As printed on the card: 4-6-5 for American Express, else 4-4-4-4."""
+    if len(card) == 15:
+        return " ".join((card[:4], card[4:10], card[10:]))
+    return " ".join(card[j:j + 4] for j in range(0, 16, 4))
 
 
 def mess(values, rng, null_rate, malform=None, recase=None):
@@ -101,7 +122,7 @@ def customers(n, rng):
     def phone(i):
         m = str(int(rng.integers(6, 10)) * 10**9 + int(rng.integers(0, 10**9)))
         k = i % 4
-        return ["+91 " + m[:5] + " " + m[5:], "+91" + m, m, "+1415555" + m[-4:]][k]
+        return ["+91 " + m[:5] + " " + m[5:], "+91" + m, m, "+1415555" + f"{int(rng.integers(100, 200)):04d}"][k]
 
     mobiles = [int(rng.integers(6, 10)) * 10**9 + int(rng.integers(0, 10**9)) for _ in range(n)]
     aadhaar = []
@@ -112,11 +133,9 @@ def customers(n, rng):
     pans = ["".join(rng.choice(list(letters), 3)) + "P" + rng.choice(list(letters)) + f"{int(rng.integers(0, 10000)):04d}" + rng.choice(list(letters)) for _ in range(n)]
     cards = []
     for i in range(n):
-        body = [4] + [int(x) for x in rng.integers(0, 10, 14)]
-        digits = body + [luhn_check(body)]
-        s = "".join(map(str, digits))
-        cards.append(" ".join(s[j:j + 4] for j in range(0, 16, 4)) if i % 4 == 0 else s)
-    ips = [f"{int(rng.integers(1, 224))}.{int(rng.integers(0, 256))}.{int(rng.integers(0, 256))}.{int(rng.integers(1, 255))}"
+        card = TEST_CARDS[int(rng.integers(len(TEST_CARDS)))]
+        cards.append(grouped(card) if i % 4 == 0 else card)
+    ips = [f"{IPV4_NETS[int(rng.integers(len(IPV4_NETS)))]}.{int(rng.integers(1, 255))}"
            if i % 5 else f"2001:db8::{int(rng.integers(1, 65535)):x}" for i in range(n)]
 
     def null_ints(values, rate):
@@ -167,6 +186,7 @@ def too_large():
 
 
 def main():
+    assert all(luhn_valid(card) for card in TEST_CARDS)
     out = Path(sys.argv[1]).resolve()
     rng = np.random.default_rng(20261014)
     df = customers(ROWS, rng)

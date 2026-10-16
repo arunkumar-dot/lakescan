@@ -283,7 +283,7 @@ async fn a_dominant_default_value_is_dropped_before_matching() -> TestResult {
 #[tokio::test]
 async fn a_page_over_the_cap_skips_the_column() -> TestResult {
     // One data page of ~9 MiB of emails, plus a small column.
-    let rows = 300_000;
+    let rows = 340_000;
     let layout = Layout {
         dictionary: false,
         page_bytes: usize::MAX,
@@ -425,7 +425,7 @@ async fn findings_carry_the_column_and_never_a_value() -> TestResult {
     let meta = object("t.parquet", 1);
     let rendered = format!("{:?}", scan.findings(&meta).collect::<Vec<_>>());
     assert!(rendered.contains("mobile_no"));
-    for value in ["person.1@example1.com", "9876000001"] {
+    for value in ["person.1@example.org", "9876000001"] {
         assert!(!rendered.contains(value), "{value} leaked: {rendered}");
     }
     Ok(())

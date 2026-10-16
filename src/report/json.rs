@@ -214,6 +214,29 @@ impl<'a> SampleEntry<'a> {
     }
 }
 
+/// One `largest_objects` entry: a sample's object fields only. An object
+/// on this list has no finding, so it has no severity and no detail.
+#[derive(Serialize)]
+struct ObjectEntry<'a> {
+    key: &'a str,
+    key_truncated: bool,
+    size: u64,
+    storage_class: &'a str,
+    last_modified: String,
+}
+
+impl<'a> ObjectEntry<'a> {
+    fn from_sample(sample: &'a Sample) -> Self {
+        Self {
+            key: &sample.key,
+            key_truncated: sample.key_truncated,
+            size: sample.size,
+            storage_class: sample.storage_class.as_wire(),
+            last_modified: format_rfc3339(sample.last_modified),
+        }
+    }
+}
+
 /// The `content` section: what `--pii` content scanning did.
 #[derive(Serialize)]
 struct ContentSection {
@@ -474,7 +497,7 @@ struct Summary<'a> {
     pii_inventory: Option<PiiInventorySection<'a>>,
     suppressions: SuppressionsSection<'a>,
     samples: SamplesSection<'a>,
-    largest_objects: Vec<SampleEntry<'a>>,
+    largest_objects: Vec<ObjectEntry<'a>>,
     size_histogram: Vec<SizeBucket>,
     age_histogram: Vec<AgeBucket>,
     distinct_content: DistinctContentSection,
@@ -612,7 +635,7 @@ fn build<'a>(info: &'a super::ScanInfo, aggregates: &'a Aggregates) -> Summary<'
         largest_objects: aggregates
             .largest_objects()
             .into_iter()
-            .map(SampleEntry::from_sample)
+            .map(ObjectEntry::from_sample)
             .collect(),
         size_histogram: size_histogram_section(aggregates),
         age_histogram: age_histogram_section(aggregates),
@@ -825,6 +848,125 @@ mod tests {
             value.pointer("/distinct_content/duplicates_significant"),
             Some(&Value::Bool(false))
         );
+        Ok(())
+    }
+
+    fn render_crowded() -> Result<Value, Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        write(&mut buf, &fixture::scan_info(), &fixture::crowded())?;
+        Ok(serde_json::from_slice(&buf)?)
+    }
+
+    /// The fields the schema duplicates agree: coverage restates content's
+    /// file counts, and each table's `files_not_scanned` is the rest of its
+    /// eligible files.
+    fn assert_duplicated_fields_agree(value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+        let at = |pointer: &str| {
+            value
+                .pointer(pointer)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("no integer at {pointer}"))
+        };
+        assert_eq!(
+            at("/coverage/files_eligible")?,
+            at("/content/files_eligible")?
+        );
+        assert_eq!(
+            Some(at("/coverage/files_scanned")?),
+            at("/content/scanned_whole")?.checked_add(at("/content/scanned_partially")?)
+        );
+        let tables = value
+            .pointer("/pii_inventory/tables")
+            .and_then(Value::as_array)
+            .ok_or("no pii_inventory.tables")?;
+        assert_ne!(tables.len(), 0);
+        for table in tables {
+            let field = |name: &str| {
+                table
+                    .get(name)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("no integer {name} in {table}"))
+            };
+            assert_eq!(
+                Some(field("files_not_scanned")?),
+                field("files_eligible")?.checked_sub(field("files_scanned")?),
+                "{table}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicated_fields_agree() -> Result<(), Box<dyn std::error::Error>> {
+        assert_duplicated_fields_agree(&render()?)?;
+        assert_duplicated_fields_agree(&render_crowded()?)
+    }
+
+    #[test]
+    fn a_lake_over_the_table_cap_reports_what_was_left_out()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = render_crowded()?;
+        // One table over the cap, with one file and one email finding.
+        assert_eq!(
+            value.pointer("/pii_inventory/left_out"),
+            Some(&serde_json::json!({ "files": 1, "findings": 1 }))
+        );
+        let tables = value
+            .pointer("/pii_inventory/tables")
+            .and_then(Value::as_array)
+            .map(Vec::len);
+        assert_eq!(tables, Some(crate::aggregate::MAX_TABLES));
+        // Coverage still counts every file, held in a table or not.
+        assert_eq!(
+            value.pointer("/coverage/files_eligible"),
+            Some(&Value::from(4097))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicated_content_is_significant() -> Result<(), Box<dyn std::error::Error>> {
+        let value = render_crowded()?;
+        assert_eq!(
+            value.pointer("/distinct_content/duplicates_significant"),
+            Some(&Value::Bool(true))
+        );
+        let bound = value
+            .pointer("/distinct_content/duplicate_lower_bound")
+            .and_then(Value::as_f64)
+            .ok_or("no duplicate_lower_bound")?;
+        // 4,097 objects with one ETag: all but about one are duplicates.
+        assert!(bound > 4000.0, "{bound}");
+        Ok(())
+    }
+
+    #[test]
+    fn largest_objects_carry_no_severity() -> Result<(), Box<dyn std::error::Error>> {
+        let value = render()?;
+        let entries = value
+            .get("largest_objects")
+            .and_then(Value::as_array)
+            .ok_or("no largest_objects")?;
+        assert_ne!(entries.len(), 0);
+        for entry in entries {
+            let mut keys: Vec<&str> = entry
+                .as_object()
+                .into_iter()
+                .flat_map(serde_json::Map::keys)
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "key",
+                    "key_truncated",
+                    "last_modified",
+                    "size",
+                    "storage_class"
+                ]
+            );
+        }
         Ok(())
     }
 

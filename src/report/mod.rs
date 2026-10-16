@@ -35,13 +35,22 @@
 //!
 //! [`write_summary`] with [`Format::Json`] writes one JSON object.
 //!
+//! ## Stability: `schema_version` 1 is stable
+//!
+//! As of v0.1.0 (M11), `schema_version` 1 is **stable**: the schema below
+//! is a public contract, and a consumer written against it keeps working
+//! with every later release that still reports version 1.
+//!
 //! ## Compatibility policy
 //!
 //! `schema_version` is frozen at its current value for as long as every
 //! change is **additive**: a new field, a new object in a list, a new
-//! section. Consumers must ignore fields they do not recognize. Removing
-//! or renaming a field, changing its type, or changing what an existing
-//! field means is **breaking** and bumps `schema_version`. The
+//! section, a new code in a map keyed by codes. Consumers must ignore
+//! fields and codes they do not recognize. Removing or renaming a field,
+//! changing its type, or changing what an existing field means is
+//! **breaking** and bumps `schema_version`. Before v0.1.0 the schema was
+//! not yet frozen; M11 made its last breaking change at version 1,
+//! removing `largest_objects[].severity`, which was always `null`. The
 //! `suppressed`, `suppressions`, and `distinct_content.duplicates_significant`
 //! fields (M6), `content`, a suppression entry's `column`, and a
 //! sample's `column`, `confidence`, `evidence`, `matched`, `sampled` and
@@ -87,6 +96,10 @@
 //!       "title": string,           // RuleId::title()
 //!       "counts": { "critical": integer, "high": integer, "medium": integer,
 //!                   "low": integer, "info": integer },
+//!                                  // every severity, always: no v1 rule
+//!                                  // raises "critical" yet, but the scale
+//!                                  // stays complete so adding one is not
+//!                                  // a schema change
 //!       "bytes":  { "critical": integer, "high": integer, "medium": integer,
 //!                   "low": integer, "info": integer },
 //!                                  // the finding objects' sizes; always 0
@@ -205,7 +218,10 @@
 //!     "<rule code>": [             // keys unordered (plain JSON object);
 //!       {                         // each list is best-first (severity
 //!         "key": string,          // desc, size desc, key asc)
-//!         "key_truncated": bool,
+//!         "key_truncated": bool,  // whether key was cut to 1,024 bytes;
+//!                                 // never true for S3, whose keys are at
+//!                                 // most 1,024 bytes, but kept for future
+//!                                 // sources with longer names
 //!         "severity": string,
 //!         "size": integer,
 //!         "storage_class": string,
@@ -224,8 +240,12 @@
 //!       }
 //!     ]
 //!   },
-//!   "largest_objects": [ /* same shape as a sample, with "severity" */
-//!                        /* always null */ ],
+//!   "largest_objects": [           // up to 20, size desc, then key asc
+//!     { "key": string, "key_truncated": bool, "size": integer,
+//!       "storage_class": string, "last_modified": string }
+//!                                  // a sample's object fields: no finding,
+//!                                  // so no severity and no detail
+//!   ],
 //!   "size_histogram": [            // non-empty buckets only, ascending
 //!     { "lower": integer, "upper": integer | null, "count": integer, "bytes": integer }
 //!   ],
@@ -247,6 +267,12 @@
 //! A sample never carries a sampled value: only the column path and
 //! counts. The findings stream (`--findings`) carries the same optional
 //! fields per record.
+//!
+//! Some values appear twice, and always agree (`report::json`'s tests
+//! check each): `coverage.files_eligible` equals `content.files_eligible`;
+//! `coverage.files_scanned` equals `content.scanned_whole` plus
+//! `content.scanned_partially`; and each table's `files_not_scanned`
+//! equals its `files_eligible` minus its `files_scanned`.
 //!
 //! Severities are rendered via [`crate::model::Severity::code`], storage
 //! classes via [`crate::model::StorageClass::as_wire`], rules via

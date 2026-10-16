@@ -92,14 +92,14 @@ objects:
 
 ```text
 LARGEST OBJECTS
-  lake/customers/dt=2026-01-01/part-0.parquet  size=2117115 (2.0 MiB) class=STANDARD modified=2026-10-16T05:01:48Z
+  lake/customers/dt=2026-01-01/part-0.parquet  size=1909661 (1.8 MiB) class=STANDARD modified=2026-10-16T05:01:48Z
 ```
 
 **2. Metadata rules.** Nothing fires. The key isn't secret-looking, the
 object is `STANDARD`, it is not empty, and it is younger than 90 days.
 
 **3. Read.** The key ends in `.parquet` and `--pii` is on, so the content
-scanner takes it. At 2,117,115 bytes it is under the 8 MiB
+scanner takes it. At 1,909,661 bytes it is under the 8 MiB
 `--pii-whole-file-max`, so it is read whole, in one `GET`. An extra run,
 scoped to this file's prefix, shows that:
 
@@ -113,7 +113,7 @@ CONTENT
     not scanned:       0
   columns examined:   15
   columns skipped:    2 (repeated=1, unsupported-type=1, page-too-large=0, unreadable=0, unsupported-codec=0)
-  bytes read:         2117115 (2.0 MiB)
+  bytes read:         1909661 (1.8 MiB)
   GET requests:       1
 ```
 
@@ -132,12 +132,12 @@ $ lakescan scan s3://lakescan-pii/lake/customers/dt=2026-01-01/ --endpoint-url h
 ...
     scanned partially: 1
 ...
-  bytes read:         1035211 (1010.9 KiB)
+  bytes read:         972453 (949.6 KiB)
   GET requests:       4
 ```
 
 With `--coalesce-gap 0` as well, it reads each range on its own: `bytes
-read: 750313 (732.7 KiB)` in `GET requests: 15`. Fewer bytes, more
+read: 685930 (669.8 KiB)` in `GET requests: 15`. Fewer bytes, more
 requests. Both partial runs produce exactly the same findings as the whole
 read. On this file a partial read takes about half the bytes. On large
 lake files, where row groups are big, it is under 10%.
@@ -145,14 +145,14 @@ lake files, where row groups are big, it is under 10%.
 **4. Clean, detect, classify.** For the `email` column, LakeScan decodes
 values from row group 0, drops nulls, blanks, placeholders like `N/A` and
 `-`, and repeated-character junk, and keeps up to 2,000 cleaned values. It
-got the full 2,000 here. 1,945 of them are valid emails. The other 55 are
+got the full 2,000 here. 1,943 of them are valid emails. The other 57 are
 the fixture's planted malformed values and placeholders that aren't on
-LakeScan's list (`NOT PROVIDED`, `999`). 1,945 of 2,000 is at least 80% of
+LakeScan's list (`NOT PROVIDED`, `999`). 1,943 of 2,000 is at least 80% of
 at least 30 values, so the confidence is **confirmed**, which is severity
 **high**. Its finding, from step g's stream:
 
 ```json
-{"key":"lake/customers/dt=2026-01-01/part-0.parquet","rule":"pii-email","severity":"high","size":2117115,"storage_class":"STANDARD","last_modified":"2026-10-16T05:01:48Z","column":"email","confidence":"confirmed","evidence":"values","matched":1945,"sampled":2000}
+{"key":"lake/customers/dt=2026-01-01/part-0.parquet","rule":"pii-email","severity":"high","size":1909661,"storage_class":"STANDARD","last_modified":"2026-10-16T05:01:48Z","column":"email","confidence":"confirmed","evidence":"values","matched":1943,"sampled":2000}
 ```
 
 `full_name` is judged by its name alone (names have no validator), so it
@@ -364,7 +364,7 @@ FINDINGS
   pii-date-of-birth - Parquet column holds dates of birth
     medium: 7 (-)
   content-not-scanned - Parquet file could not be content-scanned
-    info: 3 (1.3 MiB)
+    info: 3 (1.2 MiB)
 
 CONTENT
   parquet files:      11
@@ -373,7 +373,7 @@ CONTENT
     not scanned:       3 (not-parquet=1, unreadable=1, no-column-examined=1)
   columns examined:   107
   columns skipped:    17 (repeated=7, unsupported-type=9, page-too-large=1, unreadable=0, unsupported-codec=0)
-  bytes read:         12764122 (12.1 MiB)
+  bytes read:         11594785 (11.0 MiB)
   GET requests:       11
 
 COVERAGE
@@ -549,8 +549,8 @@ $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --f
 ...
 74 findings; two PII ones:
 $ grep '"rule":"pii-' findings.jsonl | head -2
-{"key":"lake/customers/dt=2026-01-01/part-0.parquet","rule":"pii-person-name","severity":"medium","size":2117115,"storage_class":"STANDARD","last_modified":"2026-10-16T05:01:48Z","column":"full_name","confidence":"likely","evidence":"column-name"}
-{"key":"lake/customers/dt=2026-01-01/part-0.parquet","rule":"pii-email","severity":"high","size":2117115,"storage_class":"STANDARD","last_modified":"2026-10-16T05:01:48Z","column":"email","confidence":"confirmed","evidence":"values","matched":1945,"sampled":2000}
+{"key":"lake/customers/dt=2026-01-01/part-0.parquet","rule":"pii-person-name","severity":"medium","size":1909661,"storage_class":"STANDARD","last_modified":"2026-10-16T05:01:48Z","column":"full_name","confidence":"likely","evidence":"column-name"}
+{"key":"lake/customers/dt=2026-01-01/part-0.parquet","rule":"pii-email","severity":"high","size":1909661,"storage_class":"STANDARD","last_modified":"2026-10-16T05:01:48Z","column":"email","confidence":"confirmed","evidence":"values","matched":1943,"sampled":2000}
 $ grep -c @ findings.jsonl
 0
 exit code: 6
