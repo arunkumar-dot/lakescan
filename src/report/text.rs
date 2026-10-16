@@ -26,7 +26,7 @@ use std::io::Write;
 use super::escape::write_escaped;
 use super::human_size::human_bytes;
 use super::rfc3339::format_rfc3339;
-use super::{ScanInfo, TOOL_NAME, TOOL_VERSION, status_of};
+use super::{SAMPLING_METHOD, ScanInfo, TOOL_NAME, TOOL_VERSION, expiry_of, status_of};
 use crate::aggregate::{
     Aggregates, InventoryEntry, MAX_ENTRIES, MAX_TABLES, Sample, SampleDetail, Table, TableStatus,
 };
@@ -74,6 +74,10 @@ fn write_header<W: Write>(out: &mut W, info: &ScanInfo) -> Result<(), LakeScanEr
         w!(out, "/{prefix}")?;
     }
     wl_empty!(out)?;
+    w!(out, "settings: ")?;
+    write_escaped(out, &info.settings.line(info.prefix.as_deref()))
+        .map_err(LakeScanError::Report)?;
+    wl_empty!(out)?;
     wl!(out, "started:  {}", format_rfc3339(info.started_at))?;
     wl!(out, "elapsed:  {}", human_duration(info.elapsed))?;
     wl_empty!(out)
@@ -85,7 +89,106 @@ fn write_verdict<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), L
         Some(severity) => wl!(out, "  worst severity: {}", severity.code())?,
         None => wl!(out, "  no findings")?,
     }
+    if let Some(inventory) = aggregates.pii_inventory()
+        && inventory.truncated()
+    {
+        wl!(
+            out,
+            "  WARNING: the PII inventory is truncated: {} and {} were left out over its caps \
+             ({MAX_TABLES} tables, {MAX_ENTRIES} entries); see PII INVENTORY",
+            files(inventory.left_out_files()),
+            counted(inventory.left_out_findings(), "finding", "findings")
+        )?;
+    }
     wl_empty!(out)
+}
+
+/// `n` with thousands separators: `1,240`.
+pub(super) fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// An extension as reports show it: `.json`, or `(no extension)`. Not yet
+/// escaped: extensions come from keys.
+pub(super) fn shown_extension(extension: &str) -> String {
+    if extension.is_empty() {
+        "(no extension)".to_owned()
+    } else {
+        format!(".{extension}")
+    }
+}
+
+/// "Not in scope for --pii: 1,240 .json, 310 .csv, 3 more (`LakeScan` reads
+/// Parquet content only)", or `None` when no object was out of scope by
+/// extension. Unescaped: the caller escapes it.
+pub(super) fn out_of_scope_line(scope: &crate::aggregate::OutOfScope) -> Option<String> {
+    let (listed, other) = scope.by_extension();
+    if listed.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = listed
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} {}",
+                grouped(entry.count),
+                shown_extension(entry.extension)
+            )
+        })
+        .collect();
+    if other > 0 {
+        parts.push(format!("{} with other extensions", grouped(other)));
+    }
+    Some(format!(
+        "Not in scope for --pii: {} (LakeScan reads Parquet content only)",
+        parts.join(", ")
+    ))
+}
+
+/// "No structured PII detected in sampled data from 3 files", plus how
+/// many were not scanned, for a table whose scanned files had none.
+pub(super) fn no_pii_line(table: &Table) -> String {
+    let mut line = format!(
+        "No structured PII detected in sampled data from {}",
+        files(table.files_scanned)
+    );
+    if table.files_not_scanned() > 0 {
+        line.push_str("; ");
+        line.push_str(&table.files_not_scanned().to_string());
+        line.push_str(" not scanned");
+    }
+    line
+}
+
+/// "files dated 2019-03-02 to 2026-10-10" for a table with files.
+pub(super) fn dates_line(table: &Table) -> Option<String> {
+    table.file_dates().map(|(oldest, newest)| {
+        let day = |at| {
+            let mut stamp = format_rfc3339(at);
+            stamp.truncate(10);
+            stamp
+        };
+        format!("files dated {} to {}", day(oldest), day(newest))
+    })
+}
+
+/// "30 undocumented (24 confirmed, 4 likely, 2 possible)".
+pub(super) fn undocumented_split(summary: &crate::aggregate::InventorySummary) -> String {
+    format!(
+        "{} undocumented ({} confirmed, {} likely, {} possible)",
+        summary.undocumented,
+        summary.undocumented_confirmed,
+        summary.undocumented_likely,
+        summary.undocumented_possible
+    )
 }
 
 fn write_inventory<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
@@ -209,8 +312,8 @@ fn write_content<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), L
     };
     wl!(out, "CONTENT")?;
     wl!(out, "  parquet files:      {}", content.files_eligible)?;
-    wl!(out, "    scanned whole:     {}", content.scanned_whole)?;
-    wl!(out, "    scanned partially: {}", content.scanned_partially)?;
+    wl!(out, "    downloaded whole:  {}", content.scanned_whole)?;
+    wl!(out, "    read partially:    {}", content.scanned_partially)?;
     w!(
         out,
         "    not scanned:       {}",
@@ -244,6 +347,11 @@ fn write_content<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), L
         human_bytes(content.bytes_read)
     )?;
     wl!(out, "  GET requests:       {}", content.get_requests)?;
+    wl!(
+        out,
+        "  sniffed:            {} (objects without a Parquet extension; one 8-byte GET each)",
+        content.sniffed
+    )?;
     wl_empty!(out)
 }
 
@@ -267,6 +375,27 @@ fn write_coverage<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), 
         coverage.not_scanned_suppressed,
         coverage.not_scanned_unsuppressed
     )?;
+    wl!(out, "  inspection:     {SAMPLING_METHOD}")?;
+    if let Some(scope) = aggregates.out_of_scope() {
+        match out_of_scope_line(scope) {
+            Some(line) => {
+                w!(out, "  ")?;
+                write_escaped(out, &line).map_err(LakeScanError::Report)?;
+                wl_empty!(out)?;
+            }
+            None => wl!(out, "  Not in scope for --pii: none by extension")?,
+        }
+        wl!(
+            out,
+            "  sniffed, not Parquet: {}",
+            grouped(scope.sniffed_not_parquet())
+        )?;
+        wl!(
+            out,
+            "  empty objects and folder markers: {}",
+            grouped(scope.empty())
+        )?;
+    }
     wl_empty!(out)
 }
 
@@ -299,6 +428,9 @@ fn write_table_heading<W: Write>(out: &mut W, table: &Table) -> Result<(), LakeS
         .collect();
     if !reasons.is_empty() {
         w!(out, " ({})", reasons.join(", "))?;
+    }
+    if let Some(dates) = dates_line(table) {
+        w!(out, "; {dates}")?;
     }
     wl_empty!(out)?;
     if let Some(key) = table.example_key() {
@@ -368,7 +500,11 @@ fn write_entry_row<W: Write>(
         (status, Some(reason)) => {
             // Documented: every file's finding was suppressed, so the
             // count is all of them.
-            w!(out, "{}, {status}: ", files(entry.files()))?;
+            w!(out, "{}, {status}", files(entry.files()))?;
+            if let Some(expires) = expiry_of(entry.status(), &info.suppressions) {
+                w!(out, " until {expires}")?;
+            }
+            w!(out, ": ")?;
             write_escaped(out, reason).map_err(LakeScanError::Report)?;
             wl_empty!(out)
         }
@@ -386,6 +522,11 @@ fn write_pii_inventory<W: Write>(
     };
     wl!(out, "PII INVENTORY")?;
     let summary = inventory.summary();
+    let action = if summary.undocumented > 0 {
+        " Action needed on the undocumented."
+    } else {
+        ""
+    };
     let gaps = if summary.tables_not_fully_scanned > 0 {
         format!(
             " ({} documented)",
@@ -396,13 +537,18 @@ fn write_pii_inventory<W: Write>(
     };
     wl!(
         out,
-        "  {} with PII, {}: {} undocumented (action needed), {} documented. {} not fully \
+        "  {} with PII, {}: {}, {} documented.{action} {} with files not \
          scanned{gaps}.",
         counted(summary.tables_with_pii, "table", "tables"),
         counted(summary.pii_columns, "PII column", "PII columns"),
-        summary.undocumented,
+        undocumented_split(&summary),
         summary.documented,
         counted(summary.tables_not_fully_scanned, "table", "tables"),
+    )?;
+    wl!(
+        out,
+        "  Tables are inferred from object paths. Documented means your team recorded a \
+         reason: an operational exception, not a compliance approval."
     )?;
     if inventory.tables().is_empty() {
         wl!(out, "  no Parquet files")?;
@@ -415,24 +561,17 @@ fn write_pii_inventory<W: Write>(
                     write_entry_row(out, info, entry)?;
                 }
             }
-            // Never "no PII found" about files that were not read.
-            TableStatus::NoPiiInScannedFiles => {
-                let scanned = table.files_scanned;
-                let noun = if scanned == 1 { "file" } else { "files" };
-                w!(out, "    no PII found in {scanned} scanned {noun}")?;
-                if table.files_not_scanned() > 0 {
-                    w!(out, "; {} not scanned", table.files_not_scanned())?;
-                }
-                wl_empty!(out)?;
-            }
+            // Never "no PII" about files that were not read, nor about
+            // more than was sampled.
+            TableStatus::NoPiiInScannedFiles => wl!(out, "    {}", no_pii_line(table))?,
             TableStatus::NotScanned => wl!(out, "    not scanned: PII unknown")?,
         }
     }
     if inventory.truncated() {
         wl!(
             out,
-            "  truncated: {} files and {} findings left out over the caps ({MAX_TABLES} tables, \
-             {MAX_ENTRIES} entries); scan a narrower prefix to see them",
+            "  WARNING: truncated: {} files and {} findings left out over the caps \
+             ({MAX_TABLES} tables, {MAX_ENTRIES} entries); scan a narrower prefix to see them",
             inventory.left_out_files(),
             inventory.left_out_findings()
         )?;
@@ -769,22 +908,27 @@ mod tests {
         assert_eq!(
             section,
             "PII INVENTORY\n\
-             \x20 1 table with PII, 3 PII columns: 2 undocumented (action needed), 1 documented. \
-             2 tables not fully scanned (1 documented).\n\
-             \x20 clean  files: 1 scanned, 0 not scanned\n\
-             \x20   no PII found in 1 scanned file\n\
-             \x20 dark  files: 0 scanned, 1 not scanned (unreadable=1 undocumented)\n\
+             \x20 1 table with PII, 3 PII columns: 2 undocumented (1 confirmed, 1 likely, 0 \
+             possible), 1 documented. Action needed on the undocumented. 2 tables with files not \
+             scanned (1 documented).\n\
+             \x20 Tables are inferred from object paths. Documented means your team recorded a \
+             reason: an operational exception, not a compliance approval.\n\
+             \x20 clean  files: 1 scanned, 0 not scanned; files dated 2023-11-14 to 2023-11-14\n\
+             \x20   No structured PII detected in sampled data from 1 file\n\
+             \x20 dark  files: 0 scanned, 1 not scanned (unreadable=1 undocumented); files dated \
+             2023-11-14 to 2023-11-14\n\
              \x20   not scanned: PII unknown\n\
-             \x20 half  files: 2 scanned, 1 not scanned (unreadable=1 documented)\n\
-             \x20   no PII found in 2 scanned files; 1 not scanned\n\
-             \x20 pii  files: 2 scanned, 0 not scanned\n\
+             \x20 half  files: 2 scanned, 1 not scanned (unreadable=1 documented); files dated \
+             2023-11-14 to 2023-11-14\n\
+             \x20   No structured PII detected in sampled data from 2 files; 1 not scanned\n\
+             \x20 pii  files: 2 scanned, 0 not scanned; files dated 2023-11-14 to 2023-11-14\n\
              \x20   example: pii/a.parquet\n\
              \x20   phone  pii-email  likely  evidence=values  1 file likely, 1 suppressed  \
              UNDOCUMENTED\n\
              \x20   zip  pii-email  confirmed  evidence=values  1 file confirmed, 1 likely  \
              UNDOCUMENTED\n\
-             \x20   email  pii-email  confirmed  evidence=values  2 files, documented: \
-             Consented, DPA-12\n\
+             \x20   email  pii-email  confirmed  evidence=values  2 files, documented \
+             until 2024-06-30: Consented, DPA-12\n\
              \n"
         );
         Ok(())

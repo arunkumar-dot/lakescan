@@ -855,3 +855,139 @@ async fn a_panic_inside_decoding_costs_one_file_not_the_scan() -> TestResult {
     assert_eq!(verdicts(&next), expected_customers());
     Ok(())
 }
+
+fn options(whole_file_max: u64) -> super::ScanOptions {
+    super::ScanOptions {
+        whole_file_max,
+        coalesce_gap: super::DEFAULT_COALESCE_GAP,
+    }
+}
+
+#[tokio::test]
+async fn an_extensionless_parquet_file_is_sniffed_then_scanned() -> TestResult {
+    // Athena CTAS and Trino write Parquet files with no extension.
+    let key = "athena/customers/20261016_101010_00007_abcde_0b3f";
+    for whole_file_max in [0, super::DEFAULT_WHOLE_FILE_MAX] {
+        let body = parquet_file(&customers(500), Layout::default())?;
+        let meta = object(key, body.len());
+        let reader = MemoryReader::default().with(key, body);
+        let scan =
+            super::sniff_and_scan(reader.clone(), &meta, options(whole_file_max), budget()).await;
+        assert_ne!(scan.outcome, FileOutcome::SniffedNotParquet);
+        assert_eq!(verdicts(&scan), expected_customers());
+        assert_eq!(scan.stats.sniffed, 1);
+        // The sniff is one request of 8 bytes, counted with the rest.
+        assert_eq!(scan.stats.get_requests, reader.requests());
+        assert_eq!(scan.stats.bytes_read, reader.bytes());
+        reader.reset_counts();
+        let (direct, _) = scan_with_gap(
+            key,
+            parquet_file(&customers(500), Layout::default())?,
+            whole_file_max,
+            super::DEFAULT_COALESCE_GAP,
+        )
+        .await;
+        assert_eq!(scan.stats.get_requests, direct.stats.get_requests + 1);
+        assert_eq!(scan.stats.bytes_read, direct.stats.bytes_read + 8);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sniffed_object_that_is_not_parquet_is_out_of_scope_not_unscanned() -> TestResult {
+    let csv = b"customer_id,email\n1,someone@example.org\n".to_vec();
+    let meta = object("exports/today", csv.len());
+    let reader = MemoryReader::default().with("exports/today", csv);
+    let scan = super::sniff_and_scan(reader.clone(), &meta, options(0), budget()).await;
+    assert_eq!(scan.outcome, FileOutcome::SniffedNotParquet);
+    assert_eq!(scan.findings(&meta).count(), 0, "never content-not-scanned");
+    assert_eq!((scan.stats.get_requests, scan.stats.bytes_read), (1, 8));
+    assert_eq!(reader.requests(), 1);
+
+    // Under 12 bytes cannot be Parquet: not even fetched.
+    let tiny = object("tiny", 11);
+    let reader = MemoryReader::default().with("tiny", vec![b'x'; 11]);
+    let scan = super::sniff_and_scan(reader.clone(), &tiny, options(0), budget()).await;
+    assert_eq!(scan.outcome, FileOutcome::SniffedNotParquet);
+    assert_eq!(reader.requests(), 0);
+
+    // A refused sniff leaves the type unknown: not scanned, fail closed.
+    let body = parquet_file(&customers(50), Layout::default())?;
+    let meta = object("locked/f", body.len());
+    let reader = MemoryReader::default().with("locked/f", body);
+    reader.deny("locked/f");
+    let scan = super::sniff_and_scan(reader, &meta, options(0), budget()).await;
+    assert_eq!(
+        scan.outcome,
+        FileOutcome::NotScanned(NotScannedReason::AccessDenied)
+    );
+    Ok(())
+}
+
+#[test]
+fn only_objects_that_may_be_parquet_are_sniffed() {
+    use super::{Scope, Sniff, scope_of};
+    let of = |key: &str, size: usize, sniff| scope_of(&object(key, size), sniff);
+    let extension = |e: &str| Scope::Extension(e.to_owned());
+    for (key, size, scope) in [
+        ("t/part-0.parquet", 100, Scope::Parquet),
+        ("t/part-0.PARQ", 100, Scope::Parquet),
+        ("t/part-0.parquet", 0, Scope::Parquet),
+        ("athena/20261016_101010_00007_abcde", 100, Scope::Sniff),
+        ("t/part-00000-c000", 100, Scope::Sniff),
+        ("t/part-00000.c000", 100, Scope::Sniff),
+        ("t/file.tmp", 100, Scope::Sniff),
+        ("logs/app.json", 100, extension("json")),
+        ("logs/app.JSON", 100, extension("json")),
+        ("exports/data.csv.gz", 100, extension("gz")),
+        ("img/logo.png", 100, extension("png")),
+        ("t/part-0.parquet.crc", 100, extension("crc")),
+        // Hidden by Hadoop's convention: never sniffed.
+        ("t/_SUCCESS", 100, extension("")),
+        ("t/_metadata", 100, extension("")),
+        ("t/.part-0.crc", 100, extension("crc")),
+        // Nothing to read.
+        ("t/empty", 0, Scope::Empty),
+        ("t/folder/", 100, Scope::Empty),
+    ] {
+        assert_eq!(of(key, size, Sniff::Unknown), scope, "{key}");
+    }
+    assert_eq!(
+        of("athena/20261016_101010_00007_abcde", 100, Sniff::None),
+        extension("")
+    );
+    assert_eq!(of("t/part-0.parquet", 100, Sniff::None), Scope::Parquet);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_left_waiting_for_the_budget_is_budget_timeout() -> TestResult {
+    let need = super::file_need(super::DEFAULT_WHOLE_FILE_MAX);
+    // Two files in flight, each with no share of its own: every permit
+    // goes through the overflow lane.
+    let budget = std::sync::Arc::new(super::MemoryBudget::new(need, 2, need)?);
+    // The injected stall: another file holds the whole budget and never
+    // makes progress.
+    let mut stalled = budget.for_file();
+    let held = stalled.acquire(need).await.map_err(|_| "no permits")?;
+    let body = parquet_file(&customers(100), Layout::default())?;
+    let meta = object("t.parquet", body.len());
+    let reader = MemoryReader::default().with("t.parquet", body);
+    let started = tokio::time::Instant::now();
+    let scan = scan_file(
+        reader.clone(),
+        &meta,
+        options(super::DEFAULT_WHOLE_FILE_MAX),
+        budget.for_file(),
+    )
+    .await;
+    assert_eq!(
+        scan.outcome,
+        FileOutcome::NotScanned(NotScannedReason::BudgetTimeout)
+    );
+    assert!(started.elapsed() >= super::BUDGET_WAIT);
+    // Nothing was fetched without permits, and nothing is left held.
+    assert_eq!(reader.requests(), 0);
+    drop(held);
+    assert_eq!(budget.held(), 0);
+    Ok(())
+}

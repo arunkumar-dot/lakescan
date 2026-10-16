@@ -121,6 +121,28 @@ pub struct Entry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     entries: Vec<Entry>,
+    fingerprint: Option<Fingerprint>,
+}
+
+/// What identifies a config file in a report without naming its path: the
+/// SHA-256 of its bytes and how many entries it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// Lowercase hex.
+    pub sha256: String,
+    /// `[[suppress]]` entries.
+    pub entries: usize,
+}
+
+/// The SHA-256 of `bytes`, as lowercase hex.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(Sha256::output_size() * 2);
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 impl Config {
@@ -129,11 +151,23 @@ impl Config {
     /// # Errors
     /// Returns [`LakeScanError::Usage`] if the file cannot be read or fails
     /// any check in [`Config::parse`].
+    /// Its [`Fingerprint`] is taken over exactly the bytes read.
     pub fn load(path: &Path) -> Result<Self, LakeScanError> {
         let origin = path.display().to_string();
         let text = std::fs::read_to_string(path)
             .map_err(|err| LakeScanError::Usage(format!("cannot read config {origin}: {err}")))?;
-        Self::parse(&text, &origin)
+        let mut config = Self::parse(&text, &origin)?;
+        config.fingerprint = Some(Fingerprint {
+            sha256: sha256_hex(text.as_bytes()),
+            entries: config.entries.len(),
+        });
+        Ok(config)
+    }
+
+    /// The file's fingerprint, if it was loaded from one.
+    #[must_use]
+    pub fn fingerprint(&self) -> Option<&Fingerprint> {
+        self.fingerprint.as_ref()
     }
 
     /// Validates config `text`; `origin` names it in error messages.
@@ -179,7 +213,10 @@ impl Config {
             })
             .collect::<Result<_, _>>()?;
 
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            fingerprint: None,
+        })
     }
 
     /// The entries, in file order.
@@ -334,6 +371,34 @@ mod tests {
     use crate::error::LakeScanError;
     use crate::model::RuleId;
     use crate::suppress::date::Date;
+
+    #[test]
+    fn a_loaded_config_is_fingerprinted_by_sha256_and_entry_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // FIPS 180-2's test vector.
+        assert_eq!(
+            super::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let text =
+            "version = 1\n\n[[suppress]]\nrule = \"sensitive-key\"\nkey = \"a\"\nreason = \"r\"\n";
+        let path =
+            std::env::temp_dir().join(format!("lakescan-fingerprint-{}.toml", std::process::id()));
+        std::fs::write(&path, text)?;
+        let loaded = super::Config::load(&path);
+        std::fs::remove_file(&path).ok();
+        let loaded = loaded?;
+        assert_eq!(
+            loaded.fingerprint(),
+            Some(&super::Fingerprint {
+                sha256: super::sha256_hex(text.as_bytes()),
+                entries: 1,
+            })
+        );
+        // Parsed from text, there is no file to fingerprint.
+        assert_eq!(super::Config::parse(text, "t")?.fingerprint(), None);
+        Ok(())
+    }
 
     fn parse(text: &str) -> Result<Config, LakeScanError> {
         Config::parse(text, "test.toml")

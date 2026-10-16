@@ -20,6 +20,8 @@
 //! so a table name is stored once. [`PiiInventory::MAX_BYTES`] bounds the
 //! total, growth slack included: 17,399,872 bytes (~16.6 MiB) at the caps.
 
+use std::time::SystemTime;
+
 use crate::content::FileOutcome;
 use crate::model::{
     ColumnDetail, Confidence, Evidence, MAX_COLUMN_BYTES, NotScannedReason, RuleId, truncate_str,
@@ -157,6 +159,12 @@ pub struct InventorySummary {
     pub pii_columns: u64,
     /// Of those, the undocumented: the action items.
     pub undocumented: u64,
+    /// Of the undocumented, those whose highest confidence is `confirmed`.
+    pub undocumented_confirmed: u64,
+    /// Of the undocumented, those whose highest confidence is `likely`.
+    pub undocumented_likely: u64,
+    /// Of the undocumented, those whose highest confidence is `possible`.
+    pub undocumented_possible: u64,
     /// Of those, the documented.
     pub documented: u64,
     /// Tables with at least one file not scanned.
@@ -302,6 +310,9 @@ pub struct Table {
     /// Per reason (indexed by [`NotScannedReason::index`]): files not
     /// scanned, `[unsuppressed, suppressed]`.
     not_scanned: [[u64; 2]; NUM_REASONS],
+    /// The earliest and latest `last_modified` of the table's files,
+    /// scanned or not.
+    dates: Option<(SystemTime, SystemTime)>,
     /// Sorted by `(column, rule)`.
     entries: Vec<InventoryEntry>,
 }
@@ -314,8 +325,23 @@ impl Table {
             files_eligible: 0,
             files_scanned: 0,
             not_scanned: [[0; 2]; NUM_REASONS],
+            dates: None,
             entries: Vec::new(),
         }
+    }
+
+    /// The `last_modified` of the table's oldest and newest Parquet files,
+    /// scanned or not; `None` before any file.
+    #[must_use]
+    pub fn file_dates(&self) -> Option<(SystemTime, SystemTime)> {
+        self.dates
+    }
+
+    fn offer_dates(&mut self, oldest: SystemTime, newest: SystemTime) {
+        self.dates = Some(match self.dates {
+            Some((low, high)) => (low.min(oldest), high.max(newest)),
+            None => (oldest, newest),
+        });
     }
 
     /// The table's name; `""` for the bucket root.
@@ -411,6 +437,9 @@ impl Table {
         }
         if let Some(key) = &other.example_key {
             self.offer_example(key);
+        }
+        if let Some((oldest, newest)) = other.dates {
+            self.offer_dates(oldest, newest);
         }
     }
 
@@ -514,7 +543,14 @@ impl PiiInventory {
             for entry in &table.entries {
                 summary.pii_columns += 1;
                 match entry.status() {
-                    Status::Undocumented => summary.undocumented += 1,
+                    Status::Undocumented => {
+                        summary.undocumented += 1;
+                        match entry.highest_confidence() {
+                            Confidence::Confirmed => summary.undocumented_confirmed += 1,
+                            Confidence::Likely => summary.undocumented_likely += 1,
+                            Confidence::Possible => summary.undocumented_possible += 1,
+                        }
+                    }
                     Status::Documented { .. } => summary.documented += 1,
                 }
             }
@@ -522,10 +558,20 @@ impl PiiInventory {
         summary
     }
 
-    /// Records one eligible Parquet file: how its scan ended and, if it
-    /// was not scanned, whether its `content-not-scanned` finding was
-    /// suppressed.
-    pub(super) fn observe_file(&mut self, key: &str, outcome: FileOutcome, suppressed: bool) {
+    /// Records one eligible Parquet file, last modified at `modified`: how
+    /// its scan ended and, if it was not scanned, whether its
+    /// `content-not-scanned` finding was suppressed. A sniffed object that
+    /// is not Parquet belongs to no table and is ignored.
+    pub(super) fn observe_file(
+        &mut self,
+        key: &str,
+        outcome: FileOutcome,
+        suppressed: bool,
+        modified: SystemTime,
+    ) {
+        if outcome == FileOutcome::SniffedNotParquet {
+            return;
+        }
         let Some(table) = self
             .table_index(table_of(key))
             .and_then(|index| self.tables.get_mut(index))
@@ -535,7 +581,9 @@ impl PiiInventory {
         };
         let add = |total: &mut u64| *total = total.saturating_add(1);
         add(&mut table.files_eligible);
+        table.offer_dates(modified, modified);
         match outcome {
+            FileOutcome::SniffedNotParquet => {}
             FileOutcome::ScannedWhole | FileOutcome::ScannedPartially => {
                 add(&mut table.files_scanned);
             }
@@ -703,8 +751,15 @@ mod tests {
     use super::{
         EvidenceKind, InventorySummary, PiiInventory, Status, Table, TableStatus, table_of,
     };
+    use std::time::{Duration, SystemTime};
+
     use crate::content::FileOutcome;
     use crate::model::{ColumnDetail, Confidence, Evidence, NotScannedReason, RuleId};
+
+    /// `days` after the epoch.
+    fn at(days: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(days * 86_400)
+    }
 
     #[test]
     fn tables_are_named_by_the_key_s_directory_without_partitions_or_data() {
@@ -777,17 +832,21 @@ mod tests {
         let dob = ColumnDetail::new("dob", Confidence::Likely, Evidence::ColumnName);
         inventory.observe_pii("t/dt=2/b.parquet", RuleId::PiiDateOfBirth, &dob, Some(7));
         inventory.observe_pii("t/dt=1/a.parquet", RuleId::PiiDateOfBirth, &dob, Some(2));
-        inventory.observe_file("t/dt=1/a.parquet", FileOutcome::ScannedWhole, false);
+        inventory.observe_file("t/dt=1/a.parquet", FileOutcome::ScannedWhole, false, at(5));
         inventory.observe_file(
             "t/dt=9/z.parquet",
             FileOutcome::NotScanned(NotScannedReason::Unreadable),
             true,
+            at(1),
         );
         inventory.observe_file(
             "t/dt=9/y.parquet",
             FileOutcome::NotScanned(NotScannedReason::Unreadable),
             false,
+            at(9),
         );
+        // Sniffed and not Parquet: no table, no file.
+        inventory.observe_file("t/dt=9/x", FileOutcome::SniffedNotParquet, false, at(20));
 
         let [table] = inventory.tables() else {
             unreachable!("one table: {inventory:?}");
@@ -795,6 +854,8 @@ mod tests {
         assert_eq!(table.name(), "t");
         assert_eq!(table.example_key(), Some("t/dt=1/a.parquet"));
         assert_eq!((table.files_eligible, table.files_scanned), (3, 1));
+        // Every file's date counts, scanned or not.
+        assert_eq!(table.file_dates(), Some((at(1), at(9))));
         assert_eq!(table.files_not_scanned(), 2);
         assert_eq!(
             table.not_scanned_suppressed(NotScannedReason::Unreadable),
@@ -832,14 +893,14 @@ mod tests {
     /// One observation, replayed in many orders and splits.
     #[derive(Debug, Clone)]
     enum Event {
-        File(String, FileOutcome, bool),
+        File(String, FileOutcome, bool, SystemTime),
         Pii(String, RuleId, &'static str, Confidence, Option<usize>),
     }
 
     fn apply(inventory: &mut PiiInventory, event: &Event) {
         match event {
-            Event::File(key, outcome, suppressed) => {
-                inventory.observe_file(key, *outcome, *suppressed);
+            Event::File(key, outcome, suppressed, modified) => {
+                inventory.observe_file(key, *outcome, *suppressed, *modified);
             }
             Event::Pii(key, rule, column, confidence, suppression) => {
                 inventory.observe_pii(key, *rule, &detail(column, *confidence), *suppression);
@@ -860,7 +921,8 @@ mod tests {
                 } else {
                     FileOutcome::ScannedWhole
                 };
-                out.push(Event::File(key.clone(), outcome, file == 1));
+                let modified = at(u64::try_from((table * 7 + file * 3) % 11).unwrap_or(0));
+                out.push(Event::File(key.clone(), outcome, file == 1, modified));
                 for (index, (column, rule)) in columns.iter().zip(rules).enumerate() {
                     if (table + index) % 3 == 0 || file == 2 {
                         let confidence = [
@@ -980,6 +1042,66 @@ mod tests {
         }
     }
 
+    /// A small deterministic generator for the randomized test below.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from((self.0 >> 33) % u64::try_from(n.max(1)).unwrap_or(1)).unwrap_or(0)
+        }
+    }
+
+    /// Property: under tiny caps, any observation order split into any
+    /// number of parts at random points, each observed alone and merged
+    /// back in a random order, equals one pass over everything: the same
+    /// tables, entries, counts, file dates and left-out counts.
+    #[test]
+    fn random_orders_and_random_splits_merged_back_equal_a_single_pass() {
+        let events = events();
+        let mut rng = Lcg(0x5eed);
+        for (max_tables, max_entries) in [(3, 4), (2, 9), (7, 2), (1, 1), (12, 100), (0, 3)] {
+            let single = observe(&events, max_tables, max_entries);
+            assert_eq!(
+                totals(&single),
+                totals(&observe(&events, 64, 1024)),
+                "conserved, caps {max_tables}/{max_entries}"
+            );
+            for round in 0..40 {
+                let order = shuffled(events.clone(), 1000 + round);
+                let parts = 1 + rng.below(6);
+                let mut cuts: Vec<usize> = (1..parts).map(|_| rng.below(order.len() + 1)).collect();
+                cuts.sort_unstable();
+                let mut pieces = Vec::new();
+                let mut from = 0;
+                for cut in cuts.into_iter().chain([order.len()]) {
+                    pieces.push(observe(
+                        order.get(from..cut).unwrap_or_default(),
+                        max_tables,
+                        max_entries,
+                    ));
+                    from = cut;
+                }
+                // Merge in a random order.
+                let mut merged = PiiInventory::with_caps(max_tables, max_entries);
+                while !pieces.is_empty() {
+                    merged.merge(pieces.swap_remove(rng.below(pieces.len())));
+                }
+                assert_eq!(
+                    merged, single,
+                    "round {round}, {parts} parts, caps {max_tables}/{max_entries}"
+                );
+                assert_eq!(
+                    (merged.left_out_files(), merged.left_out_findings()),
+                    (single.left_out_files(), single.left_out_findings())
+                );
+            }
+        }
+    }
+
     #[test]
     fn over_a_cap_the_smallest_tables_and_entries_are_kept_and_the_rest_counted() {
         let events = events();
@@ -1046,14 +1168,14 @@ mod tests {
         let mut inventory = PiiInventory::default();
         let unreadable = FileOutcome::NotScanned(NotScannedReason::Unreadable);
         // Never read: unknown, not clean.
-        inventory.observe_file("dark/a.parquet", unreadable, false);
+        inventory.observe_file("dark/a.parquet", unreadable, false, at(0));
         // Partly read, nothing found.
-        inventory.observe_file("half/a.parquet", FileOutcome::ScannedWhole, false);
-        inventory.observe_file("half/b.parquet", unreadable, true);
+        inventory.observe_file("half/a.parquet", FileOutcome::ScannedWhole, false, at(0));
+        inventory.observe_file("half/b.parquet", unreadable, true, at(0));
         // Fully read, nothing found.
-        inventory.observe_file("clean/a.parquet", FileOutcome::ScannedWhole, false);
+        inventory.observe_file("clean/a.parquet", FileOutcome::ScannedWhole, false, at(0));
         // PII: two undocumented locations and one documented.
-        inventory.observe_file("pii/a.parquet", FileOutcome::ScannedWhole, false);
+        inventory.observe_file("pii/a.parquet", FileOutcome::ScannedWhole, false, at(0));
         for (column, suppression) in [("zip", None), ("email", Some(0)), ("phone", None)] {
             let detail = detail(column, Confidence::Confirmed);
             inventory.observe_pii("pii/a.parquet", RuleId::PiiEmail, &detail, suppression);
@@ -1079,6 +1201,10 @@ mod tests {
                 tables_with_pii: 1,
                 pii_columns: 3,
                 undocumented: 2,
+                // Both undocumented locations are confirmed.
+                undocumented_confirmed: 2,
+                undocumented_likely: 0,
+                undocumented_possible: 0,
                 documented: 1,
                 tables_not_fully_scanned: 2,
                 // half's unscanned file is documented; dark's is not.
@@ -1106,7 +1232,7 @@ mod tests {
         let column = "c".repeat(400);
         for table in 0..(super::MAX_TABLES + 300) {
             let key = format!("{table:05}{}/{}", "t".repeat(1100), "k".repeat(200));
-            inventory.observe_file(&key, FileOutcome::ScannedWhole, false);
+            inventory.observe_file(&key, FileOutcome::ScannedWhole, false, at(0));
             for n in 0..5 {
                 let detail = ColumnDetail::new(
                     &format!("{n}{column}"),

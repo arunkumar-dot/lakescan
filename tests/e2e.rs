@@ -4,11 +4,12 @@
 //! Ignored by default, since they need that server. To run them:
 //!
 //! ```text
-//! docker run --rm -d -p 5000:5000 motoserver/moto:5.2.3
-//! export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
-//! export LAKESCAN_E2E_ENDPOINT=http://localhost:5000
-//! cargo run --example seed_local -- "$LAKESCAN_E2E_ENDPOINT"
-//! cargo test --test e2e -- --ignored
+//! docker run --rm -d -p 5001:5000 motoserver/moto:5.2.3
+//! AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+//!   cargo run --example seed_local -- http://localhost:5001
+//! AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+//!   LAKESCAN_E2E_ENDPOINT=http://localhost:5001 \
+//!   cargo test --test e2e -- --ignored
 //! ```
 
 #[path = "support/seed_manifest.rs"]
@@ -29,9 +30,9 @@ type TestResult = Result<(), Box<dyn Error>>;
 fn endpoint() -> Result<String, Box<dyn Error>> {
     std::env::var("LAKESCAN_E2E_ENDPOINT").map_err(|_| {
         "LAKESCAN_E2E_ENDPOINT is not set. These tests need a seeded S3-compatible \
-         server: start motoserver/moto:5.2.3 on port 5000, run \
-         `cargo run --example seed_local -- http://localhost:5000`, then set \
-         LAKESCAN_E2E_ENDPOINT=http://localhost:5000 (see this file's header)"
+         server: start motoserver/moto:5.2.3 on host port 5001, run \
+         `cargo run --example seed_local -- http://localhost:5001`, then set \
+         LAKESCAN_E2E_ENDPOINT=http://localhost:5001 (see this file's header)"
             .into()
     })
 }

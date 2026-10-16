@@ -62,7 +62,7 @@ use parquet::file::reader::ChunkReader;
 use parquet::file::serialized_reader::SerializedPageReader;
 use parquet::schema::types::{ColumnDescPtr, ColumnDescriptor};
 
-use super::budget::{FileBudget, Permit};
+use super::budget::{FileBudget, Permit, Refused};
 use super::classify::{Evidence, Kind, classify};
 use super::clean::{clean, drop_dominant};
 use super::fetch::{FetchError, ObjectReader};
@@ -392,6 +392,14 @@ async fn fetch_range<R: ObjectReader, B: Window>(
     }
 }
 
+/// Why a file is not scanned when the budget refuses it permits.
+fn not_scanned(refused: Refused) -> NotScannedReason {
+    match refused {
+        Refused::OverNeed => NotScannedReason::Unreadable,
+        Refused::TimedOut => NotScannedReason::BudgetTimeout,
+    }
+}
+
 /// One file's reads: the reader, the object, its budget account, and the
 /// running counts.
 pub(super) struct Session<R, B> {
@@ -431,13 +439,11 @@ impl<R: ObjectReader, B: Window> Session<R, B> {
         self.stats.bytes_read = self.stats.bytes_read.saturating_add(returned);
     }
 
-    /// Permits for `bytes`. Refused only past the largest single-file
-    /// need, which the caps rule out: the file is then unreadable.
+    /// Permits for `bytes`. Refused past the largest single-file need,
+    /// which the caps rule out (the file is then unreadable), or after
+    /// waiting too long (`budget-timeout`).
     async fn permit(&mut self, bytes: u64) -> Result<Permit, NotScannedReason> {
-        self.budget
-            .acquire(bytes)
-            .await
-            .ok_or(NotScannedReason::Unreadable)
+        self.budget.acquire(bytes).await.map_err(not_scanned)
     }
 
     /// Reads `start..end` under permits for its length, counting the
@@ -1001,11 +1007,17 @@ impl<R: ObjectReader, B: Window> Session<R, B> {
         descr: &ColumnDescPtr,
         decode_bytes: u64,
     ) -> Result<ColumnRead, NotScannedReason> {
-        let Some(work) = self.budget.acquire(decode_bytes).await else {
-            return Ok(ColumnRead::Unreadable);
+        // A column over the single-file need is skipped as unreadable; a
+        // wait past the limit gives up on the whole file.
+        let work = match self.budget.acquire(decode_bytes).await {
+            Ok(permit) => permit,
+            Err(Refused::OverNeed) => return Ok(ColumnRead::Unreadable),
+            Err(refused @ Refused::TimedOut) => return Err(not_scanned(refused)),
         };
-        let Some(sample) = self.budget.acquire(SAMPLE_BYTES).await else {
-            return Ok(ColumnRead::Unreadable);
+        let sample = match self.budget.acquire(SAMPLE_BYTES).await {
+            Ok(permit) => permit,
+            Err(Refused::OverNeed) => return Ok(ColumnRead::Unreadable),
+            Err(refused @ Refused::TimedOut) => return Err(not_scanned(refused)),
         };
         let chunk = chunk.clone();
         let descr = Arc::clone(descr);

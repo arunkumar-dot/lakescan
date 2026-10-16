@@ -9,10 +9,10 @@ use serde::Serialize;
 
 use super::findings::DetailFields;
 use super::rfc3339::format_rfc3339;
-use super::{TOOL_NAME, TOOL_VERSION, status_of};
+use super::{SAMPLING_METHOD, ScanSettings, TOOL_NAME, TOOL_VERSION, expiry_of, status_of};
 use crate::aggregate::{
     Aggregates, ContentSummary, CountBytes, Coverage, InventoryEntry, InventorySummary,
-    MAX_ENTRIES, MAX_TABLES, PiiInventory, Sample, SampleDetail, Table,
+    MAX_ENTRIES, MAX_TABLES, OutOfScope, PiiInventory, Sample, SampleDetail, Table,
 };
 use crate::error::LakeScanError;
 use crate::model::{NotScannedReason, RuleId, Severity};
@@ -30,6 +30,49 @@ struct ScanSection<'a> {
     prefix: Option<&'a str>,
     started_at: String,
     elapsed_ms: u64,
+    settings: SettingsSection<'a>,
+}
+
+/// `scan.settings`: what the run was asked to do. The `--pii` settings are
+/// `null` without `--pii`; the config file is named by its fingerprint,
+/// never its path.
+#[derive(Serialize)]
+struct SettingsSection<'a> {
+    pii: bool,
+    pii_whole_file_max: Option<u64>,
+    pii_sniff: Option<&'static str>,
+    coalesce_gap: Option<u64>,
+    concurrency: Option<usize>,
+    memory_budget: Option<u64>,
+    fail_on: &'static str,
+    prefix: Option<&'a str>,
+    config: Option<ConfigSection<'a>>,
+}
+
+#[derive(Serialize)]
+struct ConfigSection<'a> {
+    sha256: &'a str,
+    entries: usize,
+}
+
+impl<'a> SettingsSection<'a> {
+    fn new(settings: &'a ScanSettings, prefix: Option<&'a str>) -> Self {
+        let pii = settings.pii.as_ref();
+        Self {
+            pii: pii.is_some(),
+            pii_whole_file_max: pii.map(|pii| pii.whole_file_max),
+            pii_sniff: pii.map(|pii| pii.sniff.code()),
+            coalesce_gap: pii.map(|pii| pii.coalesce_gap),
+            concurrency: pii.map(|pii| pii.concurrency),
+            memory_budget: pii.map(|pii| pii.memory_budget),
+            fail_on: settings.fail_on.map_or("none", Severity::code),
+            prefix,
+            config: settings.config.as_ref().map(|config| ConfigSection {
+                sha256: &config.sha256,
+                entries: config.entries,
+            }),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -248,6 +291,7 @@ struct ContentSection {
     columns_skipped: ColumnsSkipped,
     bytes_read: u64,
     get_requests: u64,
+    sniffed: u64,
 }
 
 #[derive(Serialize)]
@@ -279,6 +323,7 @@ impl ContentSection {
             },
             bytes_read: summary.bytes_read,
             get_requests: summary.get_requests,
+            sniffed: summary.sniffed,
         }
     }
 }
@@ -306,24 +351,68 @@ struct DistinctContentSection {
     duplicates_significant: bool,
 }
 
-/// The `coverage` section: [`Coverage`], field for field.
+/// The `coverage` section: [`Coverage`], field for field, then what was
+/// out of scope and how what was in scope was inspected.
 #[derive(Serialize)]
-struct CoverageSection {
+struct CoverageSection<'a> {
     files_eligible: u64,
     files_scanned: u64,
     not_scanned_suppressed: u64,
     not_scanned_unsuppressed: u64,
     percent: Option<f64>,
+    out_of_scope: OutOfScopeSection<'a>,
+    sampling: SamplingSection,
 }
 
-impl From<Coverage> for CoverageSection {
-    fn from(coverage: Coverage) -> Self {
+/// `coverage.out_of_scope`: listed objects content scanning did not read.
+#[derive(Serialize)]
+struct OutOfScopeSection<'a> {
+    objects: u64,
+    by_extension: Vec<ExtensionEntry<'a>>,
+    other_extensions: u64,
+    sniffed_not_parquet: u64,
+    empty: u64,
+}
+
+#[derive(Serialize)]
+struct ExtensionEntry<'a> {
+    extension: &'a str,
+    count: u64,
+}
+
+/// `coverage.sampling`: inspection is sampled in every mode.
+#[derive(Serialize)]
+struct SamplingSection {
+    method: &'static str,
+    exhaustive: bool,
+}
+
+impl<'a> CoverageSection<'a> {
+    fn new(coverage: Coverage, scope: &'a OutOfScope) -> Self {
+        let (listed, other) = scope.by_extension();
         Self {
             files_eligible: coverage.files_eligible,
             files_scanned: coverage.files_scanned,
             not_scanned_suppressed: coverage.not_scanned_suppressed,
             not_scanned_unsuppressed: coverage.not_scanned_unsuppressed,
             percent: coverage.percent,
+            out_of_scope: OutOfScopeSection {
+                objects: scope.objects(),
+                by_extension: listed
+                    .into_iter()
+                    .map(|entry| ExtensionEntry {
+                        extension: entry.extension,
+                        count: entry.count,
+                    })
+                    .collect(),
+                other_extensions: other,
+                sniffed_not_parquet: scope.sniffed_not_parquet(),
+                empty: scope.empty(),
+            },
+            sampling: SamplingSection {
+                method: SAMPLING_METHOD,
+                exhaustive: false,
+            },
         }
     }
 }
@@ -348,6 +437,7 @@ struct InventoryColumn<'a> {
     files_suppressed: u64,
     status: &'static str,
     reason: Option<&'a str>,
+    expires: Option<String>,
 }
 
 impl<'a> InventoryColumn<'a> {
@@ -364,6 +454,7 @@ impl<'a> InventoryColumn<'a> {
             files_suppressed: entry.files_suppressed,
             status,
             reason,
+            expires: expiry_of(entry.status(), suppressions).map(|date| date.to_string()),
         }
     }
 }
@@ -377,6 +468,8 @@ struct InventoryTable<'a> {
     files_not_scanned: u64,
     not_scanned: BTreeMap<&'static str, NotScannedCounts>,
     example_key: Option<&'a str>,
+    oldest_file: Option<String>,
+    newest_file: Option<String>,
     columns: Vec<InventoryColumn<'a>>,
 }
 
@@ -399,6 +492,8 @@ impl<'a> InventoryTable<'a> {
                 })
                 .collect(),
             example_key: table.example_key(),
+            oldest_file: table.file_dates().map(|(oldest, _)| format_rfc3339(oldest)),
+            newest_file: table.file_dates().map(|(_, newest)| format_rfc3339(newest)),
             columns: table
                 .entries()
                 .iter()
@@ -426,6 +521,9 @@ struct InventorySummarySection {
     tables_with_pii: u64,
     pii_columns: u64,
     undocumented: u64,
+    undocumented_confirmed: u64,
+    undocumented_likely: u64,
+    undocumented_possible: u64,
     documented: u64,
     tables_not_fully_scanned: u64,
     tables_not_fully_scanned_documented: u64,
@@ -437,6 +535,9 @@ impl From<InventorySummary> for InventorySummarySection {
             tables_with_pii: summary.tables_with_pii,
             pii_columns: summary.pii_columns,
             undocumented: summary.undocumented,
+            undocumented_confirmed: summary.undocumented_confirmed,
+            undocumented_likely: summary.undocumented_likely,
+            undocumented_possible: summary.undocumented_possible,
             documented: summary.documented,
             tables_not_fully_scanned: summary.tables_not_fully_scanned,
             tables_not_fully_scanned_documented: summary.tables_not_fully_scanned_documented,
@@ -449,6 +550,7 @@ impl From<InventorySummary> for InventorySummarySection {
 struct PiiInventorySection<'a> {
     summary: InventorySummarySection,
     tables: Vec<InventoryTable<'a>>,
+    truncated: bool,
     left_out: LeftOut,
     caps: Caps,
 }
@@ -462,6 +564,7 @@ impl<'a> PiiInventorySection<'a> {
                 .iter()
                 .map(|table| InventoryTable::from_table(table, suppressions))
                 .collect(),
+            truncated: inventory.truncated(),
             left_out: LeftOut {
                 files: inventory.left_out_files(),
                 findings: inventory.left_out_findings(),
@@ -493,7 +596,7 @@ struct Summary<'a> {
     inventory: InventorySection<'a>,
     findings: Vec<FindingSummary>,
     content: Option<ContentSection>,
-    coverage: Option<CoverageSection>,
+    coverage: Option<CoverageSection<'a>>,
     pii_inventory: Option<PiiInventorySection<'a>>,
     suppressions: SuppressionsSection<'a>,
     samples: SamplesSection<'a>,
@@ -619,6 +722,7 @@ fn build<'a>(info: &'a super::ScanInfo, aggregates: &'a Aggregates) -> Summary<'
             prefix: info.prefix.as_deref(),
             started_at: format_rfc3339(info.started_at),
             elapsed_ms: u64::try_from(info.elapsed.as_millis()).unwrap_or(u64::MAX),
+            settings: SettingsSection::new(&info.settings, info.prefix.as_deref()),
         },
         verdict: VerdictSection {
             worst_severity: aggregates.worst_severity().map(Severity::code),
@@ -626,7 +730,10 @@ fn build<'a>(info: &'a super::ScanInfo, aggregates: &'a Aggregates) -> Summary<'
         inventory: inventory_section(aggregates),
         findings: findings_section(aggregates),
         content: aggregates.content().map(ContentSection::from_summary),
-        coverage: aggregates.coverage().map(CoverageSection::from),
+        coverage: aggregates
+            .coverage()
+            .zip(aggregates.out_of_scope())
+            .map(|(coverage, scope)| CoverageSection::new(coverage, scope)),
         pii_inventory: aggregates
             .pii_inventory()
             .map(|inventory| PiiInventorySection::from_inventory(inventory, &info.suppressions)),
@@ -1036,10 +1143,32 @@ mod tests {
                 "files_scanned": 3,
                 "not_scanned_suppressed": 1,
                 "not_scanned_unsuppressed": 0,
-                "percent": 75.0
+                "percent": 75.0,
+                // id_rsa, old/dataset.bin, unknown/object.dat and
+                // docs/examples/id_rsa have no Parquet extension and are
+                // sniffed; the folder marker and placeholder are empty.
+                "out_of_scope": {
+                    "objects": 9,
+                    "by_extension": [
+                        { "extension": "csv", "count": 1 },
+                        { "extension": "jpg", "count": 1 },
+                        { "extension": "tar", "count": 1 }
+                    ],
+                    "other_extensions": 0,
+                    "sniffed_not_parquet": 4,
+                    "empty": 2
+                },
+                "sampling": {
+                    "method": crate::report::SAMPLING_METHOD,
+                    "exhaustive": false
+                }
             }))
         );
-        let inventory = value.get("pii_inventory").ok_or("no pii_inventory")?;
+        the_inventory_matches(value.get("pii_inventory").ok_or("no pii_inventory")?);
+        Ok(())
+    }
+
+    fn the_inventory_matches(inventory: &Value) {
         assert_eq!(
             inventory.get("left_out"),
             Some(&serde_json::json!({ "files": 0, "findings": 0 }))
@@ -1073,6 +1202,9 @@ mod tests {
                 "tables_with_pii": 1,
                 "pii_columns": 3,
                 "undocumented": 2,
+                "undocumented_confirmed": 1,
+                "undocumented_likely": 1,
+                "undocumented_possible": 0,
                 "documented": 1,
                 "tables_not_fully_scanned": 1,
                 "tables_not_fully_scanned_documented": 1
@@ -1090,7 +1222,8 @@ mod tests {
                 "files_possible": 0,
                 "files_suppressed": 2,
                 "status": "documented",
-                "reason": "Names are needed for invoicing (DPA section 4)"
+                "reason": "Names are needed for invoicing (DPA section 4)",
+                "expires": "2027-06-30"
             }))
         );
         assert_eq!(
@@ -1115,7 +1248,6 @@ mod tests {
             inventory.pointer("/tables/0/example_key"),
             Some(&Value::Null)
         );
-        Ok(())
     }
 
     #[test]

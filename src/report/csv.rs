@@ -20,13 +20,14 @@
 use std::io::Write;
 
 use super::escape::escaped;
-use super::status_of;
+use super::rfc3339::format_rfc3339;
+use super::{expiry_of, status_of};
 use crate::aggregate::Aggregates;
 use crate::error::LakeScanError;
 use crate::suppress::Outcome;
 
 /// The header row, in column order.
-pub(super) const HEADER: [&str; 12] = [
+pub(super) const HEADER: [&str; 15] = [
     "table",
     "column",
     "rule",
@@ -39,6 +40,9 @@ pub(super) const HEADER: [&str; 12] = [
     "status",
     "reason",
     "example_key",
+    "oldest_file",
+    "newest_file",
+    "expires",
 ];
 
 /// `field`, escaped and made safe to open in a spreadsheet (see this
@@ -104,6 +108,17 @@ pub(super) fn write<W: Write>(
                 status.to_owned(),
                 reason.unwrap_or_default().to_owned(),
                 table.example_key().unwrap_or_default().to_owned(),
+                table
+                    .file_dates()
+                    .map(|(oldest, _)| format_rfc3339(oldest))
+                    .unwrap_or_default(),
+                table
+                    .file_dates()
+                    .map(|(_, newest)| format_rfc3339(newest))
+                    .unwrap_or_default(),
+                expiry_of(entry.status(), suppressions)
+                    .map(|date| date.to_string())
+                    .unwrap_or_default(),
             ];
             write_record(out, &record).map_err(LakeScanError::Report)?;
         }

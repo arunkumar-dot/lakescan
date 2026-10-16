@@ -49,9 +49,11 @@ one file each, look at one `ObjectMeta` at a time and raise `Finding`s:
 rule never looks across objects and never touches the network.
 
 **PII content scanner** ([`src/content/`](../src/content/)). Only with
-`--pii`, and only for keys ending in `.parquet` or `.parq`. It reads a small
-file whole in one request, or reads a large file's footer and the first
-pages of each candidate column. It then cleans the sampled values
+`--pii`. Keys ending in `.parquet` or `.parq` are eligible, and so are
+extensionless objects (and objects whose extension is not a known
+non-Parquet format) after one 8-byte sniff for the `PAR1` magic. It
+downloads a small file whole in one request, or reads a large file's footer
+and the first pages of each candidate column, and samples either way. It then cleans the sampled values
 (`clean.rs`), validates them (`detect.rs`), checks column names
 (`names.rs`) and decides a confidence per column (`classify.rs`). Up to
 `--concurrency` files are scanned at once, under one `--memory-budget`
@@ -100,7 +102,7 @@ object is `STANDARD`, it is not empty, and it is younger than 90 days.
 
 **3. Read.** The key ends in `.parquet` and `--pii` is on, so the content
 scanner takes it. At 1,909,661 bytes it is under the 8 MiB
-`--pii-whole-file-max`, so it is read whole, in one `GET`. An extra run,
+`--pii-whole-file-max`, so it is downloaded whole, in one `GET`. An extra run,
 scoped to this file's prefix, shows that:
 
 ```text
@@ -108,13 +110,14 @@ $ lakescan scan s3://lakescan-pii/lake/customers/dt=2026-01-01/ --endpoint-url h
 ...
 CONTENT
   parquet files:      1
-    scanned whole:     1
-    scanned partially: 0
+    downloaded whole:  1
+    read partially:    0
     not scanned:       0
   columns examined:   15
   columns skipped:    2 (repeated=1, unsupported-type=1, page-too-large=0, unreadable=0, unsupported-codec=0)
   bytes read:         1909661 (1.8 MiB)
   GET requests:       1
+  sniffed:            0 (objects without a Parquet extension; one 8-byte GET each)
 ```
 
 The file has 17 leaf columns (the struct `billing` holds two: `email` and
@@ -130,10 +133,11 @@ requests:
 ```text
 $ lakescan scan s3://lakescan-pii/lake/customers/dt=2026-01-01/ --endpoint-url http://localhost:5001 --pii --quiet --pii-whole-file-max 0
 ...
-    scanned partially: 1
+    read partially:    1
 ...
   bytes read:         972453 (949.6 KiB)
   GET requests:       4
+  sniffed:            0 (objects without a Parquet extension; one 8-byte GET each)
 ```
 
 With `--coalesce-gap 0` as well, it reads each range on its own: `bytes
@@ -178,14 +182,14 @@ one entry per (table, column, rule). This file is also the table's
 step e's CSV:
 
 ```text
-lake/customers,email,pii-email,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet
+lake/customers,email,pii-email,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,
 ```
 
 Documented, from step f2's CSV (all 4 files now counted as suppressed,
-with the reason):
+with the reason and the expiry):
 
 ```text
-lake/customers,email,pii-email,confirmed,values,0,0,0,4,documented,"Consented marketing contacts, DPA-12",lake/customers/dt=2026-01-01/part-0.parquet
+lake/customers,email,pii-email,confirmed,values,0,0,0,4,documented,"Consented marketing contacts, DPA-12",lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,2027-06-30
 ```
 
 ## The demo, step by step
@@ -194,7 +198,7 @@ lake/customers,email,pii-email,confirmed,values,0,0,0,4,documented,"Consented ma
 
 ```text
 $ docker run --rm -d --name lakescan-demo-moto -p 5001:5000 motoserver/moto:5.2.3
--> moto is up on http://localhost:5001 (on macOS, AirPlay Receiver owns port 5000, hence 5001)
+-> moto is up on http://localhost:5001 (on macOS, AirPlay Receiver owns port 5000, hence 5001; set MOTO_PORT to use another)
 $ export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
 $ cargo build --release
     Finished `release` profile [optimized] target(s) in 0.24s
@@ -211,6 +215,8 @@ What to notice:
   across three listing pages, with planted problems. `lakescan-pii` holds
   the 11 Parquet fixtures under lake-like keys.
 - The script stops moto when it exits, even on Ctrl-C.
+- `MOTO_PORT` (default `5001`) is the host port. On macOS, AirPlay Receiver already owns 5000.
+- The script exports the dummy credentials for its own process tree only. Do not leave `AWS_ENDPOINT_URL` exported afterwards: a later scan of a real bucket would be sent to that endpoint. `--endpoint-url` on the command is the flag for an S3-compatible service.
 - Everything it writes goes to `target/demo/`, which git ignores.
 
 In the steps below, `lakescan` means `target/release/lakescan`.
@@ -249,8 +255,9 @@ What to notice:
 $ lakescan scan s3://lakescan-demo --endpoint-url http://localhost:5001
 lakescan 0.1.0
 s3://lakescan-demo
-started:  2026-10-16T05:01:49Z
-elapsed:  0.170s
+settings: pii=off fail-on=high prefix=(none) config=(none)
+started:  2026-10-16T16:52:42Z
+elapsed:  0.195s
 
 VERDICT
   worst severity: high
@@ -319,8 +326,19 @@ $ pretty-print summary.json | head -45
   "scan": {
     "bucket": "lakescan-demo",
     "prefix": null,
-    "started_at": "2026-10-16T05:01:49Z",
-    "elapsed_ms": 158
+    "started_at": "2026-10-16T16:52:43Z",
+    "elapsed_ms": 175,
+    "settings": {
+      "pii": false,
+      "pii_whole_file_max": null,
+      "pii_sniff": null,
+      "coalesce_gap": null,
+      "concurrency": null,
+      "memory_budget": null,
+      "fail_on": "high",
+      "prefix": null,
+      "config": null
+    }
   },
   "verdict": {
     "worst_severity": "high"
@@ -368,24 +386,30 @@ FINDINGS
 
 CONTENT
   parquet files:      11
-    scanned whole:     8
-    scanned partially: 0
+    downloaded whole:  8
+    read partially:    0
     not scanned:       3 (not-parquet=1, unreadable=1, no-column-examined=1)
   columns examined:   107
   columns skipped:    17 (repeated=7, unsupported-type=9, page-too-large=1, unreadable=0, unsupported-codec=0)
   bytes read:         11594785 (11.0 MiB)
   GET requests:       11
+  sniffed:            0 (objects without a Parquet extension; one 8-byte GET each)
 
 COVERAGE
   parquet files:  11
   scanned:        8 (72.7%)
   not scanned:    0 documented, 3 undocumented
+  inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  Not in scope for --pii: none by extension
+  sniffed, not Parquet: 0
+  empty objects and folder markers: 0
 
 PII INVENTORY
-  4 tables with PII, 31 PII columns: 31 undocumented (action needed), 0 documented. 2 tables not fully scanned (0 documented).
-  bad  files: 0 scanned, 2 not scanned (not-parquet=1 undocumented, unreadable=1 undocumented)
+  4 tables with PII, 31 PII columns: 31 undocumented (25 confirmed, 6 likely, 0 possible), 0 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented).
+  Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
+  bad  files: 0 scanned, 2 not scanned (not-parquet=1 undocumented, unreadable=1 undocumented); files dated 2026-10-16 to 2026-10-16
     not scanned: PII unknown
-  lake/customers  files: 4 scanned, 0 not scanned
+  lake/customers  files: 4 scanned, 0 not scanned; files dated 2026-10-16 to 2026-10-16
     example: lake/customers/dt=2026-01-01/part-0.parquet
     aadhaar_no  pii-in-aadhaar  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
     billing.email  pii-email  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
@@ -394,10 +418,10 @@ PII INVENTORY
     email  pii-email  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
     full_name  pii-person-name  likely  evidence=column-name  4 files likely  UNDOCUMENTED
 ...
-  lake/events  files: 1 scanned, 0 not scanned
+  lake/events  files: 1 scanned, 0 not scanned; files dated 2026-10-16 to 2026-10-16
     example: lake/events/data/dt=2026-01-01/part-0.parquet
     contact_email  pii-email  confirmed  evidence=values  1 file confirmed  UNDOCUMENTED
-  skipped  files: 0 scanned, 1 not scanned (no-column-examined=1 undocumented)
+  skipped  files: 0 scanned, 1 not scanned (no-column-examined=1 undocumented); files dated 2026-10-16 to 2026-10-16
     not scanned: PII unknown
 exit code: 6
 ```
@@ -428,12 +452,12 @@ $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --i
 lakescan: 3 of 11 eligible Parquet files could not be content-scanned and are not documented (not-parquet=1, unreadable=1, no-column-examined=1)
 ...
 $ head -6 inventory.csv
-table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,files_possible,files_suppressed,status,reason,example_key
-lake/customers,aadhaar_no,pii-in-aadhaar,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet
-lake/customers,billing.email,pii-email,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet
-lake/customers,card_number,pii-card-number,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet
-lake/customers,contact,pii-phone,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet
-lake/customers,dob,pii-date-of-birth,likely,column-name,0,4,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet
+table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,files_possible,files_suppressed,status,reason,example_key,oldest_file,newest_file,expires
+lake/customers,aadhaar_no,pii-in-aadhaar,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,
+lake/customers,billing.email,pii-email,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,
+lake/customers,card_number,pii-card-number,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,
+lake/customers,contact,pii-phone,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,
+lake/customers,dob,pii-date-of-birth,likely,column-name,0,4,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,
   ... (31 rows; full file: .../target/demo/inventory.csv)
 exit code: 6
 ```
@@ -476,24 +500,29 @@ COVERAGE
   parquet files:  11
   scanned:        8 (72.7%)
   not scanned:    1 documented, 2 undocumented
+  inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  Not in scope for --pii: none by extension
+  sniffed, not Parquet: 0
+  empty objects and folder markers: 0
 
 PII INVENTORY
-  4 tables with PII, 31 PII columns: 30 undocumented (action needed), 1 documented. 2 tables not fully scanned (0 documented).
-  bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 undocumented)
+  4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented).
+  Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
+  bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 undocumented); files dated 2026-10-16 to 2026-10-16
     not scanned: PII unknown
-  lake/customers  files: 4 scanned, 0 not scanned
+  lake/customers  files: 4 scanned, 0 not scanned; files dated 2026-10-16 to 2026-10-16
     example: lake/customers/dt=2026-01-01/part-0.parquet
     aadhaar_no  pii-in-aadhaar  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
     billing.email  pii-email  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
 ...
     pan  pii-in-pan  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
-    email  pii-email  confirmed  evidence=values  4 files, documented: Consented marketing contacts, DPA-12
+    email  pii-email  confirmed  evidence=values  4 files, documented until 2027-06-30: Consented marketing contacts, DPA-12
 exit code: 6
 ```
 
 What to notice:
 
-- `email` moved to the end of its table as documented, with its reason.
+- `email` moved to the end of its table as documented, with its reason and the date it applies until (`documented until 2027-06-30`).
   Undocumented entries are listed first.
 - `billing.email` is a different column path, so it is still
   undocumented. The same is true of `email` in the `_gzip` and `_brotli`
@@ -522,13 +551,18 @@ COVERAGE
   parquet files:  11
   scanned:        8 (72.7%)
   not scanned:    3 documented, 0 undocumented
+  inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  Not in scope for --pii: none by extension
+  sniffed, not Parquet: 0
+  empty objects and folder markers: 0
 
 PII INVENTORY
-  4 tables with PII, 31 PII columns: 30 undocumented (action needed), 1 documented. 2 tables not fully scanned (2 documented).
-  bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 documented)
+  4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (2 documented).
+  Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
+  bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 documented); files dated 2026-10-16 to 2026-10-16
     not scanned: PII unknown
 $ grep ',documented,' documented.csv
-lake/customers,email,pii-email,confirmed,values,0,0,0,4,documented,"Consented marketing contacts, DPA-12",lake/customers/dt=2026-01-01/part-0.parquet
+lake/customers,email,pii-email,confirmed,values,0,0,0,4,documented,"Consented marketing contacts, DPA-12",lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,2027-06-30
 exit code: 1
 ```
 
@@ -572,14 +606,14 @@ What to notice:
 
 ```text
 $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --config demo.toml --html report.html --quiet > /dev/null
-report.html: 16231 bytes
+report.html: 17735 bytes
 $ open report.html
 exit code: 1
 ```
 
 What to notice:
 
-- It is one ~16 KB file with inline CSS and script, and a
+- It is one ~18 KB file with inline CSS and script, and a
   Content-Security-Policy of `default-src 'none'`, so opening it makes no
   network request.
 - **Action needed** banner at the top, with headline cards below it.
@@ -621,7 +655,7 @@ $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --q
 $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --quiet --findings findings-c16.jsonl --inventory inventory-c16.csv > summary-c16.txt
 ...
 exit codes: 6 (--concurrency 1) and 6 (default)
-$ diff <(grep -v -E "^(started|elapsed):" summary-c1.txt) <(grep -v -E "^(started|elapsed):" summary-c16.txt)
+$ diff <(grep -v -E "^(started|elapsed|settings):" summary-c1.txt) <(grep -v -E "^(started|elapsed|settings):" summary-c16.txt)
 $ diff findings-c1.jsonl findings-c16.jsonl
 $ diff inventory-c1.csv inventory-c16.csv
 -> No diff output: the summary, the findings stream and the inventory are identical.
@@ -632,8 +666,9 @@ What to notice:
 - With 16 files in flight, they finish in any order. The driver still
   applies results in listing order, so every output is identical, byte
   for byte.
-- The only differences are the `started:` and `elapsed:` lines, which
-  are left out of the comparison.
+- The only differences are the `started:`, `elapsed:` and `settings:`
+  lines (`settings` records concurrency), which are left out of the
+  comparison.
 - That determinism is what makes reports diffable between runs.
 
 ## Exit codes
@@ -761,15 +796,17 @@ type. They set the severity:
 - `possible` (info): a name hint with no value evidence.
 
 **Coverage.** How many of the eligible Parquet files were actually
-scanned, and of the rest, how many are documented. It is shown as the
-COVERAGE section, and `coverage` in JSON.
+scanned, and of the rest, how many are documented. It also says the
+inspection was sampled (never exhaustive), and counts objects that were
+not in scope for `--pii` by extension. It is shown as the COVERAGE
+section, and `coverage` in JSON.
 
 **Fail-closed.** When LakeScan can't check something, it fails instead of
 passing. One undocumented unscanned file among thousands makes the exit
 code 6, and a table with no file scanned says `PII unknown`, never "no
 PII".
 
-**Memory budget.** The `--memory-budget` limit (256 MiB by default) on
+**Memory budget.** The `--memory-budget` limit (512 MiB by default) on
 the bytes in-flight content scans may hold. Every fetch and decode takes
 permits for its size before it starts. One file needs at most ~103 MiB,
 so a smaller budget is a usage error. The bucket's size never changes

@@ -466,11 +466,15 @@ pub enum NotScannedReason {
     FetchFailed,
     /// The schema has more leaf columns than the per-file cap (16,384).
     TooManyColumns,
+    /// The file waited more than 10 minutes for memory-budget permits
+    /// (`--memory-budget`), so it was given up rather than left to hold
+    /// up the run.
+    BudgetTimeout,
 }
 
 impl NotScannedReason {
     /// Every reason, in declaration order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::NotParquet,
         Self::Unreadable,
         Self::AccessDenied,
@@ -479,6 +483,7 @@ impl NotScannedReason {
         Self::NoColumnExamined,
         Self::FetchFailed,
         Self::TooManyColumns,
+        Self::BudgetTimeout,
     ];
 
     /// The stable code, e.g. `"not-parquet"`. **Frozen contract**.
@@ -493,6 +498,7 @@ impl NotScannedReason {
             Self::NoColumnExamined => "no-column-examined",
             Self::FetchFailed => "fetch-failed",
             Self::TooManyColumns => "too-many-columns",
+            Self::BudgetTimeout => "budget-timeout",
         }
     }
 
@@ -508,6 +514,7 @@ impl NotScannedReason {
             Self::NoColumnExamined => 5,
             Self::FetchFailed => 6,
             Self::TooManyColumns => 7,
+            Self::BudgetTimeout => 8,
         }
     }
 }
@@ -733,6 +740,7 @@ mod tests {
         );
         assert_eq!(NotScannedReason::FetchFailed.code(), "fetch-failed");
         assert_eq!(NotScannedReason::TooManyColumns.code(), "too-many-columns");
+        assert_eq!(NotScannedReason::BudgetTimeout.code(), "budget-timeout");
         assert_eq!(Evidence::ColumnName.code(), "column-name");
         assert_eq!(
             Evidence::Values {

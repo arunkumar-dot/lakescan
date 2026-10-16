@@ -58,7 +58,12 @@
 //! per-table `status` (M8), and the `fetch-failed` reason and
 //! `summary.tables_not_fully_scanned_documented` (M9), and the
 //! `too-many-columns` reason (M10) were added under
-//! this policy, so the version is still 1. M8 also made a PII rule's
+//! this policy, so the version is still 1. M11.1 added, still at version
+//! 1: `scan.settings`, `content.sniffed`, the `budget-timeout` reason,
+//! `coverage.out_of_scope` and `coverage.sampling`,
+//! `pii_inventory.truncated`, the undocumented confidence split on
+//! `pii_inventory.summary`, `oldest_file` and `newest_file` on a table,
+//! and `expires` on an inventory column. M8 also made a PII rule's
 //! `bytes` and `suppressed.bytes` always 0: they double-counted files
 //! (once per column), and a consumer summing them was already wrong.
 //!
@@ -70,7 +75,20 @@
 //!     "bucket": string,
 //!     "prefix": string | null,
 //!     "started_at": string,       // RFC 3339, UTC, seconds precision
-//!     "elapsed_ms": integer
+//!     "elapsed_ms": integer,
+//!     "settings": {               // the flags this run used; never a path
+//!       "pii": bool,
+//!       "pii_whole_file_max": integer | null, // null without --pii
+//!       "pii_sniff": string | null,           // "unknown" or "none"
+//!       "coalesce_gap": integer | null,
+//!       "concurrency": integer | null,
+//!       "memory_budget": integer | null,
+//!       "fail_on": string,        // Severity::code(), or "none"
+//!       "prefix": string | null,
+//!       "config": { "sha256": string, "entries": integer } | null
+//!                                 // the --config file's SHA-256 and how
+//!                                 // many entries it has; null without one
+//!     }
 //!   },
 //!   "verdict": { "worst_severity": string | null },  // Severity::code(), or null if no finding
 //!   "inventory": {
@@ -112,11 +130,13 @@
 //!     }
 //!   ],
 //!   "content": {                   // null unless --pii was given
-//!     "files_eligible": integer,   // keys ending .parquet/.parq (any case)
-//!     "scanned_whole": integer,    // read in one GetObject
+//!     "files_eligible": integer,   // .parquet/.parq keys, plus sniffed
+//!                                  // objects that are Parquet
+//!     "scanned_whole": integer,    // downloaded whole, in one GetObject,
+//!                                  // then sampled like any other file
 //!     "scanned_partially": integer,// footer + sampled pages
 //!     "not_scanned": {             // one key per NotScannedReason::code(),
-//!       "not-parquet": integer,    // always all eight, zero when none
+//!       "not-parquet": integer,    // always all nine, zero when none
 //!       "unreadable": integer,
 //!       "access-denied": integer,
 //!       "encrypted": integer,
@@ -125,7 +145,8 @@
 //!                                  // values could be read was skipped
 //!       "fetch-failed": integer,   // a GetObject still failed after the
 //!                                  // SDK's retries (M9)
-//!       "too-many-columns": integer // over 16,384 leaf columns (M10)
+//!       "too-many-columns": integer, // over 16,384 leaf columns (M10)
+//!       "budget-timeout": integer  // waited over 10 minutes for permits
 //!     },
 //!     "columns_examined": integer, // candidate columns sampled and classified
 //!     "columns_skipped": {
@@ -136,24 +157,45 @@
 //!       "unsupported_codec": integer // a codec not decoded safely (LZO)
 //!     },
 //!     "bytes_read": integer,       // bytes returned by every GetObject
-//!     "get_requests": integer      // GetObject requests made
+//!     "get_requests": integer,     // GetObject requests made, sniffs included
+//!     "sniffed": integer           // extensionless or unknown-extension
+//!                                  // objects given one 8-byte ranged GET
 //!   },
 //!   "coverage": {                  // null unless --pii was given
 //!     "files_eligible": integer,   // as content.files_eligible
-//!     "files_scanned": integer,    // scanned whole or partially
+//!     "files_scanned": integer,    // downloaded whole or read partially
 //!     "not_scanned_suppressed": integer,   // content-not-scanned finding
 //!                                  // suppressed: documented
 //!     "not_scanned_unsuppressed": integer, // undocumented; any of these
 //!                                  // fails the run with exit code 6
-//!     "percent": number | null     // files_scanned / files_eligible * 100,
+//!     "percent": number | null,    // files_scanned / files_eligible * 100,
 //!                                  // rounded down to one decimal; null
 //!                                  // when files_eligible is 0
+//!     "out_of_scope": {            // listed objects content scanning did
+//!       "objects": integer,        // not read
+//!       "by_extension": [          // the most common, at most 32
+//!         { "extension": string, "count": integer }
+//!                                  // extension is "" for none; escaped
+//!                                  // and cut, because keys are hostile
+//!       ],
+//!       "other_extensions": integer, // objects whose extension was not
+//!                                  // one of the 32 listed
+//!       "sniffed_not_parquet": integer, // sniffed, and not Parquet
+//!       "empty": integer           // zero-byte objects and folder markers
+//!     },
+//!     "sampling": {
+//!       "method": string,          // how a column is sampled
+//!       "exhaustive": bool         // always false: a sample is not the file
+//!     }
 //!   },
 //!   "pii_inventory": {             // null unless --pii was given
 //!     "summary": {                 // the headline, over tables held:
 //!       "tables_with_pii": integer,  // tables with a PII location
 //!       "pii_columns": integer,    // (table, column, rule) locations
 //!       "undocumented": integer,   // of those: the action items
+//!       "undocumented_confirmed": integer, // of undocumented, by the
+//!       "undocumented_likely": integer,    // location's highest confidence
+//!       "undocumented_possible": integer,
 //!       "documented": integer,
 //!       "tables_not_fully_scanned": integer, // with any file not scanned
 //!       "tables_not_fully_scanned_documented": integer // of those, every
@@ -179,6 +221,9 @@
 //!         },
 //!         "example_key": string | null, // the smallest key in the table
 //!                                  // with a PII finding; at most 1 KiB
+//!         "oldest_file": string | null, // RFC 3339 of the oldest and
+//!         "newest_file": string | null, // newest last_modified among the
+//!                                  // table's eligible Parquet files
 //!         "columns": [             // sorted by column, then rule
 //!           {
 //!             "column": string,    // the column path, at most 256 bytes
@@ -193,13 +238,16 @@
 //!             "files_suppressed": integer,
 //!             "status": string,    // "UNDOCUMENTED" if any file's finding
 //!                                  // was not suppressed, else "documented"
-//!             "reason": string | null // documented only: the reason of the
+//!             "reason": string | null, // documented only: the reason of the
 //!                                  // first --config entry (file order)
 //!                                  // that suppressed any of them
+//!             "expires": string | null // YYYY-MM-DD when that entry expires;
+//!                                  // null otherwise
 //!           }
 //!         ]
 //!       }
 //!     ],
+//!     "truncated": bool,           // true when left_out is non-zero
 //!     "left_out": {                // what the caps dropped, exactly:
 //!       "files": integer,          // files in tables left out
 //!       "findings": integer        // findings in tables or entries left out
@@ -300,14 +348,88 @@ pub use findings::FindingsWriter;
 use sink::Sink;
 
 use crate::aggregate::{Aggregates, Status};
+use crate::content::{MAX_ROW_GROUPS, MAX_VALUES_PER_ROW_GROUP, Sniff};
 use crate::error::{ExitCode, LakeScanError};
-use crate::suppress::Outcome;
+use crate::model::Severity;
+use crate::suppress::{Fingerprint, Outcome};
 
 /// This build's name and version, for the report's `tool` section —
 /// `env!` constants from `Cargo.toml`, not configuration: there is exactly
 /// one tool and one version per build.
 const TOOL_NAME: &str = env!("CARGO_PKG_NAME");
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How content is inspected, in every mode, as every format states it.
+pub(crate) const SAMPLING_METHOD: &str = "sampled: the dictionary and first data page of each \
+     column in up to 3 row groups, at most 2,000 values per column per row group; files read \
+     whole are downloaded whole but sampled the same way";
+
+const _: () = assert!(MAX_ROW_GROUPS == 3 && MAX_VALUES_PER_ROW_GROUP == 2000);
+
+/// Content-scanning settings for one run: `--pii` and the flags it enables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PiiSettings {
+    /// `--pii-whole-file-max`.
+    pub whole_file_max: u64,
+    /// `--pii-sniff`.
+    pub sniff: Sniff,
+    /// `--coalesce-gap`.
+    pub coalesce_gap: u64,
+    /// `--concurrency`.
+    pub concurrency: usize,
+    /// `--memory-budget`.
+    pub memory_budget: u64,
+}
+
+/// What a run was asked to do, recorded in every report so a result is
+/// read with the settings that produced it. Never the config file's path.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScanSettings {
+    /// Content scanning and its settings; `None` without `--pii`.
+    pub pii: Option<PiiSettings>,
+    /// `--fail-on`; `None` for `none`.
+    pub fail_on: Option<Severity>,
+    /// The `--config` file's fingerprint, if one was given.
+    pub config: Option<Fingerprint>,
+}
+
+impl ScanSettings {
+    /// The one line the text summary and the HTML report show. `prefix`
+    /// is bucket-derived in effect (it names keys): the caller escapes it
+    /// with the rest of the line.
+    pub(crate) fn line(&self, prefix: Option<&str>) -> String {
+        let mut parts = Vec::new();
+        match &self.pii {
+            Some(pii) => parts.push(format!(
+                "pii=on whole-file-max={} sniff={} coalesce-gap={} concurrency={} memory-budget={}",
+                pii.whole_file_max,
+                pii.sniff.code(),
+                pii.coalesce_gap,
+                pii.concurrency,
+                pii.memory_budget
+            )),
+            None => parts.push("pii=off".to_owned()),
+        }
+        parts.push(format!(
+            "fail-on={}",
+            self.fail_on.map_or("none", Severity::code)
+        ));
+        parts.push(format!("prefix={}", prefix.unwrap_or("(none)")));
+        parts.push(match &self.config {
+            Some(config) => format!(
+                "config=sha256:{} ({})",
+                config.sha256,
+                text::counted(
+                    u64::try_from(config.entries).unwrap_or(u64::MAX),
+                    "entry",
+                    "entries"
+                )
+            ),
+            None => "config=(none)".to_owned(),
+        });
+        parts.join(" ")
+    }
+}
 
 /// What a report's header describes about the scan that produced it.
 ///
@@ -327,6 +449,8 @@ pub struct ScanInfo {
     /// The `--config` entries that expired or went unused during this
     /// scan; empty without `--config`.
     pub suppressions: Outcome,
+    /// The settings the scan ran with.
+    pub settings: ScanSettings,
 }
 
 /// Which shape [`write_summary`] renders: machine-readable or human-readable.
@@ -408,6 +532,15 @@ pub fn write_html<W: Write>(
 #[cfg(test)]
 pub(crate) fn parse_csv(text: &str) -> Option<Vec<Vec<String>>> {
     csv::parse(text)
+}
+
+/// The expiry date of the suppression entry that documents an inventory
+/// entry with `status`, if it is documented and the entry expires.
+fn expiry_of(status: Status, suppressions: &Outcome) -> Option<crate::suppress::Date> {
+    match status {
+        Status::Undocumented => None,
+        Status::Documented { entry } => suppressions.expires.get(entry).copied().flatten(),
+    }
 }
 
 /// An inventory entry's status as every format spells it: `"UNDOCUMENTED"`,

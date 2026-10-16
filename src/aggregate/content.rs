@@ -12,9 +12,11 @@ const NUM_REASONS: usize = NotScannedReason::ALL.len();
 /// only when `--pii` was given.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContentSummary {
-    /// Objects whose key names a Parquet file.
+    /// Parquet files: keys ending `.parquet` or `.parq`, and sniffed
+    /// objects found to be Parquet (or whose sniff failed).
     pub files_eligible: u64,
-    /// Files read whole, in one request.
+    /// Files downloaded whole, in one request (then sampled like any
+    /// other).
     pub scanned_whole: u64,
     /// Files read partially (footer and sampled pages).
     pub scanned_partially: u64,
@@ -38,8 +40,11 @@ pub struct ContentSummary {
     pub skipped_unsupported_codec: u64,
     /// Bytes read from S3 for content scanning.
     pub bytes_read: u64,
-    /// `GetObject` requests made for content scanning.
+    /// `GetObject` requests made for content scanning, sniffs included.
     pub get_requests: u64,
+    /// Objects without a Parquet extension sniffed for the Parquet magic
+    /// (`--pii-sniff unknown`), Parquet or not.
+    pub sniffed: u64,
 }
 
 impl ContentSummary {
@@ -51,8 +56,11 @@ impl ContentSummary {
     /// whether its `content-not-scanned` finding, if any, was suppressed.
     pub(super) fn observe(&mut self, scan: &FileScan, suppressed: bool) {
         let add = |total: &mut u64, n: u64| *total = total.saturating_add(n);
-        add(&mut self.files_eligible, 1);
+        if scan.outcome != FileOutcome::SniffedNotParquet {
+            add(&mut self.files_eligible, 1);
+        }
         match scan.outcome {
+            FileOutcome::SniffedNotParquet => {}
             FileOutcome::ScannedWhole => add(&mut self.scanned_whole, 1),
             FileOutcome::ScannedPartially => add(&mut self.scanned_partially, 1),
             FileOutcome::NotScanned(reason) => {
@@ -84,6 +92,7 @@ impl ContentSummary {
         );
         add(&mut self.bytes_read, stats.bytes_read);
         add(&mut self.get_requests, stats.get_requests);
+        add(&mut self.sniffed, stats.sniffed);
     }
 
     /// Folds `other` in. Order-independent.
@@ -118,6 +127,7 @@ impl ContentSummary {
             other.skipped_unsupported_codec,
         );
         add(&mut self.bytes_read, other.bytes_read);
+        add(&mut self.sniffed, other.sniffed);
         add(&mut self.get_requests, other.get_requests);
     }
 

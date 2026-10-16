@@ -8,7 +8,8 @@ exit codes, the rule codes and the JSON summary's `schema_version`.
 
 The first release: an S3 bucket audit from the object listing, and, with
 `--pii`, a scan of Parquet files for personal data, run in your own account
-with read-only access.
+with read-only access. A discovery aid, not a compliance assessment: no
+finding does not prove there is no personal data.
 
 ### Bucket audit (no object contents read)
 
@@ -53,14 +54,35 @@ with read-only access.
 - Coverage fails closed: a Parquet file that could not be scanned
   (unreadable, encrypted, access denied, too wide, and so on) fails the run
   with exit code 6 until a suppression documents it.
+- Parquet files without an extension (as Athena CTAS and Trino write them)
+  are found by sniffing: one 8-byte ranged GET per object with no
+  extension, or one not known to be another format, checks the `PAR1`
+  magic (`--pii-sniff unknown`, the default; `none` turns it off).
+- Every output says what it could not say: inspection is sampled in every
+  mode (a whole-file download is still sampled); objects out of scope are
+  counted by extension, with sniffed non-Parquet objects and empty ones; a
+  table with nothing found reads "No structured PII detected in sampled
+  data from N files"; and a truncated inventory is flagged in the text, the
+  HTML report, on stderr and in JSON.
+- Column-name hints for people's names and dates of birth no longer fire
+  on `product_name`, `file_name`, `birth_place` and the like.
+- Each table shows the date range of its files; a documented location
+  shows when its suppression expires; the undocumented count is split by
+  confidence.
 - Concurrent scanning (`--concurrency`) within a memory budget
-  (`--memory-budget`), with nearby page reads coalesced into one request
-  (`--coalesce-gap`). Output is identical at any concurrency.
+  (`--memory-budget`, 512 MiB by default, at most 64 GiB), with nearby page
+  reads coalesced into one request (`--coalesce-gap`). Output is identical
+  at any concurrency. A file that waits more than 10 minutes for memory is
+  `content-not-scanned` with reason `budget-timeout`.
 
 ### Reports and release
 
 - `--html`: a self-contained, offline HTML report with every name escaped
   and no personal-data values.
+- Every report records the scan's settings, and a `--config` file by its
+  SHA-256 and entry count, never its path.
+- Output files are written to a temporary file and renamed into place only
+  when the run completes, so a failed run never leaves a partial report.
 - JSON `schema_version` 1 is now **stable**, under an additive-only
   compatibility policy. The last breaking change before the freeze:
   `largest_objects` entries no longer carry `severity`, which was always

@@ -34,6 +34,14 @@ regex = "1.13.1"
 # features already put in the build, so they add no code.
 flate2 = { version = "=1.1.10", default-features = false, features = ["zlib-rs"] }
 brotli = { version = "=9.0.0", default-features = false, features = ["std"] }
+# The --config file's SHA-256, recorded in every report. Pinned to exactly
+# the version and features aws-sdk-s3 already puts in the build, so it adds
+# no code.
+sha2 = "=0.11.0"
+
+# Test-only: tokio's paused clock, for the memory budget's wait limit.
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [lib]
 name = "lakescan"

@@ -6,15 +6,16 @@
 
 use std::time::{Duration, SystemTime};
 
-use super::ScanInfo;
+use super::{PiiSettings, ScanInfo, ScanSettings};
 use crate::aggregate::Aggregates;
 use crate::content::{ColumnFinding, FileOutcome, FileScan, FileStats};
+use crate::content::{Scope, Sniff};
 use crate::model::{
     ColumnDetail, Confidence, Evidence, Finding, NotScannedReason, ObjectMeta, PiiType, RuleId,
     StorageClass,
 };
 use crate::rules::{self, EvalContext};
-use crate::suppress::{Config, Date, Outcome, Suppressor};
+use crate::suppress::{Config, Date, Fingerprint, Outcome, Suppressor};
 
 /// The fixed "now" every fixture object and the fixture [`ScanInfo`] are
 /// built relative to.
@@ -98,7 +99,7 @@ pub(super) fn objects() -> Vec<ObjectMeta> {
         object(
             "warehouse/customers/dt=2023-11-01/part-0.parquet",
             5_000_000,
-            0,
+            13,
             "etag-10",
             StorageClass::Standard,
         ),
@@ -179,6 +180,22 @@ fn scan_of(key: &str) -> FileScan {
     }
 }
 
+/// A sniff that found no Parquet magic: one 8-byte GET. Every fixture
+/// object without a Parquet extension that is sniffed (`id_rsa`,
+/// `old/dataset.bin`, ...) is one of these.
+fn sniffed_not_parquet() -> FileScan {
+    FileScan {
+        outcome: FileOutcome::SniffedNotParquet,
+        columns: Vec::new(),
+        stats: FileStats {
+            bytes_read: 8,
+            get_requests: 1,
+            sniffed: 1,
+            ..FileStats::default()
+        },
+    }
+}
+
 /// The fixture suppression config: one entry that suppresses
 /// `docs/examples/id_rsa`, one that expired before [`now`] (2023-11-14),
 /// and one that matches nothing.
@@ -207,6 +224,7 @@ rule = "pii-person-name"
 prefix = "warehouse/customers/"
 column = "full_name"
 reason = "Names are needed for invoicing (DPA section 4)"
+expires = 2027-06-30
 
 [[suppress]]
 rule = "content-not-scanned"
@@ -230,8 +248,13 @@ fn run() -> (Aggregates, Outcome) {
         for finding in rules::evaluate(object, &ctx) {
             route(&mut aggregates, &mut suppressor, finding);
         }
-        if crate::content::is_eligible(&object.key) {
-            let scan = scan_of(&object.key);
+        let scope = crate::content::scope_of(object, crate::content::Sniff::Unknown);
+        if matches!(scope, Scope::Parquet | Scope::Sniff) {
+            let scan = if scope == Scope::Sniff {
+                sniffed_not_parquet()
+            } else {
+                scan_of(&object.key)
+            };
             let mut suppressed = false;
             for finding in scan.findings(object) {
                 let covered = route(&mut aggregates, &mut suppressor, finding);
@@ -240,6 +263,8 @@ fn run() -> (Aggregates, Outcome) {
                 }
             }
             aggregates.observe_content(object, &scan, suppressed);
+        } else {
+            aggregates.observe_out_of_scope(&scope);
         }
     }
     (aggregates, suppressor.finish())
@@ -319,5 +344,19 @@ pub(super) fn scan_info() -> ScanInfo {
         started_at: now(),
         elapsed: Duration::from_millis(1234),
         suppressions: run().1,
+        settings: ScanSettings {
+            pii: Some(PiiSettings {
+                whole_file_max: crate::content::DEFAULT_WHOLE_FILE_MAX,
+                sniff: Sniff::Unknown,
+                coalesce_gap: crate::content::DEFAULT_COALESCE_GAP,
+                concurrency: crate::content::DEFAULT_CONCURRENCY,
+                memory_budget: crate::content::DEFAULT_MEMORY_BUDGET,
+            }),
+            fail_on: Some(crate::model::Severity::High),
+            config: Some(Fingerprint {
+                sha256: crate::suppress::config::sha256_hex(CONFIG.as_bytes()),
+                entries: 5,
+            }),
+        },
     }
 }

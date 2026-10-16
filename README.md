@@ -1,17 +1,15 @@
 # LakeScan
 
-LakeScan audits an S3 bucket from its object listing. It pages through
-`ListObjectsV2`, checks every object against a small set of rules (secret-looking
-keys, deprecated or wasteful storage classes, stale data, empty objects), sets
-aside findings you have explicitly accepted, and writes a summary as text or
-JSON. It exits with a code your CI can act on.
+LakeScan finds personal data in an S3 data lake and audits the bucket from
+its object listing. It pages through `ListObjectsV2` and checks every object
+against a small set of rules (secret-looking keys, deprecated or wasteful
+storage classes, stale data, empty objects). With `--pii` it also looks
+inside Parquet files for structured personal data: emails, phone numbers,
+Indian PAN and Aadhaar numbers, card numbers, IP addresses, and, by column
+name, people's names and dates of birth. It reports which columns hold what,
+never the values themselves, and exits with a code your CI can act on.
 
-With `--pii`, it also looks inside Parquet files for personal data (emails,
-phone numbers, Indian PAN and Aadhaar numbers, card numbers, IP addresses,
-and, by column name, people's names and dates of birth). It reads a small part
-of each file, not the whole of it, and reports which columns hold what. It
-never reports the values themselves. See
-[PII content scanning](#pii-content-scanning).
+A discovery aid, not a compliance assessment: no finding does not prove there is no personal data.
 
 Where the product is headed, and why, is in [docs/PRODUCT.md](docs/PRODUCT.md).
 
@@ -19,7 +17,7 @@ Memory use does not grow with the bucket. Every stage has a fixed budget: one
 listing page in flight, fixed-size summaries, and a streaming writer. Scanning
 ten objects or ten billion uses the same memory.
 
-## Install
+## Run the release binary
 
 Download the archive for your platform from the
 [Releases](https://github.com/arunkumar-dot/lakescan/releases) page, along
@@ -56,16 +54,19 @@ gh attestation verify "lakescan-$VERSION-$TARGET.tar.gz" --repo arunkumar-dot/la
 ```
 
 **macOS: the binary is not signed.** macOS quarantines files downloaded by a
-browser and refuses to run an unsigned binary from one. Having verified the
-checksum, remove the quarantine attribute:
+browser and refuses to run an unsigned binary from one. After the checksum
+above has matched, remove the quarantine attribute from that exact file:
 
 ```sh
-xattr -d com.apple.quarantine ./lakescan
+xattr -d com.apple.quarantine "lakescan-$VERSION-$TARGET/lakescan"
 ```
 
-(A download with `curl` or `gh release download` is not quarantined.)
+A download with `curl` or `gh release download` is not quarantined: there
+`xattr` answers `No such xattr: com.apple.quarantine`, which means there is
+nothing to remove.
 
-**From source**, with Rust 1.94.1 or newer:
+Installing from source, with Rust 1.94.1 or newer, is the other way to get
+the same binary:
 
 ```sh
 cargo install --locked --git https://github.com/arunkumar-dot/lakescan.git --tag v0.1.0
@@ -75,38 +76,89 @@ lakescan --version
 Or clone the repository and run `cargo build --release`; the binary is
 `target/release/lakescan`.
 
-## Quickstart: the local demo
+## Try the local demo from source
 
-The repository includes a seeder that fills a local S3 fake with a demo bucket.
-That bucket has 2,413 objects across three listing pages, a few planted
-problems, and some hostile key names. This needs Docker and no AWS account.
+The repository includes a seeder that fills a local S3 fake with a demo
+bucket. That bucket has 2,413 objects across three listing pages, a few
+planted problems, and some hostile key names. This stays on your machine:
+Docker, Rust 1.94.1 or newer (`rustc --version`), and no AWS account. moto
+accepts any credentials, so the ones below are dummies. Exit code 1 means
+the scan finished and found findings at or above `--fail-on` (here, High).
+
+`--endpoint-url` is only for an S3-compatible service such as this local
+moto. Do not put that URL in the environment: an exported `AWS_ENDPOINT_URL`
+would send a later scan of a real bucket to the wrong endpoint.
 
 ```sh
-# 1. Start moto, an in-memory S3 fake that accepts any credentials.
-#    On macOS, AirPlay Receiver already listens on port 5000, so map 5001.
+rustc --version   # 1.94.1 or newer
+
+# On macOS, AirPlay Receiver already listens on port 5000, so map 5001.
 docker run --rm -d --name lakescan-moto -p 5001:5000 motoserver/moto:5.2.3
 
-# 2. Any credentials work against moto.
-export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+  cargo run --example seed_local -- http://localhost:5001
 
-# 3. Create and fill the lakescan-demo bucket.
-cargo run --example seed_local -- http://localhost:5001
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+  cargo run --release -- scan s3://lakescan-demo --endpoint-url http://localhost:5001
+echo "exit code: $?"    # 1: findings
 
-# 4. Scan it.
-cargo run --release -- scan s3://lakescan-demo --endpoint-url http://localhost:5001
-echo "exit code: $?"    # 1: the bucket has High findings
-
-# 5. Write the same results as a self-contained HTML report, then open
-#    report.html in a browser (it loads nothing from the network).
-cargo run --release -- scan s3://lakescan-demo --endpoint-url http://localhost:5001 \
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+  cargo run --release -- scan s3://lakescan-demo --endpoint-url http://localhost:5001 \
   --html report.html --quiet > /dev/null
 open report.html        # macOS; xdg-open on Linux, start on Windows
 
 docker stop lakescan-moto
 ```
 
-On Linux, or with AirPlay Receiver turned off, you can use `-p 5000:5000` and
-`http://localhost:5000` instead.
+`scripts/demo.sh` walks the same buckets and explains each section. It
+honours `MOTO_PORT` (default 5001): `MOTO_PORT=5002 scripts/demo.sh --no-pause`.
+
+**Troubleshooting.** If `docker run` fails immediately, Docker is not
+running: start Docker Desktop, or the daemon, and try again. If it fails
+because the port is taken, something else is bound there (on macOS that is
+often AirPlay Receiver on 5000). Pick a free host port, pass it as
+`MOTO_PORT`, and use that same port in `--endpoint-url`. If the scan then
+says it cannot connect, moto is not listening on the URL you passed: `curl`
+the endpoint, and check `docker ps` for `lakescan-moto`.
+
+## Permissions
+
+A metadata scan needs `s3:ListBucket` on the bucket. `--pii` also needs
+`s3:GetObject` on the objects it reads, and `kms:Decrypt` when those objects
+use SSE-KMS. This policy lists one prefix and reads objects under it:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListThePrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::example-bucket",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["lake/customers", "lake/customers/*"] }
+      }
+    },
+    {
+      "Sid": "ReadObjectsForPii",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::example-bucket/lake/customers/*"
+    },
+    {
+      "Sid": "DecryptSseKms",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:us-east-1:111122223333:key/00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}
+```
+
+Drop the `GetObject` and `Decrypt` statements for a listing-only scan. A
+refused read is `content-not-scanned` with reason `access-denied`, and fails
+the run with exit code 6 unless you document it.
 
 ## Usage
 
@@ -134,16 +186,48 @@ container or instance credentials.
 | `--endpoint-url <URL>` | AWS | An S3-compatible endpoint (`http://` or `https://`). Implies path-style addressing. |
 | `--config <PATH>` | none | A suppression file (see [Suppressions](#suppressions)). Only used when given; never discovered automatically. |
 | `--quiet` | off | No progress line and no suppression warnings on stderr. |
-| `--pii` | off | Also scan Parquet files (keys ending in `.parquet` or `.parq`, any case) for personal data. Reads object contents; see [PII content scanning](#pii-content-scanning). Without it, no object is read. |
-| `--pii-whole-file-max <BYTES>` | `8388608` (8 MiB) | With `--pii`: Parquet files of at most `BYTES` are read whole, in one request. Larger ones are read partially. `0` to `67108864` (64 MiB). Requires `--pii`. |
-| `--concurrency <N>` | `16` | With `--pii`: Parquet files scanned at once, `1` to `256`. Output is identical for any value. Requires `--pii`. See [Speed and memory](#speed-and-memory). |
-| `--memory-budget <BYTES>` | `268435456` (256 MiB) | With `--pii`: the most bytes in-flight file scans hold at once. Must cover the most one file can need (~103 MiB at the default `--pii-whole-file-max`, ~132 MiB at 64 MiB); less is a usage error. Requires `--pii`. |
+| `--pii` | off | Also scan Parquet for structured personal data, including extensionless Parquet found by sniffing. Sampled inspection; repeated columns, free text and other formats are skipped. See [PII content scanning](#pii-content-scanning). Without it, no object is read. |
+| `--pii-sniff unknown\|none` | `unknown` | With `--pii`: which objects without a `.parquet` or `.parq` extension to sniff. `unknown` (default) sniffs a key with no extension, or an extension not on the known non-Parquet list, with one ranged GET of the last 8 bytes, and checks the `PAR1` magic. `none` sniffs nothing. Folder markers and zero-byte objects are never candidates. Each sniff is one small GET, counted in the GET totals. Requires `--pii`. |
+| `--pii-whole-file-max <BYTES>` | `8388608` (8 MiB) | With `--pii`: Parquet files of at most `BYTES` are downloaded whole, in one request, and still sampled. Larger ones are read partially. `0` to `67108864` (64 MiB). Requires `--pii`. |
+| `--concurrency <N>` | `16` | With `--pii`: Parquet files scanned at once, `1` to `256`. Findings, the inventory and the summary are the same for any value, apart from this number in the recorded settings and the timing lines. Requires `--pii`. See [Speed and memory](#speed-and-memory). |
+| `--memory-budget <BYTES>` | `536870912` (512 MiB) | With `--pii`: the most bytes in-flight file scans hold at once. Must cover the most one file can need (~103 MiB at the default `--pii-whole-file-max`, ~132 MiB at 64 MiB), and at most `68719476736` (64 GiB). Anything else is a usage error; the semaphore is created with exactly this many permits. Requires `--pii`. |
 | `--coalesce-gap <BYTES>` | `1048576` (1 MiB) | With `--pii`: page ranges of one file at most `BYTES` apart are read as one request (merged reads stay within 8 MiB). `0` reads each range alone. Requires `--pii`. |
 | `--html <PATH>` | off | Also write a self-contained [HTML report](#html-report) to `PATH`. `-` means stdout, which then requires every other output to go to a file. Works with or without `--pii`. |
 | `--inventory <PATH>` | off | With `--pii`: also write the [PII inventory](#pii-inventory-and-coverage) as CSV to `PATH`, one row per table, column and rule. `-` means stdout, which then requires `--output` to name a file, and `--findings` not to be `-`. Requires `--pii`. |
 
 A progress line (`scanned N objects, M findings`) is shown on stderr only when
 stderr is a terminal. Errors print one line to stderr, `lakescan: <error>`.
+
+### Output files
+
+Every file output (`--output`, `--findings`, `--inventory`, `--html`) is
+written to a temporary file in the same directory and renamed into place
+only when the run finishes. A failed run removes the temporary file and
+leaves any previous file untouched. Stdout is written directly, with no
+temporary file. `-` means stdout.
+
+| Flag | Writes | Stdout |
+|---|---|---|
+| `--output <PATH>` | The text or JSON summary. Omitted, or `-`, writes it to stdout. | The default destination for the summary. |
+| `--findings <PATH>` | Every unsuppressed finding as JSON Lines, as it is found. | `-` requires `--output` to name a file, so the summary is not mixed into the stream. |
+| `--inventory <PATH>` | The PII inventory as CSV. Requires `--pii`. | `-` requires `--output` to name a file, and `--findings` not to be `-`. |
+| `--html <PATH>` | A self-contained HTML report. Works with or without `--pii`. | `-` requires every other output to go to a file. |
+
+One of them may be stdout. Two may not: `--findings -` with the summary
+also on stdout is a usage error, and so is `--html -` together with any
+other stdout output. These are valid:
+
+```sh
+lakescan scan s3://example-bucket --format json > summary.json
+lakescan scan s3://example-bucket --output summary.txt --findings findings.jsonl
+lakescan scan s3://example-bucket --pii --output summary.txt --inventory inventory.csv --html report.html
+lakescan scan s3://example-bucket --pii --format json --output summary.json --findings -
+```
+
+The last one puts the findings stream on stdout and the summary in a file.
+If the inventory is truncated, the text and HTML say so, and
+`pii_inventory.truncated` in that JSON is `true`. A CSV consumer should
+check that flag: the CSV itself has no room for it.
 
 ## Exit codes
 
@@ -157,7 +241,22 @@ The numbers are a stable contract. CI can branch on them.
 | 3 | `Auth` | Credentials are missing, expired, or rejected. |
 | 4 | `Transport` | The network or S3 failed (DNS, TLS, timeouts, 5xx, an unparseable response). Often worth retrying. |
 | 5 | `Report` | The summary or findings stream could not be written (full disk, bad path, permissions). |
-| 6 | `ContentNotScanned` | `--pii` was given and at least one Parquet file could not be content-scanned (unreadable, encrypted, refused, a read that kept failing, not Parquet, or with every readable column skipped) without a `content-not-scanned` suppression documenting it. Coverage fails closed: one such file among thousands of readable ones is enough. The summary is still written, and stderr gives the counts by reason. Takes precedence over 1. |
+| 6 | `ContentNotScanned` | `--pii` was given and at least one Parquet file could not be content-scanned (unreadable, encrypted, refused, a read that kept failing, not Parquet, a wait for memory-budget permits longer than 10 minutes, or with every readable column skipped) without a `content-not-scanned` suppression documenting it. Coverage fails closed: one such file among thousands of readable ones is enough. The summary is still written, and stderr gives the counts by reason. Takes precedence over 1. |
+
+Exit code 6 is decided before 1. A run with both confirmed PII and an
+undocumented unscanned file exits 6, not 1. CI can branch on the three
+codes a finished scan uses:
+
+```sh
+lakescan scan s3://example-bucket --pii --format json --output summary.json
+code=$?
+case "$code" in
+  0) echo "scan finished; nothing at or above --fail-on" ;;
+  1) echo "findings at or above --fail-on; coverage is accounted for" ;;
+  6) echo "coverage is incomplete; read the summary before trusting it" ;;
+  *) echo "lakescan failed ($code)"; exit "$code" ;;
+esac
+```
 
 A closed pipe (`lakescan ... | head`) is not an error.
 
@@ -199,16 +298,38 @@ names one column, and its severity follows from its confidence (see
 | `pii-ip-address` | A column of IPv4 or IPv6 addresses. |
 | `pii-person-name` | A column whose name says it holds people's names (`full_name`, `lastName`, …). Detected by name only. |
 | `pii-date-of-birth` | A column whose name says it holds dates of birth (`dob`, `birth_date`, …). Detected by name only. |
-| `content-not-scanned` | `info`: a Parquet file that could not be scanned, with a reason: `not-parquet`, `unreadable`, `access-denied`, `encrypted`, `footer-too-large`, `no-column-examined` (it has string or integer columns, but every one was skipped, so no value was examined), `fetch-failed` (a `GetObject` still failed after the SDK's retries: throttling, timeouts, 5xx, an object deleted mid-scan), or `too-many-columns` (the schema has more than 16,384 leaf columns). It never stops the scan, but unless suppressed it fails the run with exit code 6 (see [Coverage](#coverage-fails-closed)). |
+| `content-not-scanned` | `info`: a Parquet file that could not be scanned, with a reason: `not-parquet`, `unreadable`, `access-denied`, `encrypted`, `footer-too-large`, `no-column-examined` (it has string or integer columns, but every one was skipped, so no value was examined), `fetch-failed` (a `GetObject` still failed after the SDK's retries: throttling, timeouts, 5xx, an object deleted mid-scan), `too-many-columns` (the schema has more than 16,384 leaf columns), or `budget-timeout` (it waited more than 10 minutes for memory-budget permits). It never stops the scan, but unless suppressed it fails the run with exit code 6 (see [Coverage](#coverage-fails-closed)). |
 
 ## PII content scanning
 
-`--pii` reads the contents of every object whose key ends in `.parquet` or
-`.parq` (in any case), up to `--concurrency` files at once (see [Speed and
+`--pii` reads Parquet, and only Parquet. A key ending in `.parquet` or
+`.parq` (any case) is eligible. With `--pii-sniff unknown` (the default),
+so is an object whose key has no extension, or an extension that is not on
+the known non-Parquet list (`.json`, `.jsonl`, `.csv`, `.tsv`, `.txt`,
+`.log`, `.gz`, `.zip`, `.avro`, `.orc`, `.xml`, `.html`, `.png`, `.jpg`,
+`.jpeg`, `.gif`, `.pdf`, and the rest of that list). Athena CTAS and
+Trino/Hive writers often omit the extension; without sniffing, a lake of
+those files would exit 0 with nothing scanned. Each candidate gets one
+ranged GET of its last 8 bytes. `PAR1` there means Parquet, and the file
+then follows the normal read plan. Anything else is counted as sniffed, not
+Parquet, and is out of scope, not a failure. Folder markers and zero-byte
+objects are never sniffed. `--pii-sniff none` turns this off. The cost is
+one small GET per candidate, included in `GET requests` and in `sniffed`.
+
+Inspection is sampled in every mode. LakeScan reads the dictionary page, if
+the writer stored one, and the first data page of a column, in up to 3 row
+groups and at most 2,000 values per column per row group. A file at or
+below `--pii-whole-file-max` is downloaded whole, in one request, and then
+sampled the same way. A whole-file download is not an exhaustive read of
+every page. Repeated (list and map) columns are skipped. Free text is not
+scanned: an email inside a notes column is not a finding. CSV, JSON, Avro,
+ORC and every other format are not read.
+
+Up to `--concurrency` files are scanned at once (see [Speed and
 memory](#speed-and-memory)).
 
 **What is read.** A file of at most `--pii-whole-file-max` bytes (8 MiB by
-default) is read whole, in one request. For a larger file, LakeScan reads:
+default) is downloaded whole, in one request. For a larger file, LakeScan reads:
 
 - the footer, with one 64 KiB tail read (plus a second read if the footer is
   longer than that), and the offset indexes, if the writer wrote them: free
@@ -330,14 +451,15 @@ reports `bytes_read` and `get_requests`, so you can see what a scan cost.
 
 Content scanning runs up to `--concurrency` files at once (16 by
 default). Results are applied in listing order, so the summary, the
-findings stream and the inventory are identical for any `--concurrency`.
+findings stream and the inventory are the same for any `--concurrency`,
+apart from the recorded `concurrency` and the timing lines.
 Decoding runs on a separate thread pool, so it doesn't stall reads.
 `GetObject` uses the SDK's adaptive retry mode, which slows down when S3
 throttles (503 `SlowDown`); a read that still fails becomes
 `content-not-scanned` with reason `fetch-failed`, which fails the run (exit
 code 6) unless documented.
 
-**Memory is bounded by `--memory-budget`** (256 MiB by default). Every read
+**Memory is bounded by `--memory-budget`** (512 MiB by default). Every read
 and every decode takes permits for its bytes (the bytes fetched, or the
 page sizes a header declares) before it starts, and gives them back when
 its buffers are freed. One file never needs more than ~103 MiB under
@@ -347,8 +469,12 @@ share the budget so that none can wait forever: each in-flight file may
 hold an equal share freely, and one file at a time may go beyond it. On
 top of the budget, each in-flight file holds a few kilobytes of state and
 up to ~0.8 MiB of page locations. A bigger budget lets more files run at
-full speed at high `--concurrency`: with 256 MiB, going past 16 adds
-little for typical files.
+full speed at high `--concurrency`: with 512 MiB, a whole-file read fits
+in each file's share at the default concurrency of 16. A file that goes
+past its share takes the one overflow lane and gives it back as soon as
+what it holds drops to its share, so the next file can use it. A wait
+longer than 10 minutes makes that file `content-not-scanned` with reason
+`budget-timeout`.
 
 **Coalescing trades bytes for requests.** Within a partially read file,
 each round's page reads (the first pages of every column in row group 0,
@@ -372,18 +498,23 @@ auditor, a customer or a regulator.
 COVERAGE
   parquet files:  11
   scanned:        8 (72.7%)
-  not scanned:    2 documented, 1 undocumented
+  not scanned:    1 documented, 2 undocumented
+  inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  Not in scope for --pii: none by extension
+  sniffed, not Parquet: 0
+  empty objects and folder markers: 0
 
 PII INVENTORY
-  4 tables with PII, 31 PII columns: 30 undocumented (action needed), 1 documented. 2 tables not fully scanned.
-  bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 documented)
+  4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented).
+  Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
+  bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 undocumented); files dated 2026-10-16 to 2026-10-16
     not scanned: PII unknown
-  lake/customers  files: 4 scanned, 0 not scanned
+  lake/customers  files: 4 scanned, 0 not scanned; files dated 2026-10-16 to 2026-10-16
     example: lake/customers/dt=2026-01-01/part-0.parquet
     aadhaar_no  pii-in-aadhaar  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
     full_name  pii-person-name  likely  evidence=column-name  4 files likely  UNDOCUMENTED
     pan  pii-in-pan  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
-    email  pii-email  confirmed  evidence=values  4 files, documented: Consented marketing contacts, DPA-12
+    email  pii-email  confirmed  evidence=values  4 files, documented until 2027-06-30: Consented marketing contacts, DPA-12
 ```
 
 (Trimmed: the real output lists every table and row.)
@@ -391,12 +522,13 @@ PII INVENTORY
 The headline counts the action items: undocumented PII locations, and
 tables with files that weren't scanned. A table never claims more than was
 read: one with no file scanned says `not scanned: PII unknown`, and one
-where nothing was found says `no PII found in N scanned files`, adding
+where nothing was found says `No structured PII detected in sampled data from N files`, adding
 `; M not scanned` when some weren't (JSON: each table's `status`,
 `pii_found`, `no_pii_in_scanned_files` or `not_scanned`, and
-`pii_inventory.summary` for the headline).
+`pii_inventory.summary` for the headline). The undocumented count is split
+by the highest confidence of each location: `30 undocumented (24 confirmed, 6 likely, 0 possible)`.
 
-**Tables.** A listing knows nothing about catalogs, so each Parquet file is
+**Tables.** Tables are inferred from object paths. A listing knows nothing about catalogs, so each Parquet file is
 put in a table by its key, a heuristic: take the directory (everything up
 to the last `/`), drop trailing Hive-style partition segments
 (`name=value`, such as `dt=2026-01-01` and `region=in`), then drop one
@@ -415,7 +547,11 @@ counts (`3 files confirmed, 1 likely`; suppressed files too, if only some
 were); it is undocumented if any file's finding was not suppressed. A
 documented line gives all its files and the reason of the first `--config`
 entry (in file order) that suppressed them: `4 files, documented: <reason>`.
-JSON and CSV keep every count. Each table
+When that entry has an expiry, the line says
+`documented until 2027-06-30: <reason>`. JSON and CSV keep every count,
+plus that date (`expires`) and the oldest and newest `last_modified` among
+the table's eligible Parquet files (`oldest_file`, `newest_file`; in text
+and HTML, `files dated 2019-03-02 to 2026-10-10`). Each table
 also gives its files scanned and not scanned, the unscanned ones by reason,
 documented or not, and an example key: the smallest key in the table with a
 PII finding. No sampled value appears, in any format.
@@ -440,7 +576,9 @@ but stays in the inventory, as documented, with that reason.
 row per table, column and rule, under a header row: `table`, `column`,
 `rule`, `highest_confidence`, `evidence`, `files_confirmed`,
 `files_likely`, `files_possible`, `files_suppressed`, `status`
-(`UNDOCUMENTED` or `documented`), `reason`, and `example_key` (the table's).
+(`UNDOCUMENTED` or `documented`), `reason`, `example_key` (the table's),
+`oldest_file`, `newest_file`, and `expires` (the documenting entry's date,
+or empty).
 It follows RFC 4180 (CRLF line ends; a field with a comma or quote is
 quoted, with quotes doubled). The CSV is a human-facing report, and table
 names, column paths, keys and reasons are attacker-controlled, so it is
@@ -457,8 +595,11 @@ byte for byte (JSON-escaped).
 kept, so the inventory's memory stays bounded (~16.5 MiB at the caps). Over
 a cap, the lexicographically smallest tables and entries are kept, the
 same whatever order files arrive in, with every kept count exact. What is
-left out is counted (files and findings) and reported in a `truncated:`
-line, `left_out` in JSON. Scan a narrower prefix to see the rest.
+left out is counted (files and findings) and reported in a `WARNING: truncated:`
+line in the text headline, an HTML banner, a warning on stderr, and
+`pii_inventory.truncated` (computed in the aggregate) plus `left_out` in
+JSON. The CSV has no flag of its own: check the JSON. Scan a narrower
+prefix to see the rest.
 
 ### HTML report
 
@@ -468,15 +609,21 @@ with its meaning; an **Action needed** banner listing what to do
 (undocumented PII columns, undocumented unscanned files, findings at the
 failing threshold), or **No action needed**; headline cards; the PII
 inventory by table, ordered as in the text summary, with status badges and
-documented reasons, and filters (All, Undocumented, Documented); the files
-not scanned, by table and reason; and the metadata findings per rule.
-Without `--pii` it has the metadata sections only.
+documented reasons, and filters (All, Undocumented, Documented); a
+**Coverage** section (files scanned, sampled inspection, and what was out of
+scope or sniffed and not Parquet); the files not scanned, by table and
+reason; and the metadata findings per rule. When the inventory's caps left
+anything out, a **PII inventory truncated** banner says so above
+everything else. The header records the scan's settings. Without `--pii` it
+has the metadata sections only.
 
 - **Offline.** All CSS and JavaScript are inline, fonts are the system's,
   and a Content-Security-Policy (`default-src 'none'`) stops the page from
   loading anything: opening it makes no network request.
 - **No values.** Like every other output, it holds no sampled personal
   data: keys, table and column names, counts, and your documented reasons.
+  The footer says: "Contains object and column names but no personal-data
+  values; share within your organization."
 - **Escaped names.** Keys, table and column names and reasons are
   attacker-controlled. Each is escaped like the text summary (control and
   bidi characters as `\u{XXXX}`, backslashes doubled), then HTML-escaped,
@@ -486,14 +633,19 @@ Without `--pii` it has the metadata sections only.
 - **Works without JavaScript**: every row is shown and the filters are
   hidden. Printing shows every row, without the filters.
 - **Deterministic**: the same for any `--concurrency`, apart from its start
-  time and duration.
+  time, duration, and the recorded concurrency.
 
 ### Coverage fails closed
 
 COVERAGE counts the eligible Parquet files, those scanned (with the
 percentage, rounded down, so it never reads 100% unless every file was
 scanned), and those not scanned, split into **documented** (their
-`content-not-scanned` finding was suppressed) and **undocumented**.
+`content-not-scanned` finding was suppressed) and **undocumented**. It also
+says inspection is sampled, and lists what was not content-scanned because
+it was out of scope, by extension (the 32 most common, plus "other";
+extensions are attacker-controlled, so they are escaped and truncated),
+plus objects that were sniffed and were not Parquet. For example:
+`Not in scope for --pii: 1,240 .json, 310 .csv (LakeScan reads Parquet content only)`.
 
 Any undocumented file fails the run with exit code 6, even among thousands
 of readable ones, and even when exit 1 would otherwise apply: an inventory
@@ -510,6 +662,8 @@ expires = 2027-04-01
 ```
 
 ## Suppressions
+
+Documented means your team recorded a reason; it is an operational exception, not a compliance approval.
 
 Some findings are expected, such as a public example key in your docs or a
 scratch prefix full of placeholders. List them in a TOML file and pass it with
@@ -553,7 +707,7 @@ Each `[[suppress]]` entry has:
 | `rule` | yes | A rule code from the table above. |
 | `key` / `prefix` | exactly one | `key` matches one key exactly. `prefix` matches every key that starts with it, and `""` matches all keys. |
 | `reason` | yes | Why the finding is acceptable. Must not be blank. |
-| `expires` | no | The last day (UTC) the entry applies. The day after, it stops suppressing and is reported as expired. |
+| `expires` | no | The last day (UTC) the entry applies, inclusive. The day after, it stops suppressing: the finding counts again, and the entry is reported as expired. A documented inventory row shows the date while the entry still applies (`documented until 2027-06-30: <reason>`). |
 | `bucket` | no | The entry applies only when scanning this bucket. For any other bucket it is ignored completely, and never reported as unused or expired. |
 | `column` | no | The entry applies only to findings on this exact column path, such as `billing.email` (PII findings). Listing findings never match it. At most 256 bytes. |
 
@@ -599,7 +753,12 @@ fields:
 - `schema_version`: `1`
 - `tool`: `name` and `version`
 - `scan`: `bucket`, `prefix` (or `null`), `started_at` (RFC 3339, UTC) and
-  `elapsed_ms`
+  `elapsed_ms`, plus `settings`: whether `pii` was set, and when it was,
+  `pii_whole_file_max`, `pii_sniff`, `coalesce_gap`, `concurrency` and
+  `memory_budget` (each `null` without `--pii`); `fail_on`; `prefix`; and
+  `config`, the `--config` file's `sha256` and `entries`, or `null`. The
+  config path is never recorded. The same line is the `settings:` header
+  in text and HTML.
 - `verdict`: `worst_severity`, or `null`
 - `inventory`: `object_count` and `total_bytes`; `by_storage_class`, one
   entry per known class with objects, with `storage_class`, `count` and
@@ -614,29 +773,37 @@ fields:
   not applicable: their findings are about columns, and a file's size
   would be counted once per column. The text summary shows `-` for them.
 - `content`: with `--pii`, Parquet files found (`files_eligible`),
-  `scanned_whole`, `scanned_partially`, and `not_scanned` by reason (every
-  reason code, `0` when none); `columns_examined`, and `columns_skipped` by
-  reason (`repeated`, `unsupported_type`, `page_too_large`, `unreadable`,
-  `unsupported_codec`); `bytes_read` and `get_requests`. `null` without
-  `--pii`.
+  `scanned_whole` (downloaded whole, then sampled), `scanned_partially`,
+  and `not_scanned` by reason (every reason code, including
+  `budget-timeout`, `0` when none); `columns_examined`, and
+  `columns_skipped` by reason (`repeated`, `unsupported_type`,
+  `page_too_large`, `unreadable`, `unsupported_codec`); `bytes_read`,
+  `get_requests` (sniffs included) and `sniffed` (one 8-byte GET per
+  candidate). `null` without `--pii`.
 - `coverage`: with `--pii`, `files_eligible`, `files_scanned`,
   `not_scanned_suppressed`, `not_scanned_unsuppressed`, and `percent`
-  (rounded down to one decimal; `null` with no eligible file). `null`
-  without `--pii`.
+  (rounded down to one decimal; `null` with no eligible file);
+  `out_of_scope` (`objects`, `by_extension` of `extension` and `count`,
+  `other_extensions`, `sniffed_not_parquet`, `empty`); and `sampling`
+  (`method`, and `exhaustive`, always `false`). `null` without `--pii`.
 - `pii_inventory`: with `--pii`, `tables` (sorted by name), each with
   `table`, `status` (`pii_found`, `no_pii_in_scanned_files` or
   `not_scanned`), `files_eligible`, `files_scanned`, `files_not_scanned`,
   `not_scanned` (per reason with any, its `suppressed` and `unsuppressed`
   file counts),
-  `example_key` (or `null`) and `columns` (sorted by column, then rule), each
+  `example_key` (or `null`), `oldest_file` and `newest_file` (RFC 3339, or
+  `null`), and `columns` (sorted by column, then rule), each
   with `column`, `rule`, `highest_confidence`, `evidence`,
   `files_confirmed`, `files_likely`, `files_possible`, `files_suppressed`,
-  `status` (`UNDOCUMENTED` or `documented`) and `reason` (or `null`); plus
-  `summary` (`tables_with_pii`, `pii_columns`, `undocumented`, `documented`,
+  `status` (`UNDOCUMENTED` or `documented`), `reason` (or `null`) and
+  `expires` (`YYYY-MM-DD`, or `null`); plus
+  `summary` (`tables_with_pii`, `pii_columns`, `undocumented`,
+  `undocumented_confirmed`, `undocumented_likely`, `undocumented_possible`,
+  `documented`,
   `tables_not_fully_scanned`, and `tables_not_fully_scanned_documented`:
   of those, the tables whose every unscanned file is documented),
-  `left_out` (`files`, `findings`) and `caps` (`tables`, `entries`). `null`
-  without `--pii`.
+  `truncated`, `left_out` (`files`, `findings`) and `caps` (`tables`,
+  `entries`). `null` without `--pii`.
 - `suppressions`: `expired` and `unused` entries, each with `rule`, `key`
   or `prefix`, `reason`, `expires` (`YYYY-MM-DD`, or `null`), and `column`
   when the entry has one
@@ -691,8 +858,13 @@ v0.1.0: `largest_objects` entries no longer carry `severity`, which was always
 - **Repeated columns are skipped.** List and map columns are counted but not
   read.
 - **It samples rather than reads everything.** A column is judged from the
-  first data page of up to three row groups (at most 2,000 values each). A
-  column whose personal data appears only in other pages can be missed.
+  dictionary and the first data page of up to three row groups (at most
+  2,000 values each), including when the file was downloaded whole.
+  Personal data that appears only in row groups or pages the sample does not reach is missed:
+  a file whose first sampled pages are not personal data, with the personal
+  data only in a later row group the plan never opens, is reported as
+  sampled and produces no finding. `coverage.sampling.exhaustive` is
+  `false` on every run.
 - **One listing stream.** Listing is sequential (one `ListObjectsV2` page
   at a time), so for very large buckets, and for scans without `--pii`, it
   becomes the bottleneck. Scan big buckets by prefix, in parallel runs.
@@ -750,10 +922,11 @@ are `#[ignore]`d by default:
 
 ```sh
 docker run --rm -d --name lakescan-moto -p 5001:5000 motoserver/moto:5.2.3
-export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
-export LAKESCAN_E2E_ENDPOINT=http://localhost:5001
-cargo run --example seed_local -- "$LAKESCAN_E2E_ENDPOINT"
-cargo test --test e2e --test e2e_pii -- --ignored
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+  cargo run --example seed_local -- http://localhost:5001
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+  LAKESCAN_E2E_ENDPOINT=http://localhost:5001 \
+  cargo test --test e2e --test e2e_pii -- --ignored
 docker stop lakescan-moto
 ```
 
@@ -766,13 +939,13 @@ That README lists each fixture's ground truth and how to regenerate it.
 
 ## License
 
-LakeScan is source-available under the Functional Source License, Version 1.1,
-ALv2 Future License (FSL-1.1-ALv2). In plain words:
+LakeScan is source-available ("fair source") under the Functional Source
+License, Version 1.1, Apache 2.0 Future License (FSL-1.1-ALv2). In plain words:
 
 - You are free to use, modify and run LakeScan inside your own organization.
 - You may not offer it, or something built from it, as a competing commercial
   product or service.
 - Each version becomes available under the Apache License, Version 2.0, two
-  years after its release.
+  years after that version's release.
 
 The full terms are in [LICENSE](LICENSE).

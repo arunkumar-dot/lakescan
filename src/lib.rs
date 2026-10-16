@@ -47,7 +47,7 @@
 //! to 1 KiB each is held twice at once, once as the raw response body and
 //! once as parsed `ObjectMeta` entries.
 //!
-//! The content stage's bound is `--memory-budget` (256 MiB by default) plus
+//! The content stage's bound is `--memory-budget` (512 MiB by default) plus
 //! a small fixed overhead per in-flight file. Up to `--concurrency` files
 //! (16 by default) are scanned at once, and every fetched buffer, every
 //! decode (its pages' declared sizes and a dictionary's slots, checked from
@@ -61,7 +61,7 @@
 //! (~0.8 MiB); the per-column scan records (a file has at most 16,384
 //! leaf columns) are counted against the budget. Plus, in the driver's
 //! ordered window, at most `--concurrency` + 1,024 listed objects (~1 KiB
-//! each) waiting their turn. With the defaults: 256 MiB + 16 × ~1 MiB +
+//! each) waiting their turn. With the defaults: 512 MiB + 16 × ~1 MiB +
 //! ~1 MiB. It depends on those settings and caps, never on the bucket.
 //!
 //! The suppress stage's bound comes from the config caps, not from the

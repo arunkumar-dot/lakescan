@@ -5,7 +5,7 @@
 #   scripts/demo.sh --no-pause  run straight through
 #
 # Needs Docker and a Rust toolchain; no AWS account. It starts moto on host
-# port 5001, builds the release binary, seeds the two demo buckets with the
+# port ${MOTO_PORT:-5001}, builds the release binary, seeds the two demo buckets with the
 # repository's seeder, then walks through every feature. Each step prints a
 # one-line explanation, the command, its output, and what its exit code
 # means. Files it writes go to target/demo/ (git-ignored) and are kept, so
@@ -17,7 +17,8 @@ set -uo pipefail
 
 MOTO_IMAGE="motoserver/moto:5.2.3"
 MOTO_CONTAINER="lakescan-demo-moto"
-ENDPOINT="http://localhost:5001"
+MOTO_PORT="${MOTO_PORT:-5001}"
+ENDPOINT="http://localhost:${MOTO_PORT}"
 
 PAUSE=1
 for arg in "$@"; do
@@ -128,13 +129,13 @@ trap 'exit 130' INT TERM
 echo "${BOLD}LakeScan demo${RESET}: every feature, against a local S3 fake."
 echo "Outputs go to $OUT"
 
-step 0 "Setup" "Start moto (an in-memory S3 fake) on port 5001, build LakeScan, and seed the demo buckets."
+step 0 "Setup" "Start moto (an in-memory S3 fake) on port $MOTO_PORT, build LakeScan, and seed the demo buckets."
 
 docker info >/dev/null 2>&1 || die "Docker is not running. Start Docker Desktop (or the docker daemon) and try again."
 
-show docker run --rm -d --name "$MOTO_CONTAINER" -p 5001:5000 "$MOTO_IMAGE"
-if ! docker run --rm -d --name "$MOTO_CONTAINER" -p 5001:5000 "$MOTO_IMAGE" >/dev/null; then
-  die "could not start moto. Is port 5001 in use, or is a '$MOTO_CONTAINER' container already running? (docker ps; docker stop <name>)"
+show docker run --rm -d --name "$MOTO_CONTAINER" -p "$MOTO_PORT:5000" "$MOTO_IMAGE"
+if ! docker run --rm -d --name "$MOTO_CONTAINER" -p "$MOTO_PORT:5000" "$MOTO_IMAGE" >/dev/null; then
+  die "could not start moto. Is port $MOTO_PORT in use, or is a '$MOTO_CONTAINER' container already running? (docker ps; docker stop <name>)"
 fi
 STARTED_MOTO=1
 for _ in $(seq 1 60); do
@@ -142,7 +143,7 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 curl -s -o /dev/null "$ENDPOINT" || die "moto did not answer on $ENDPOINT"
-note "moto is up on $ENDPOINT (on macOS, AirPlay Receiver owns port 5000, hence 5001)"
+note "moto is up on $ENDPOINT (on macOS, AirPlay Receiver owns port 5000, hence ${MOTO_PORT}; set MOTO_PORT to use another)"
 
 # moto accepts any credentials; these keep the AWS SDK from looking for real ones.
 show export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
@@ -334,10 +335,10 @@ lakescan scan "$S3_PII" --endpoint-url "$ENDPOINT" --pii --quiet \
   --findings findings-c16.jsonl --inventory inventory-c16.csv >summary-c16.txt
 code16=$?
 echo "exit codes: $code1 (--concurrency 1) and $code16 (default)"
-note "The summaries differ only in their 'started:' and 'elapsed:' lines, so those are left out of the comparison."
-show diff '<(grep -v -E "^(started|elapsed):" summary-c1.txt)' '<(grep -v -E "^(started|elapsed):" summary-c16.txt)'
+note "The summaries differ only in their 'started:', 'elapsed:' and 'settings:' lines (settings records concurrency), so those are left out of the comparison."
+show diff '<(grep -v -E "^(started|elapsed|settings):" summary-c1.txt)' '<(grep -v -E "^(started|elapsed|settings):" summary-c16.txt)'
 same=1
-diff <(grep -v -E '^(started|elapsed):' summary-c1.txt) <(grep -v -E '^(started|elapsed):' summary-c16.txt) || same=0
+diff <(grep -v -E '^(started|elapsed|settings):' summary-c1.txt) <(grep -v -E '^(started|elapsed|settings):' summary-c16.txt) || same=0
 show diff findings-c1.jsonl findings-c16.jsonl
 diff findings-c1.jsonl findings-c16.jsonl || same=0
 show diff inventory-c1.csv inventory-c16.csv

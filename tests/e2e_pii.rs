@@ -7,16 +7,17 @@
 //!
 //! ```text
 //! docker run --rm -d -p 5001:5000 motoserver/moto:5.2.3
-//! export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
-//! export LAKESCAN_E2E_ENDPOINT=http://localhost:5001
-//! cargo run --example seed_local -- "$LAKESCAN_E2E_ENDPOINT"
-//! cargo test --test e2e_pii -- --ignored
+//! AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+//!   cargo run --example seed_local -- http://localhost:5001
+//! AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+//!   LAKESCAN_E2E_ENDPOINT=http://localhost:5001 \
+//!   cargo test --test e2e_pii -- --ignored
 //! ```
 //!
 //! Set `LAKESCAN_E2E_CONCURRENCY` to run every `--pii` scan at that
 //! `--concurrency` (the CLI default, 16, otherwise); CI runs the suite at 1
-//! and at 16. Whatever it is, the outputs must be identical, which one
-//! test checks directly.
+//! and at 16. Whatever it is, the outputs must match, apart from timing and
+//! the recorded concurrency, which one test checks directly.
 
 #[path = "support/pii_manifest.rs"]
 mod pii_manifest;
@@ -349,7 +350,8 @@ fn the_inventory_groups_partitioned_files_into_tables() -> TestResult {
             "files_possible": 0,
             "files_suppressed": 0,
             "status": "UNDOCUMENTED",
-            "reason": null
+            "reason": null,
+            "expires": null
         })
     );
     assert_eq!(
@@ -362,6 +364,9 @@ fn the_inventory_groups_partitioned_files_into_tables() -> TestResult {
             "tables_with_pii": 4,
             "pii_columns": 3 * CUSTOMERS.len() + 1,
             "undocumented": 3 * CUSTOMERS.len() + 1,
+            "undocumented_confirmed": 3 * 8 + 1,
+            "undocumented_likely": 3 * 2,
+            "undocumented_possible": 0,
             "documented": 0,
             "tables_not_fully_scanned": 0,
             "tables_not_fully_scanned_documented": 0
@@ -544,7 +549,18 @@ fn a_mixed_lake_fails_closed_until_its_unscannable_files_are_documented() -> Tes
             "files_scanned": 8,
             "not_scanned_suppressed": 0,
             "not_scanned_unsuppressed": 3,
-            "percent": 72.7
+            "percent": 72.7,
+            "out_of_scope": {
+                "objects": 0,
+                "by_extension": [],
+                "other_extensions": 0,
+                "sniffed_not_parquet": 0,
+                "empty": 0
+            },
+            "sampling": {
+                "method": "sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way",
+                "exhaustive": false
+            }
         }))
     );
 
@@ -602,6 +618,76 @@ fn a_mixed_lake_fails_closed_until_its_unscannable_files_are_documented() -> Tes
     Ok(())
 }
 
+fn leading(row: &[String]) -> Vec<&str> {
+    row.iter().take(12).map(String::as_str).collect()
+}
+
+fn inventory_csv_rows(rows: &[Vec<String>]) {
+    assert_eq!(
+        rows.first().map(|header| header.join(",")).as_deref(),
+        Some(
+            "table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,\
+             files_possible,files_suppressed,status,reason,example_key,oldest_file,\
+             newest_file,expires"
+        )
+    );
+    let row = |table: &str, column: &str| {
+        rows.iter()
+            .find(|r| {
+                r.first().map(String::as_str) == Some(table)
+                    && r.get(1).map(String::as_str) == Some(column)
+            })
+            .cloned()
+            .unwrap_or_default()
+    };
+    let email_row = row("lake/customers", "email");
+    assert_eq!(
+        leading(&email_row),
+        [
+            "lake/customers",
+            "email",
+            "pii-email",
+            "confirmed",
+            "values",
+            "0",
+            "0",
+            "0",
+            "4",
+            "documented",
+            "Consented marketing contacts, DPA-12",
+            "lake/customers/dt=2026-01-01/part-0.parquet",
+        ]
+    );
+    assert_eq!(email_row.get(14).map(String::as_str), Some(""));
+    let billing = row("lake/customers", "billing.email");
+    assert_eq!(
+        leading(&billing),
+        [
+            "lake/customers",
+            "billing.email",
+            "pii-email",
+            "confirmed",
+            "values",
+            "4",
+            "0",
+            "0",
+            "0",
+            "UNDOCUMENTED",
+            "",
+            "lake/customers/dt=2026-01-01/part-0.parquet",
+        ]
+    );
+    assert_eq!(billing.get(14).map(String::as_str), Some(""));
+    for dated in [&email_row, &billing] {
+        let oldest = dated.get(12).map_or("", String::as_str);
+        let newest = dated.get(13).map_or("", String::as_str);
+        assert!(
+            oldest <= newest && oldest.ends_with('Z'),
+            "{oldest} {newest}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs a seeded S3-compatible server; see this file's header"]
 fn a_column_suppression_documents_that_location_in_the_inventory_and_csv() -> TestResult {
@@ -634,59 +720,8 @@ fn a_column_suppression_documents_that_location_in_the_inventory_and_csv() -> Te
 
     // The CSV: a header, then one row per (table, column, rule).
     let rows = parse_csv(&run.inventory).ok_or("the inventory is not valid CSV")?;
-    assert_eq!(
-        rows.first().map(|header| header.join(",")),
-        Some(
-            "table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,\
-             files_possible,files_suppressed,status,reason,example_key"
-                .to_owned()
-        )
-    );
-    // 3 customers tables of 10 locations each, events' 1, and the header.
     assert_eq!(rows.len(), 3 * CUSTOMERS.len() + 1 + 1);
-    let row = |table: &str, column: &str| {
-        rows.iter()
-            .find(|r| {
-                r.first().map(String::as_str) == Some(table)
-                    && r.get(1).map(String::as_str) == Some(column)
-            })
-            .cloned()
-            .unwrap_or_default()
-    };
-    assert_eq!(
-        row("lake/customers", "email"),
-        [
-            "lake/customers",
-            "email",
-            "pii-email",
-            "confirmed",
-            "values",
-            "0",
-            "0",
-            "0",
-            "4",
-            "documented",
-            "Consented marketing contacts, DPA-12",
-            "lake/customers/dt=2026-01-01/part-0.parquet",
-        ]
-    );
-    assert_eq!(
-        row("lake/customers", "billing.email"),
-        [
-            "lake/customers",
-            "billing.email",
-            "pii-email",
-            "confirmed",
-            "values",
-            "4",
-            "0",
-            "0",
-            "0",
-            "UNDOCUMENTED",
-            "",
-            "lake/customers/dt=2026-01-01/part-0.parquet",
-        ]
-    );
+    inventory_csv_rows(&rows);
     // The JSON inventory says the same.
     let status = run
         .summary
@@ -704,11 +739,15 @@ fn a_column_suppression_documents_that_location_in_the_inventory_and_csv() -> Te
     Ok(())
 }
 
-/// `summary` without the fields that time a run.
+/// `summary` without the fields that time a run, and without the recorded
+/// concurrency, which the comparison varies on purpose.
 fn untimed(mut summary: Value) -> Value {
     if let Some(scan) = summary.get_mut("scan").and_then(Value::as_object_mut) {
         scan.remove("started_at");
         scan.remove("elapsed_ms");
+    }
+    if let Some(concurrency) = summary.pointer_mut("/scan/settings/concurrency") {
+        *concurrency = Value::Null;
     }
     summary
 }
@@ -745,6 +784,10 @@ fn every_output_is_identical_at_concurrency_1_and_16() -> TestResult {
         let untimed_html = |html: &str| {
             html.lines()
                 .filter(|line| !line.contains("class=\"timing\""))
+                .map(|line| {
+                    line.replace("concurrency=16", "concurrency=")
+                        .replace("concurrency=1", "concurrency=")
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };

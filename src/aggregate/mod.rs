@@ -34,6 +34,7 @@ mod inventory;
 mod matrix;
 mod pii;
 mod sample;
+mod scope;
 mod size_histogram;
 mod stats;
 mod topk;
@@ -53,9 +54,10 @@ pub use pii::{
     Table, TableStatus, table_of,
 };
 pub use sample::{Sample, SampleDetail};
+pub use scope::{ExtensionCount, LISTED_EXTENSIONS, MAX_EXTENSION_BYTES, OutOfScope};
 pub use stats::CountBytes;
 
-use crate::content::FileScan;
+use crate::content::{FileOutcome, FileScan, Scope};
 use crate::model::{Detail, Finding, ObjectMeta, RuleId, Severity, StorageClass};
 
 /// How many rules exist; sizes the per-rule sample array.
@@ -92,6 +94,9 @@ pub struct Aggregates {
     /// Where PII was found, per table and column; reported only when
     /// content scanning is on.
     pii: PiiInventory,
+    /// What content scanning left unread, and why; reported only when
+    /// content scanning is on.
+    scope: OutOfScope,
 }
 
 impl Aggregates {
@@ -108,7 +113,8 @@ impl Aggregates {
         + AgeHistogram::MAX_BYTES
         + Hll::MAX_BYTES
         + ContentSummary::MAX_BYTES
-        + PiiInventory::MAX_BYTES;
+        + PiiInventory::MAX_BYTES
+        + OutOfScope::MAX_BYTES;
 
     /// Starts an empty summary. `now` should be the same scan-start
     /// instant passed to [`crate::rules::EvalContext`], so that this
@@ -128,6 +134,7 @@ impl Aggregates {
             hll: Hll::default(),
             content: None,
             pii: PiiInventory::default(),
+            scope: OutOfScope::default(),
         }
     }
 
@@ -147,7 +154,28 @@ impl Aggregates {
         self.content
             .get_or_insert_with(ContentSummary::default)
             .observe(scan, suppressed);
-        self.pii.observe_file(&object.key, scan.outcome, suppressed);
+        if scan.outcome == FileOutcome::SniffedNotParquet {
+            self.scope.observe_sniffed_not_parquet();
+        }
+        self.pii
+            .observe_file(&object.key, scan.outcome, suppressed, object.last_modified);
+    }
+
+    /// Records one listed object content scanning does not read: its
+    /// extension is out of scope, or it is empty. Objects to scan or sniff
+    /// go through [`Aggregates::observe_content`] instead.
+    pub fn observe_out_of_scope(&mut self, scope: &Scope) {
+        match scope {
+            Scope::Extension(extension) => self.scope.observe_extension(extension),
+            Scope::Empty => self.scope.observe_empty(),
+            Scope::Parquet | Scope::Sniff => {}
+        }
+    }
+
+    /// What content scanning left unread, or `None` if it was off.
+    #[must_use]
+    pub fn out_of_scope(&self) -> Option<&OutOfScope> {
+        self.content.is_some().then_some(&self.scope)
     }
 
     /// The content summary, or `None` if content scanning was off.
@@ -260,6 +288,7 @@ impl Aggregates {
             (Some(_), None) => {}
         }
         self.pii.merge(other.pii);
+        self.scope.merge(&other.scope);
     }
 
     /// The total number of objects observed.
@@ -441,6 +470,7 @@ impl Aggregates {
             + self.samples.iter().map(TopK::heap_bytes).sum::<usize>()
             + self.largest.heap_bytes()
             + self.pii.heap_bytes()
+            + self.scope.heap_bytes()
     }
 }
 

@@ -16,11 +16,14 @@ use std::time::{Instant, SystemTime};
 
 use super::target::Target;
 use crate::aggregate::{Aggregates, ContentSummary};
-use crate::content::{self, FileOutcome, FileScan, MemoryBudget, ObjectReader, ScanOptions};
+use crate::aggregate::{MAX_ENTRIES, MAX_TABLES};
+use crate::content::{
+    self, FileOutcome, FileScan, MemoryBudget, ObjectReader, ScanOptions, Scope, Sniff,
+};
 use crate::error::{ExitCode, LakeScanError};
 use crate::model::RuleId;
 use crate::model::{Finding, NotScannedReason, ObjectMeta, Severity};
-use crate::report::{self, FindingsWriter, Format, ScanInfo};
+use crate::report::{self, FindingsWriter, Format, PiiSettings, ScanInfo, ScanSettings};
 use crate::rules::{self, EvalContext};
 use crate::scanner::{PageSource, Scanner};
 use crate::suppress::{Config, Date, Entry, Outcome, Suppressor};
@@ -40,6 +43,8 @@ pub(crate) struct Content<R> {
     pub(crate) concurrency: usize,
     /// The bytes in-flight scans may hold (`--memory-budget`).
     pub(crate) budget: Arc<MemoryBudget>,
+    /// Which objects without a Parquet extension are sniffed.
+    pub(crate) sniff: Sniff,
 }
 
 /// How many listed objects may wait behind an unfinished file scan, on top
@@ -127,6 +132,17 @@ where
     // Boxed: `Aggregates` is ~110 KiB of fixed-size summaries, which would
     // otherwise sit inline in this function's future.
     let mut aggregates = Box::new(Aggregates::new(started_at));
+    let settings = ScanSettings {
+        pii: content.as_ref().map(|content| PiiSettings {
+            whole_file_max: content.options.whole_file_max,
+            sniff: content.sniff,
+            coalesce_gap: content.options.coalesce_gap,
+            concurrency: content.concurrency,
+            memory_budget: content.budget.total(),
+        }),
+        fail_on,
+        config: config.fingerprint().cloned(),
+    };
     let mut suppressor = Suppressor::new(config, &target.bucket, Date::utc_of(started_at));
     if content.is_some() {
         aggregates.enable_content();
@@ -176,6 +192,7 @@ where
         started_at,
         elapsed,
         suppressions: suppressor.finish(),
+        settings,
     };
     // Decided before any report is written, so the HTML report can state
     // it; a report that then fails to write still ends the run with 5.
@@ -191,6 +208,20 @@ where
     if let Some(mut out) = warnings {
         // Best effort, like progress: the summary already carries these.
         let _ = write_warnings(&mut out, &info.suppressions);
+    }
+    if let Some(inventory) = aggregates.pii_inventory()
+        && inventory.truncated()
+    {
+        // Always, `--quiet` or not: it changes how every output reads.
+        let _ = writeln!(
+            errors,
+            "lakescan: warning: the PII inventory is truncated: {} files and {} findings were \
+             left out over its caps ({MAX_TABLES} tables, {MAX_ENTRIES} entries), so its tables \
+             and the --inventory CSV are incomplete; scan narrower prefixes",
+            inventory.left_out_files(),
+            inventory.left_out_findings()
+        )
+        .and_then(|()| errors.flush());
     }
 
     if code == ExitCode::ContentNotScanned
@@ -337,13 +368,17 @@ where
                 Window::apply_listed(object, ctx, sinks)?;
                 continue;
             };
-            if content::is_eligible(&object.key) {
-                while window.scanning >= content.concurrency {
-                    window.apply_front(ctx, sinks).await?;
+            match content::scope_of(object, content.sniff) {
+                scope @ (Scope::Parquet | Scope::Sniff) => {
+                    while window.scanning >= content.concurrency {
+                        window.apply_front(ctx, sinks).await?;
+                    }
+                    window.push_scan(object, content, scope == Scope::Sniff);
                 }
-                window.push_scan(object, content);
-            } else {
-                window.push(Slot::Listed(object.clone()));
+                scope => {
+                    sinks.aggregates.observe_out_of_scope(&scope);
+                    window.push(Slot::Listed(object.clone()));
+                }
             }
             while window.slots.len() > content.concurrency + LOOKAHEAD {
                 window.apply_front(ctx, sinks).await?;
@@ -408,14 +443,25 @@ impl Window {
         self.slots.push_back(slot);
     }
 
-    /// Starts scanning `object` as a task, under its own budget account.
-    fn push_scan<R: ObjectReader>(&mut self, object: &ObjectMeta, content: &Content<R>) {
+    /// Starts scanning `object` as a task, under its own budget account,
+    /// sniffing it first if it has no Parquet extension.
+    fn push_scan<R: ObjectReader>(
+        &mut self,
+        object: &ObjectMeta,
+        content: &Content<R>,
+        sniff: bool,
+    ) {
         let reader = content.reader.clone();
         let file = object.clone();
         let options = content.options;
         let budget = content.budget.for_file();
-        let task =
-            tokio::spawn(async move { content::scan_file(reader, &file, options, budget).await });
+        let task = tokio::spawn(async move {
+            if sniff {
+                content::sniff_and_scan(reader, &file, options, budget).await
+            } else {
+                content::scan_file(reader, &file, options, budget).await
+            }
+        });
         self.scanning += 1;
         self.slots
             .push_back(Slot::Scanning(object.clone(), ScanTask(task)));
@@ -760,6 +806,7 @@ mod tests {
         failing: Vec<&'static str>,
         /// Listing page size: files split into pages of this many.
         page: usize,
+        sniff: crate::content::Sniff,
     }
 
     impl Default for RunSettings {
@@ -773,6 +820,7 @@ mod tests {
                 seed: 1,
                 failing: Vec::new(),
                 page: 1000,
+                sniff: crate::content::Sniff::Unknown,
             }
         }
     }
@@ -842,6 +890,7 @@ mod tests {
                 },
                 concurrency: settings.concurrency,
                 budget: Arc::clone(&budget),
+                sniff: settings.sniff,
             }),
             Outputs {
                 summary: &mut summary,
@@ -926,12 +975,18 @@ mod tests {
             })
             .map(|line| {
                 let mut line = line.to_owned();
-                for field in ["\"started_at\":\"", "\"elapsed_ms\":"] {
+                // The settings record --concurrency, which these runs vary.
+                for field in [
+                    "\"started_at\":\"",
+                    "\"elapsed_ms\":",
+                    "\"concurrency\":",
+                    "concurrency=",
+                ] {
                     if let Some(at) = line.find(field) {
                         let from = at + field.len();
                         let end = line
                             .get(from..)
-                            .and_then(|rest| rest.find([',', '}']))
+                            .and_then(|rest| rest.find([',', '}', ' ']))
                             .map_or(line.len(), |len| from + len);
                         line.replace_range(from..end, "");
                     }
@@ -1404,7 +1459,18 @@ mod tests {
                 "files_scanned": 2,
                 "not_scanned_suppressed": 1,
                 "not_scanned_unsuppressed": 0,
-                "percent": 66.6
+                "percent": 66.6,
+                "out_of_scope": {
+                    "objects": 0,
+                    "by_extension": [],
+                    "other_extensions": 0,
+                    "sniffed_not_parquet": 0,
+                    "empty": 0
+                },
+                "sampling": {
+                    "method": crate::report::SAMPLING_METHOD,
+                    "exhaustive": false
+                }
             }))
         );
         assert_eq!(
@@ -1442,8 +1508,8 @@ reason = "Consented contacts, see DPA-12"
         .await?;
         assert!(
             run.summary.contains(
-                "  lake/crm  files: 2 scanned, 0 not scanned\n    example: \
-                 lake/crm/dt=2026-01-01/a.parquet\n"
+                "  lake/crm  files: 2 scanned, 0 not scanned; files dated 2024-10-04 to \
+                 2024-10-04\n    example: lake/crm/dt=2026-01-01/a.parquet\n"
             ),
             "{}",
             run.summary
@@ -1461,7 +1527,8 @@ reason = "Consented contacts, see DPA-12"
             rows.first().map(|header| header.join(",")),
             Some(
                 "table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,\
-                 files_possible,files_suppressed,status,reason,example_key"
+                 files_possible,files_suppressed,status,reason,example_key,oldest_file,\
+                 newest_file,expires"
                     .to_owned()
             )
         );
@@ -1488,7 +1555,10 @@ reason = "Consented contacts, see DPA-12"
                 "2",
                 "documented",
                 "Consented contacts, see DPA-12",
-                "lake/crm/dt=2026-01-01/a.parquet"
+                "lake/crm/dt=2026-01-01/a.parquet",
+                "2024-10-04T00:00:00Z",
+                "2024-10-04T00:00:00Z",
+                ""
             ]
         );
         let odd = cells("lake/=bad,\"name\"", "mobile_no");
@@ -1701,6 +1771,176 @@ reason = "Never matches anything in this scan"
             warnings,
             "lakescan: warning: unused suppression for stale-standard, prefix \"\": \
              \"Never matches anything in this scan\"\n"
+        );
+        Ok(())
+    }
+
+    /// A lake as Athena CTAS writes it: Parquet files with no extension,
+    /// beside a `_SUCCESS` marker, a CSV export with no extension, and a
+    /// JSON log.
+    type LakeFile = (&'static str, Vec<u8>);
+
+    fn athena_lake() -> Result<Vec<LakeFile>, Box<dyn std::error::Error>> {
+        Ok(vec![
+            (
+                "athena/crm/20261016_101010_00007_abcde_0b3f",
+                customers_file(100)?,
+            ),
+            ("athena/crm/_SUCCESS", Vec::new()),
+            (
+                "athena/exports/today",
+                b"customer_id,email\n1,someone@example.org\n".to_vec(),
+            ),
+            ("logs/app.json", b"{\"level\":\"info\"}\n".to_vec()),
+        ])
+    }
+
+    #[tokio::test]
+    async fn extensionless_parquet_is_sniffed_scanned_and_its_cost_counted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let files = athena_lake()?;
+        let run = content_run(&files, Config::default(), Format::Json, 8 << 20).await?;
+        assert_eq!(run.code, ExitCode::FindingsExceedThreshold);
+        let summary: serde_json::Value = serde_json::from_str(&run.summary)?;
+        let at = |pointer: &str| summary.pointer(pointer).cloned();
+        assert_eq!(at("/content/files_eligible"), Some(serde_json::json!(1)));
+        // Both extensionless objects were sniffed: one GET each, counted.
+        assert_eq!(at("/content/sniffed"), Some(serde_json::json!(2)));
+        assert_eq!(
+            at("/coverage/out_of_scope"),
+            Some(serde_json::json!({
+                "objects": 3,
+                "by_extension": [{ "extension": "json", "count": 1 }],
+                "other_extensions": 0,
+                "sniffed_not_parquet": 1,
+                "empty": 1
+            }))
+        );
+        // Every listed object is either a Parquet file or out of scope.
+        assert_eq!(at("/inventory/object_count"), Some(serde_json::json!(4)));
+        assert_eq!(
+            at("/pii_inventory/tables/0/table"),
+            Some(serde_json::json!("athena/crm"))
+        );
+        assert_eq!(
+            at("/pii_inventory/tables/0/status"),
+            Some(serde_json::json!("pii_found"))
+        );
+        assert_eq!(
+            at("/scan/settings/pii_sniff"),
+            Some(serde_json::json!("unknown"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_sniffing_an_extensionless_lake_is_reported_out_of_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let files = athena_lake()?;
+        let settings = RunSettings {
+            sniff: crate::content::Sniff::None,
+            ..RunSettings::default()
+        };
+        let (run, store, _) =
+            content_run_with(&files, Config::default(), Format::Text, &settings).await?;
+        // Nothing scanned and nothing found: exit 0, but the summary says
+        // what was left out instead of reading as clean.
+        assert_eq!(run.code, ExitCode::Ok);
+        assert_eq!(store.requests(), 0);
+        assert!(
+            run.summary.contains(
+                "  Not in scope for --pii: 2 (no extension), 1 .json (LakeScan reads Parquet \
+                 content only)\n"
+            ),
+            "{}",
+            run.summary
+        );
+        assert!(run.summary.contains("sniff=none"), "{}", run.summary);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pii_only_in_an_unsampled_row_group_is_missed_and_the_result_says_sampled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The adversarial file: row group 0 holds 1,000 plain references,
+        // clearly not PII, so sampling stops there; emails fill row groups
+        // 1 to 3, which the read plan never reaches.
+        let mut values: Vec<Option<String>> =
+            (0..1000).map(|i| Some(format!("ref-{i:05}"))).collect();
+        values.extend(emails(3000));
+        let body = parquet_file(
+            &[("note_ref", Values::Text(values))],
+            Layout {
+                row_group_rows: 1000,
+                ..Layout::default()
+            },
+        )?;
+        let files = [("lake/hidden/part-0.parquet", body)];
+        for whole_file_max in [0, 8 << 20] {
+            let json = content_run(&files, Config::default(), Format::Json, whole_file_max).await?;
+            assert_eq!(json.code, ExitCode::Ok, "no finding");
+            assert_eq!(json.findings, "");
+            let summary: serde_json::Value = serde_json::from_str(&json.summary)?;
+            assert_eq!(
+                summary.pointer("/pii_inventory/tables/0/status"),
+                Some(&serde_json::json!("no_pii_in_scanned_files"))
+            );
+            assert_eq!(
+                summary.pointer("/coverage/sampling/exhaustive"),
+                Some(&serde_json::json!(false))
+            );
+            let text = content_run(&files, Config::default(), Format::Text, whole_file_max).await?;
+            assert!(
+                text.summary
+                    .contains("    No structured PII detected in sampled data from 1 file\n"),
+                "{}",
+                text.summary
+            );
+            assert!(text.summary.contains("  inspection:     sampled: "));
+            assert!(text.html.contains("Inspection is sampled: "));
+        }
+        // And the README's limitations describe exactly this case.
+        let readme = include_str!("../../README.md");
+        let limitations = readme
+            .split("\n## Limitations\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .unwrap_or_default();
+        assert!(
+            limitations.contains(
+                "Personal data that appears only in row groups or pages the sample does not \
+                 reach is missed"
+            ),
+            "{limitations}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_truncated_inventory_is_warned_about_on_stderr()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // One more table than the inventory holds. The files need not be
+        // Parquet: unscannable ones count in their tables all the same.
+        let keys: Vec<String> = (0..=crate::aggregate::MAX_TABLES)
+            .map(|n| format!("lake/t{n:05}/part-0.parquet"))
+            .collect();
+        let files: Vec<(&str, Vec<u8>)> = keys
+            .iter()
+            .map(|key| (key.as_str(), b"not parquet at all".to_vec()))
+            .collect();
+        let run = content_run(&files, Config::default(), Format::Json, 8 << 20).await?;
+        assert!(
+            run.errors.contains(
+                "lakescan: warning: the PII inventory is truncated: 1 files and 0 findings were \
+                 left out over its caps (4096 tables, 16384 entries)"
+            ),
+            "{}",
+            run.errors
+        );
+        let summary: serde_json::Value = serde_json::from_str(&run.summary)?;
+        assert_eq!(
+            summary.pointer("/pii_inventory/truncated"),
+            Some(&serde_json::json!(true))
         );
         Ok(())
     }

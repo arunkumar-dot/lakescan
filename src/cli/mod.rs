@@ -21,7 +21,7 @@ mod driver;
 mod target;
 
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -33,9 +33,9 @@ use self::target::Target;
 use std::sync::Arc;
 
 use crate::content::{
-    DEFAULT_COALESCE_GAP, DEFAULT_CONCURRENCY, DEFAULT_MEMORY_BUDGET, DEFAULT_WHOLE_FILE_MAX,
-    MAX_CONCURRENCY, MAX_WHOLE_FILE_MAX, MemoryBudget, ObjectReader, S3ObjectReader, ScanOptions,
-    file_need,
+    BudgetError, DEFAULT_COALESCE_GAP, DEFAULT_CONCURRENCY, DEFAULT_MEMORY_BUDGET,
+    DEFAULT_WHOLE_FILE_MAX, MAX_CONCURRENCY, MAX_MEMORY_BUDGET, MAX_WHOLE_FILE_MAX, MemoryBudget,
+    ObjectReader, S3ObjectReader, ScanOptions, Sniff, file_need,
 };
 use crate::error::{ExitCode, LakeScanError};
 use crate::model::{RuleId, Severity};
@@ -101,10 +101,24 @@ struct ScanArgs {
     #[arg(long)]
     quiet: bool,
 
-    /// Also scan Parquet files (keys ending in .parquet or .parq) for
-    /// personal data. Reads object contents: needs s3:GetObject.
+    /// Also scan Parquet files for personal data: keys ending in .parquet
+    /// or .parq, and (see --pii-sniff) objects without such an extension
+    /// that turn out to be Parquet. Reads object contents: needs
+    /// s3:GetObject.
     #[arg(long)]
     pii: bool,
+
+    /// With --pii, which objects without a .parquet or .parq extension to
+    /// sniff for the Parquet magic, one 8-byte ranged GET each: "unknown"
+    /// (no extension, or one not known to be another format) or "none".
+    #[arg(
+        long,
+        value_enum,
+        value_name = "WHICH",
+        default_value_t = SniffArg::Unknown,
+        requires = "pii"
+    )]
+    pii_sniff: SniffArg,
 
     /// With --pii, read Parquet files of at most BYTES whole, in one
     /// request; larger ones are read partially. 0 to 67108864 (64 MiB).
@@ -127,7 +141,8 @@ struct ScanArgs {
     concurrency: u16,
 
     /// With --pii, the most BYTES in-flight file scans may hold at once.
-    /// Must cover the most one file can need (see the README).
+    /// Must cover the most one file can need (see the README); at most
+    /// 68719476736 (64 GiB).
     #[arg(
         long,
         value_name = "BYTES",
@@ -161,6 +176,21 @@ struct ScanArgs {
 /// `--concurrency`'s default, as the flag's type; equal to
 /// [`DEFAULT_CONCURRENCY`] (a test checks).
 const DEFAULT_CONCURRENCY_FLAG: u16 = 16;
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum SniffArg {
+    Unknown,
+    None,
+}
+
+impl From<SniffArg> for Sniff {
+    fn from(sniff: SniffArg) -> Self {
+        match sniff {
+            SniffArg::Unknown => Self::Unknown,
+            SniffArg::None => Self::None,
+        }
+    }
+}
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
 enum FormatArg {
@@ -314,24 +344,7 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         .unwrap_or_default();
 
     check_stdout(&args)?;
-    if args.region.as_deref().is_some_and(str::is_empty) {
-        return Err(LakeScanError::Usage(
-            "--region must not be empty".to_owned(),
-        ));
-    }
-    if let Some(url) = &args.endpoint_url
-        && !(url.starts_with("http://") || url.starts_with("https://"))
-    {
-        return Err(LakeScanError::Usage(format!(
-            "invalid --endpoint-url {url:?}: expected an http:// or https:// URL"
-        )));
-    }
-    if args.pii_whole_file_max > MAX_WHOLE_FILE_MAX {
-        return Err(LakeScanError::Usage(format!(
-            "--pii-whole-file-max {} is too large: at most {MAX_WHOLE_FILE_MAX} (64 MiB)",
-            args.pii_whole_file_max
-        )));
-    }
+    check_limits(&args)?;
 
     let concurrency = usize::from(args.concurrency);
     let budget = content_budget(args.memory_budget, concurrency, args.pii_whole_file_max)?;
@@ -352,19 +365,20 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
     .await?;
 
     // Opened before the scan, so a bad path fails in a second rather than
-    // after a long listing.
-    let summary = open_destination(args.output.as_deref())?;
-    let findings = args
+    // after a long listing. Files are written beside their destination and
+    // renamed into place only if the run completes (see `Destination`).
+    let mut summary = open_destination(args.output.as_deref())?;
+    let mut findings = args
         .findings
         .as_deref()
         .map(|path| open_destination(Some(path)))
         .transpose()?;
-    let inventory = args
+    let mut inventory = args
         .inventory
         .as_deref()
         .map(|path| open_destination(Some(path)))
         .transpose()?;
-    let html = args
+    let mut html = args
         .html
         .as_deref()
         .map(|path| open_destination(Some(path)))
@@ -381,9 +395,10 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         },
         concurrency,
         budget,
+        sniff: args.pii_sniff.into(),
     });
 
-    driver::scan(
+    let code = driver::scan(
         source,
         target,
         config,
@@ -391,16 +406,25 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         args.fail_on.threshold(),
         content,
         Outputs {
-            summary,
-            findings,
-            inventory,
-            html,
+            summary: &mut summary,
+            findings: findings.as_mut(),
+            inventory: inventory.as_mut(),
+            html: html.as_mut(),
             progress,
             warnings,
             errors: stderr,
         },
     )
-    .await
+    .await?;
+    // The run completed (whatever its verdict): every file takes its
+    // place. On an error above, dropping them removes the temporaries.
+    for destination in [Some(summary), findings, inventory, html]
+        .into_iter()
+        .flatten()
+    {
+        destination.commit()?;
+    }
+    Ok(code)
 }
 
 /// At most one output may go to stdout. The summary does unless
@@ -431,6 +455,35 @@ fn check_stdout(args: &ScanArgs) -> Result<(), LakeScanError> {
     }
 }
 
+/// Flags whose ranges clap does not check.
+fn check_limits(args: &ScanArgs) -> Result<(), LakeScanError> {
+    if args.region.as_deref().is_some_and(str::is_empty) {
+        return Err(LakeScanError::Usage(
+            "--region must not be empty".to_owned(),
+        ));
+    }
+    if let Some(url) = &args.endpoint_url
+        && !(url.starts_with("http://") || url.starts_with("https://"))
+    {
+        return Err(LakeScanError::Usage(format!(
+            "invalid --endpoint-url {url:?}: expected an http:// or https:// URL"
+        )));
+    }
+    if args.memory_budget > MAX_MEMORY_BUDGET {
+        return Err(LakeScanError::Usage(format!(
+            "--memory-budget {} is too large: at most {MAX_MEMORY_BUDGET} (64 GiB)",
+            args.memory_budget
+        )));
+    }
+    if args.pii_whole_file_max > MAX_WHOLE_FILE_MAX {
+        return Err(LakeScanError::Usage(format!(
+            "--pii-whole-file-max {} is too large: at most {MAX_WHOLE_FILE_MAX} (64 MiB)",
+            args.pii_whole_file_max
+        )));
+    }
+    Ok(())
+}
+
 /// The run's memory budget, refused (a usage error) if it is below the
 /// most one file can need, since that file could then never get its
 /// permits.
@@ -441,12 +494,14 @@ fn content_budget(
 ) -> Result<Arc<MemoryBudget>, LakeScanError> {
     MemoryBudget::new(memory_budget, concurrency, file_need(whole_file_max))
         .map(Arc::new)
-        .map_err(|too_small| {
-            LakeScanError::Usage(format!(
-                "--memory-budget {memory_budget} is below the most one file can need, {} bytes \
-                 at --pii-whole-file-max {whole_file_max}",
-                too_small.file_need
-            ))
+        .map_err(|err| match err {
+            BudgetError::TooSmall { file_need } => LakeScanError::Usage(format!(
+                "--memory-budget {memory_budget} is below the most one file can need, \
+                 {file_need} bytes at --pii-whole-file-max {whole_file_max}"
+            )),
+            BudgetError::TooLarge { max } => LakeScanError::Usage(format!(
+                "--memory-budget {memory_budget} is too large: at most {max}"
+            )),
         })
 }
 
@@ -477,6 +532,8 @@ pub struct ContentSettings {
     pub memory_budget: u64,
     /// `--coalesce-gap`.
     pub coalesce_gap: u64,
+    /// `--pii-sniff`.
+    pub sniff: Sniff,
 }
 
 impl Default for ContentSettings {
@@ -486,6 +543,7 @@ impl Default for ContentSettings {
             concurrency: DEFAULT_CONCURRENCY,
             memory_budget: DEFAULT_MEMORY_BUDGET,
             coalesce_gap: DEFAULT_COALESCE_GAP,
+            sniff: Sniff::Unknown,
         }
     }
 }
@@ -526,6 +584,7 @@ where
                 settings.concurrency.clamp(1, MAX_CONCURRENCY),
                 settings.whole_file_max,
             )?,
+            sniff: settings.sniff,
         }),
         None => None,
     };
@@ -557,18 +616,144 @@ fn is_stdout(path: &Path) -> bool {
     path == Path::new("-")
 }
 
-/// Opens `path` for writing, truncating it, or stdout for `None` or `-`.
-fn open_destination(path: Option<&Path>) -> Result<Box<dyn Write>, LakeScanError> {
+/// Stdout for `None` or `-`, else an [`AtomicFile`] for `path`.
+fn open_destination(path: Option<&Path>) -> Result<Destination, LakeScanError> {
     match path {
-        None => Ok(Box::new(io::stdout())),
-        Some(path) if is_stdout(path) => Ok(Box::new(io::stdout())),
-        Some(path) => match File::create(path) {
-            Ok(file) => Ok(Box::new(file)),
-            Err(err) => Err(LakeScanError::Report(io::Error::new(
+        None => Ok(Destination::Stdout(io::stdout())),
+        Some(path) if is_stdout(path) => Ok(Destination::Stdout(io::stdout())),
+        Some(path) => AtomicFile::create(path)
+            .map(Destination::File)
+            .map_err(|err| {
+                LakeScanError::Report(io::Error::new(
+                    err.kind(),
+                    format!("cannot open {}: {err}", path.display()),
+                ))
+            }),
+    }
+}
+
+/// Where one output goes. Stdout is written as the run goes; a file is
+/// only complete, at its path, after [`Destination::commit`].
+enum Destination {
+    Stdout(io::Stdout),
+    File(AtomicFile),
+}
+
+impl Destination {
+    /// Puts a file in place; nothing to do for stdout.
+    fn commit(self) -> Result<(), LakeScanError> {
+        match self {
+            Self::Stdout(_) => Ok(()),
+            Self::File(file) => file.commit(),
+        }
+    }
+}
+
+impl Write for Destination {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(out) => out.write(buf),
+            Self::File(file) => file.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(out) => out.flush(),
+            Self::File(file) => file.flush(),
+        }
+    }
+}
+
+/// An output file written to a temporary file beside its destination
+/// (same directory, so the rename cannot cross filesystems) and renamed
+/// over it by [`AtomicFile::commit`]. Dropped uncommitted, it removes the
+/// temporary file, so a failed run never leaves a partial report at the
+/// destination, nor replaces an earlier complete one.
+struct AtomicFile {
+    file: Option<File>,
+    temp: PathBuf,
+    path: PathBuf,
+}
+
+impl AtomicFile {
+    fn create(path: &Path) -> io::Result<Self> {
+        if path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "is a directory",
+            ));
+        }
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a file name"))?
+            .to_string_lossy();
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut last = io::Error::new(io::ErrorKind::AlreadyExists, "no free temporary name");
+        for attempt in 0..64 {
+            let temp = dir.join(format!(
+                ".{name}.{}.{attempt}.lakescan-tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&temp) {
+                Ok(file) => {
+                    return Ok(Self {
+                        file: Some(file),
+                        temp,
+                        path: path.to_owned(),
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => last = err,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last)
+    }
+
+    /// Flushes the file to disk and renames it over the destination.
+    fn commit(mut self) -> Result<(), LakeScanError> {
+        let report = |err: io::Error, path: &Path| {
+            LakeScanError::Report(io::Error::new(
                 err.kind(),
-                format!("cannot open {}: {err}", path.display()),
-            ))),
-        },
+                format!("cannot write {}: {err}", path.display()),
+            ))
+        };
+        if let Some(file) = self.file.take() {
+            file.sync_all().map_err(|err| report(err, &self.path))?;
+        }
+        std::fs::rename(&self.temp, &self.path).map_err(|err| report(err, &self.path))?;
+        // In place: nothing for `Drop` to remove.
+        self.temp = PathBuf::new();
+        Ok(())
+    }
+}
+
+impl Write for AtomicFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match &mut self.file {
+            Some(file) => file.write(buf),
+            None => Err(io::Error::other("already committed")),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.file {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for AtomicFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.temp.as_os_str().is_empty() {
+            // Best effort: nothing left to report to.
+            let _ = std::fs::remove_file(&self.temp);
+        }
     }
 }
 
@@ -682,6 +867,87 @@ mod tests {
                     && !w.contains('\n')),
             "{warning:?}"
         );
+    }
+
+    /// A fresh, empty directory for one test.
+    fn scratch_dir(test: &str) -> Result<std::path::PathBuf, std::io::Error> {
+        let dir = std::env::temp_dir().join(format!("lakescan-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// The names in `dir`, sorted.
+    fn names_in(dir: &std::path::Path) -> Result<Vec<String>, std::io::Error> {
+        let mut names = std::fs::read_dir(dir)?
+            .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        Ok(names)
+    }
+
+    #[test]
+    fn an_output_file_appears_only_when_committed() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write as _;
+        let dir = scratch_dir("atomic-commit")?;
+        let path = dir.join("summary.txt");
+        let mut file = super::AtomicFile::create(&path)?;
+        file.write_all(b"complete report\n")?;
+        // Written, but not yet in place.
+        assert!(!path.exists());
+        file.commit()?;
+        assert_eq!(std::fs::read_to_string(&path)?, "complete report\n");
+        assert_eq!(names_in(&dir)?, ["summary.txt"], "no temporary left");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_run_leaves_the_previous_output_and_no_temporary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write as _;
+        let dir = scratch_dir("atomic-drop")?;
+        let path = dir.join("report.html");
+        std::fs::write(&path, "yesterday's complete report")?;
+        let mut file = super::AtomicFile::create(&path)?;
+        file.write_all(b"<html>half a rep")?;
+        // The run failed: dropped without a commit.
+        drop(file);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "yesterday's complete report"
+        );
+        assert_eq!(names_in(&dir)?, ["report.html"], "the temporary is removed");
+        // A directory is refused when opened, before any scan.
+        assert!(super::AtomicFile::create(&dir).is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_memory_budget_over_64_gib_and_a_bad_sniff_mode_are_usage_errors() {
+        let over = (crate::content::MAX_MEMORY_BUDGET + 1).to_string();
+        let message = usage_error(&[
+            "lakescan",
+            "scan",
+            "s3://b",
+            "--pii",
+            "--memory-budget",
+            &over,
+        ])
+        .await;
+        assert!(
+            message
+                .as_ref()
+                .is_some_and(|m| m.contains("too large") && m.contains("68719476736")),
+            "{message:?}"
+        );
+        for args in [
+            ["lakescan", "scan", "s3://b", "--pii-sniff", "none"].as_slice(),
+            &["lakescan", "scan", "s3://b", "--pii", "--pii-sniff", "all"],
+        ] {
+            assert!(usage_error(args).await.is_some(), "{args:?}");
+        }
     }
 
     #[tokio::test]

@@ -23,8 +23,11 @@ use std::io::Write;
 
 use super::escape::is_escaped;
 use super::rfc3339::format_rfc3339;
-use super::text::{counted, files, undocumented_counts};
-use super::{ScanInfo, TOOL_NAME, TOOL_VERSION, status_of};
+use super::text::{
+    counted, dates_line, files, grouped, no_pii_line, out_of_scope_line, undocumented_counts,
+    undocumented_split,
+};
+use super::{SAMPLING_METHOD, ScanInfo, TOOL_NAME, TOOL_VERSION, expiry_of, status_of};
 use crate::aggregate::{
     Aggregates, MAX_ENTRIES, MAX_TABLES, PiiInventory, SampleDetail, Status, Table, TableStatus,
 };
@@ -96,6 +99,7 @@ code, .key { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospa
 .banner h2 { border: 0; margin: 0 0 .25rem; padding: 0; }
 .banner.action { background: var(--bad-bg); border-color: var(--bad); }
 .banner.ok { background: var(--ok-bg); border-color: var(--ok); }
+.banner.warn { background: var(--warn-bg); border-color: #9a6700; }
 .banner ul { margin: .25rem 0 0; padding-left: 1.25rem; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .75rem; margin: 1rem 0; }
 .card { border: 1px solid var(--line); border-radius: .5rem; padding: .75rem 1rem; }
@@ -201,6 +205,9 @@ fn write_header<W: Write>(
     }
     wl!(out, "</dd>")?;
     wl!(out, "<dt>LakeScan</dt><dd>{TOOL_NAME} {TOOL_VERSION}</dd>")?;
+    w!(out, "<dt>Settings</dt><dd class=\"key\">")?;
+    write_text(out, &info.settings.line(info.prefix.as_deref()))?;
+    wl!(out, "</dd>")?;
     wl!(
         out,
         "<dt>Started</dt><dd class=\"timing\">{}</dd>",
@@ -293,6 +300,66 @@ fn write_banner<W: Write>(
     wl!(out, "</section>")
 }
 
+/// A banner of its own when the inventory's caps dropped anything: every
+/// table list and count below is then incomplete.
+fn write_truncation<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
+    let Some(inventory) = aggregates.pii_inventory() else {
+        return Ok(());
+    };
+    if !inventory.truncated() {
+        return Ok(());
+    }
+    wl!(out, "<section class=\"banner warn\" role=\"alert\">")?;
+    wl!(out, "<h2>PII inventory truncated</h2>")?;
+    wl!(
+        out,
+        "<p>{} and {} were left out over the inventory's caps ({MAX_TABLES} tables, \
+         {MAX_ENTRIES} entries), so the tables and counts below are incomplete. Scan narrower \
+         prefixes to see them.</p>",
+        files(inventory.left_out_files()),
+        counted(inventory.left_out_findings(), "finding", "findings")
+    )?;
+    wl!(out, "</section>")
+}
+
+/// What was read and how: coverage, sampled inspection, and what was out
+/// of scope.
+fn write_coverage<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
+    let (Some(coverage), Some(scope)) = (aggregates.coverage(), aggregates.out_of_scope()) else {
+        return Ok(());
+    };
+    wl!(out, "<section id=\"coverage\">")?;
+    wl!(out, "<h2>Coverage</h2>")?;
+    wl!(out, "<ul>")?;
+    wl!(
+        out,
+        "<li>{} of {} scanned; {} not scanned ({} documented).</li>",
+        grouped(coverage.files_scanned),
+        counted(coverage.files_eligible, "Parquet file", "Parquet files"),
+        grouped(coverage.not_scanned_unsuppressed + coverage.not_scanned_suppressed),
+        grouped(coverage.not_scanned_suppressed)
+    )?;
+    wl!(
+        out,
+        "<li>Inspection is {SAMPLING_METHOD}. No result proves a column holds no personal \
+         data.</li>"
+    )?;
+    w!(out, "<li>")?;
+    match out_of_scope_line(scope) {
+        Some(line) => write_text(out, &line)?,
+        None => w!(out, "Not in scope for --pii: none by extension")?,
+    }
+    wl!(out, ".</li>")?;
+    wl!(
+        out,
+        "<li>Sniffed and not Parquet: {}. Empty objects and folder markers: {}.</li>",
+        grouped(scope.sniffed_not_parquet()),
+        grouped(scope.empty())
+    )?;
+    wl!(out, "</ul>")?;
+    wl!(out, "</section>")
+}
+
 fn write_cards<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
     let (Some(inventory), Some(coverage)) = (aggregates.pii_inventory(), aggregates.coverage())
     else {
@@ -357,6 +424,9 @@ fn write_table_heading<W: Write>(out: &mut W, table: &Table) -> Result<(), LakeS
         files(table.files_scanned),
         table.files_not_scanned()
     )?;
+    if let Some(dates) = dates_line(table) {
+        w!(out, "; {dates}")?;
+    }
     if let Some(key) = table.example_key() {
         w!(out, ". Example: <span class=\"key\">")?;
         write_text(out, key)?;
@@ -403,6 +473,9 @@ fn write_entries<W: Write>(
         match status_of(entry.status(), &info.suppressions) {
             (_, Some(reason)) => {
                 w!(out, "<span class=\"badge documented\">Documented</span> ")?;
+                if let Some(expires) = expiry_of(entry.status(), &info.suppressions) {
+                    w!(out, "until {expires}: ")?;
+                }
                 write_text(out, reason)?;
             }
             (_, None) => {
@@ -430,6 +503,11 @@ fn write_inventory<W: Write>(
     let summary = inventory.summary();
     wl!(out, "<section id=\"inventory\">")?;
     wl!(out, "<h2>PII inventory</h2>")?;
+    let action = if summary.undocumented > 0 {
+        " Action needed on the undocumented."
+    } else {
+        ""
+    };
     let gaps = if summary.tables_not_fully_scanned > 0 {
         format!(
             " ({} documented)",
@@ -440,13 +518,18 @@ fn write_inventory<W: Write>(
     };
     wl!(
         out,
-        "<p>{} with PII, {}: {} undocumented (action needed), {} documented. {} not fully \
+        "<p>{} with PII, {}: {}, {} documented.{action} {} with files not \
          scanned{gaps}.</p>",
         counted(summary.tables_with_pii, "table", "tables"),
         counted(summary.pii_columns, "PII column", "PII columns"),
-        summary.undocumented,
+        undocumented_split(&summary),
         summary.documented,
         counted(summary.tables_not_fully_scanned, "table", "tables"),
+    )?;
+    wl!(
+        out,
+        "<p class=\"note\">Tables are inferred from object paths. Documented means your team \
+         recorded a reason: an operational exception, not a compliance approval.</p>"
     )?;
     wl!(
         out,
@@ -471,15 +554,7 @@ fn write_inventory<W: Write>(
         write_table_heading(out, table)?;
         match table.status() {
             TableStatus::PiiFound => write_entries(out, info, table)?,
-            TableStatus::NoPiiInScannedFiles => {
-                let scanned = table.files_scanned;
-                let noun = if scanned == 1 { "file" } else { "files" };
-                w!(out, "<p>No PII found in {scanned} scanned {noun}")?;
-                if table.files_not_scanned() > 0 {
-                    w!(out, "; {} not scanned", table.files_not_scanned())?;
-                }
-                wl!(out, ".</p>")?;
-            }
+            TableStatus::NoPiiInScannedFiles => wl!(out, "<p>{}.</p>", no_pii_line(table))?,
             TableStatus::NotScanned => {
                 wl!(
                     out,
@@ -491,8 +566,9 @@ fn write_inventory<W: Write>(
     if inventory.truncated() {
         wl!(
             out,
-            "<p class=\"note\">Truncated: {} files and {} findings left out over the caps \
-             ({MAX_TABLES} tables, {MAX_ENTRIES} entries); scan a narrower prefix to see them.</p>",
+            "<p class=\"note\"><strong>Truncated:</strong> {} files and {} findings left out \
+             over the caps ({MAX_TABLES} tables, {MAX_ENTRIES} entries); scan a narrower prefix \
+             to see them.</p>",
             inventory.left_out_files(),
             inventory.left_out_findings()
         )?;
@@ -692,16 +768,20 @@ pub(super) fn write<W: Write>(
     write_header(out, info, code)?;
     wl!(out, "<main>")?;
     write_banner(out, aggregates, code)?;
+    write_truncation(out, aggregates)?;
     write_cards(out, aggregates)?;
+    write_coverage(out, aggregates)?;
     write_inventory(out, info, aggregates)?;
     write_not_scanned(out, aggregates)?;
     write_metadata_findings(out, aggregates)?;
     wl!(out, "</main>")?;
     wl!(
         out,
-        "<footer><p>No personal-data values appear in this report: only file keys, table and \
-         column names, counts, and the reasons you documented. It is a single file that loads \
-         nothing from the network.</p></footer>"
+        "<footer><p>Contains object and column names but no personal-data values; share \
+         within your organization. Documented means your team recorded a reason; it is an \
+         operational exception, not a compliance approval. LakeScan is a discovery aid, not a \
+         compliance assessment: no finding does not prove there is no personal data. This is a \
+         single file that loads nothing from the network.</p></footer>"
     )?;
     write_data_and_script(out, info, aggregates)?;
     wl!(out, "</body>")?;

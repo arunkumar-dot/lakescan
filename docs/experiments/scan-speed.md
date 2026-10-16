@@ -32,7 +32,8 @@ tokio's blocking pool.
   `customers.parquet` from 4 writers and 3 codecs, and `escalation.parquet`,
   1.2-2.1 MB each), shared in memory, not copied. All are under the 8 MiB
   whole-file maximum, so each is one whole read. Measured at `--concurrency`
-  1, 4, 16 and 64, default `--memory-budget` (256 MiB).
+  1, 4, 16 and 64, with the M9 default `--memory-budget` (256 MiB; the
+  default is 512 MiB since M11.1).
 - **Large files.** The round-2 spike files (`spikes/parquet-pii/data2`, 12
   files, 45-184 MB, pyarrow, Polars, DuckDB and Spark), when present (the
   benchmark's `--spike-dir`). Each is scanned alone, partially, with
@@ -84,6 +85,25 @@ Total: 148 → 106 GET requests (-28%), 65.2 → 78.1 MB read (+20%).
 |---:|---:|---:|---:|
 | 10000 | 10 | 1.03 | 9744 |
 | 50000 | 50 | 5.12 | 9765 |
+
+### M11.1: large files together, `--concurrency 16`
+
+All 12 large spike files in one lake, scanned at `--concurrency 16`
+(`cargo run --release --example bench_scan -- --spike-dir
+spikes/parquet-pii/data2 --large-together-only`), three runs each, same
+latency model and host (10 CPUs). "Before" is the code at v0.1.0's M11
+commit, whose default budget was 256 MiB; "after" releases the overflow
+lane as soon as a file is back within its share, and defaults to 512 MiB.
+
+| code | --memory-budget | wall time (s), 3 runs | GET requests | MB read |
+|---|---:|---:|---:|---:|
+| before | 256 MiB (default) | 0.48, 0.49, 0.50 | 106 | 78.1 |
+| after | 256 MiB | 0.42, 0.42, 0.42 | 106 | 78.1 |
+| after | 512 MiB (default) | 0.36, 0.36, 0.36 | 106 | 78.1 |
+
+The early release alone cuts the time by about 15% at the same budget;
+with the larger default, by about 27%. Requests and bytes are unchanged:
+only how long files wait for the lane changes. Simulated, like the rest.
 
 ## Verdict against the targets
 

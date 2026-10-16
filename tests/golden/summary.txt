@@ -1,5 +1,6 @@
 lakescan 0.1.0
 s3://example-bucket/logs/
+settings: pii=on whole-file-max=8388608 sniff=unknown coalesce-gap=1048576 concurrency=16 memory-budget=536870912 fail-on=high prefix=logs/ config=sha256:ed56731f5617f42469ac22ee95fe5f09a8c95a1672bdbcd10a8f406f27fb7738 (5 entries)
 started:  2023-11-14T22:13:20Z
 elapsed:  1.234s
 
@@ -40,29 +41,35 @@ FINDINGS
 
 CONTENT
   parquet files:      4
-    scanned whole:     2
-    scanned partially: 1
+    downloaded whole:  2
+    read partially:    1
     not scanned:       1 (unreadable=1)
   columns examined:   0
   columns skipped:    0 (repeated=0, unsupported-type=0, page-too-large=0, unreadable=0, unsupported-codec=0)
-  bytes read:         0 (0 B)
-  GET requests:       0
+  bytes read:         32 (32 B)
+  GET requests:       4
+  sniffed:            4 (objects without a Parquet extension; one 8-byte GET each)
 
 COVERAGE
   parquet files:  4
   scanned:        3 (75.0%)
   not scanned:    1 documented, 0 undocumented
+  inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  Not in scope for --pii: 1 .csv, 1 .jpg, 1 .tar (LakeScan reads Parquet content only)
+  sniffed, not Parquet: 4
+  empty objects and folder markers: 2
 
 PII INVENTORY
-  1 table with PII, 3 PII columns: 2 undocumented (action needed), 1 documented. 1 table not fully scanned (1 documented).
-  (bucket root)  files: 1 scanned, 0 not scanned
-    no PII found in 1 scanned file
-  warehouse/customers  files: 2 scanned, 0 not scanned
+  1 table with PII, 3 PII columns: 2 undocumented (1 confirmed, 1 likely, 0 possible), 1 documented. Action needed on the undocumented. 1 table with files not scanned (1 documented).
+  Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
+  (bucket root)  files: 1 scanned, 0 not scanned; files dated 2023-11-14 to 2023-11-14
+    No structured PII detected in sampled data from 1 file
+  warehouse/customers  files: 2 scanned, 0 not scanned; files dated 2023-11-01 to 2023-11-14
     example: warehouse/customers/dt=2023-11-01/part-0.parquet
     contact.phone  pii-phone  likely  evidence=values  1 file likely  UNDOCUMENTED
     email  pii-email  confirmed  evidence=values  2 files confirmed  UNDOCUMENTED
-    full_name  pii-person-name  likely  evidence=column-name  2 files, documented: Names are needed for invoicing (DPA section 4)
-  warehouse/orders  files: 0 scanned, 1 not scanned (unreadable=1 documented)
+    full_name  pii-person-name  likely  evidence=column-name  2 files, documented until 2027-06-30: Names are needed for invoicing (DPA section 4)
+  warehouse/orders  files: 0 scanned, 1 not scanned (unreadable=1 documented); files dated 2023-11-14 to 2023-11-14
     not scanned: PII unknown
 
 SUPPRESSIONS
@@ -85,14 +92,14 @@ SAMPLES
   [unknown-storage-class]
     unknown/object.dat  severity=info size=777 (777 B) class=FUTURE_TIER modified=2023-11-14T22:13:20Z
   [pii-email]
-    warehouse/customers/dt=2023-11-01/part-0.parquet  column=email confidence=confirmed evidence=values matched=1900/2000  severity=high size=5000000 (4.7 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
+    warehouse/customers/dt=2023-11-01/part-0.parquet  column=email confidence=confirmed evidence=values matched=1900/2000  severity=high size=5000000 (4.7 MiB) class=STANDARD modified=2023-11-01T22:13:20Z
     warehouse/customers/dt=2023-11-02/part-0.parquet  column=email confidence=confirmed evidence=values matched=1900/2000  severity=high size=4000000 (3.8 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
   [pii-phone]
-    warehouse/customers/dt=2023-11-01/part-0.parquet  column=contact.phone confidence=likely evidence=values matched=20/24  severity=medium size=5000000 (4.7 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
+    warehouse/customers/dt=2023-11-01/part-0.parquet  column=contact.phone confidence=likely evidence=values matched=20/24  severity=medium size=5000000 (4.7 MiB) class=STANDARD modified=2023-11-01T22:13:20Z
 
 LARGEST OBJECTS
   old/dataset.bin  size=2147483648 (2.0 GiB) class=STANDARD modified=2023-04-28T22:13:20Z
-  warehouse/customers/dt=2023-11-01/part-0.parquet  size=5000000 (4.7 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
+  warehouse/customers/dt=2023-11-01/part-0.parquet  size=5000000 (4.7 MiB) class=STANDARD modified=2023-11-01T22:13:20Z
   warehouse/customers/dt=2023-11-02/part-0.parquet  size=4000000 (3.8 MiB) class=STANDARD modified=2023-11-14T22:13:20Z
   warehouse/orders/data/part-0.parquet  size=10000 (9.7 KiB) class=STANDARD modified=2023-11-14T22:13:20Z
   backups/archive.tar  size=4096 (4.0 KiB) class=REDUCED_REDUNDANCY modified=2023-11-14T22:13:20Z
@@ -118,7 +125,8 @@ SIZE HISTOGRAM
   [2147483648, 4294967296) count=1          bytes=2147483648 (2.0 GiB)
 
 AGE HISTOGRAM
-  [0d, 1d)                 count=12         bytes=9020833 (8.6 MiB)
+  [0d, 1d)                 count=11         bytes=4020833 (3.8 MiB)
+  [7d, 30d)                count=1          bytes=5000000 (4.7 MiB)
   [180d, 365d)             count=1          bytes=2147483648 (2.0 GiB)
 
 DISTINCT CONTENT

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! cargo run --release --example bench_scan -- \
-//!     [--spike-dir spikes/parquet-pii/data2] [--files 1000]
+//!     [--spike-dir spikes/parquet-pii/data2] [--files 1000] [--large-together-only]
 //! ```
 //!
 //! Prints three Markdown tables: the small-file lake at several
@@ -288,6 +288,51 @@ async fn large_files(spike_dir: Option<&Path>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Every large spike file in one lake, scanned at `--concurrency 16`: once
+/// with the default `--memory-budget` and once with 256 MiB (the default
+/// before M11.1), so the effect of the budget and of the overflow lane's
+/// release can be told apart.
+async fn large_files_together(spike_dir: Option<&Path>) -> Result<(), Box<dyn Error>> {
+    println!("### Large files together: --concurrency 16\n");
+    let Some(dir) = spike_dir.filter(|dir| dir.is_dir()) else {
+        println!("Skipped: the round-2 spike files are not present (pass --spike-dir).\n");
+        return Ok(());
+    };
+    let store = SimStore::new(MODEL);
+    let mut objects = Vec::new();
+    for writer in ["pyarrow", "polars", "duckdb", "spark"] {
+        for table in ["customers_1m", "tickets_1m", "events_2m"] {
+            let path = dir.join(writer).join(format!("{table}.parquet"));
+            if path.is_file() {
+                let body = Arc::new(std::fs::read(&path)?);
+                let key = format!("big/{writer}/{table}.parquet");
+                objects.push(object(key.clone(), u64::try_from(body.len())?));
+                store.insert(&key, body);
+            }
+        }
+    }
+    println!("| --memory-budget | files | wall time (s) | GET requests | MB read |");
+    println!("|---:|---:|---:|---:|---:|");
+    for budget in [ContentSettings::default().memory_budget, 256 << 20] {
+        let settings = ContentSettings {
+            concurrency: 16,
+            memory_budget: budget,
+            ..ContentSettings::default()
+        };
+        let run = measure(objects.clone(), &store, Some(settings), Duration::ZERO).await?;
+        println!(
+            "| {} MiB | {} | {:.2} | {} | {} |",
+            budget >> 20,
+            objects.len(),
+            run.seconds,
+            run.requests,
+            mb(run.bytes)
+        );
+    }
+    println!();
+    Ok(())
+}
+
 async fn listing_alone() -> Result<(), Box<dyn Error>> {
     println!("### Listing alone: 1,000 keys per page, 100 ms per page, no --pii\n");
     println!("| keys | pages | wall time (s) | keys/s |");
@@ -314,11 +359,13 @@ async fn listing_alone() -> Result<(), Box<dyn Error>> {
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut spike_dir: Option<PathBuf> = None;
     let mut files = 1000;
+    let mut together_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--spike-dir" => spike_dir = args.next().map(PathBuf::from),
             "--files" => files = args.next().ok_or("--files needs a number")?.parse()?,
+            "--large-together-only" => together_only = true,
             other => return Err(format!("unknown argument {other:?}").into()),
         }
     }
@@ -329,8 +376,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         MODEL.bytes_per_second / 1_000_000,
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get)
     );
+    if together_only {
+        large_files_together(spike_dir.as_deref()).await?;
+        return Ok(());
+    }
     small_file_lake(&fixtures, files).await?;
     large_files(spike_dir.as_deref()).await?;
+    large_files_together(spike_dir.as_deref()).await?;
     listing_alone().await?;
     let _ = io::Write::flush(&mut io::stdout());
     Ok(())

@@ -51,7 +51,7 @@ mod date;
 
 use std::collections::HashMap;
 
-pub use config::{Config, Entry, MAX_ENTRIES, Pattern};
+pub use config::{Config, Entry, Fingerprint, MAX_ENTRIES, Pattern};
 pub use date::Date;
 
 use crate::model::{Finding, RuleId};
@@ -80,6 +80,8 @@ pub struct Outcome {
     /// [`Suppressor::matching`] returned for a finding finds the reason
     /// that documents it.
     pub reasons: Vec<String>,
+    /// Every entry's expiry date, if it has one, by the same index.
+    pub expires: Vec<Option<Date>>,
 }
 
 /// Matches findings against one config's entries for one scan, counting
@@ -197,6 +199,7 @@ impl Suppressor {
                 .iter()
                 .map(|entry| entry.reason.clone())
                 .collect(),
+            expires: self.entries.iter().map(|entry| entry.expires).collect(),
             ..Outcome::default()
         };
         for ((entry, state), hits) in self.entries.into_iter().zip(self.states).zip(self.hits) {
