@@ -33,6 +33,50 @@ Memory use does not grow with the bucket. Every stage has a fixed budget: one
 listing page in flight, fixed-size summaries, and a streaming writer. Scanning
 ten objects or ten billion uses the same memory.
 
+## Getting started
+
+1. Download and install the binary for your platform
+   (see [Run the release binary](#run-the-release-binary) below).
+
+2. Make sure your AWS credentials are configured:
+   ```bash
+   aws configure
+   # or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in your shell
+   ```
+
+3. Run a metadata scan on your bucket:
+   ```bash
+   lakescan scan s3://your-bucket-name
+   ```
+   Exit 0: no findings at or above `--fail-on` (default: High).
+   Exit 1: findings were found — read the summary.
+   Exit 6: a file could not be scanned and is not documented —
+   read the summary before trusting it.
+
+4. Add `--pii` to also scan Parquet files for personal data:
+   ```bash
+   lakescan scan s3://your-bucket-name --pii --html report.html
+   open report.html   # macOS; xdg-open on Linux
+   ```
+   This opens an interactive offline dashboard in your browser
+   showing which tables and columns hold personal data.
+
+5. When a finding is expected (a column that is meant to hold
+   personal data), document it with a suppression entry in a
+   TOML config file:
+   ```toml
+   [[suppress]]
+   rule    = "pii-email"
+   prefix  = "lake/customers/"
+   column  = "email"
+   reason  = "Consented billing contacts, covered by our DPA"
+   expires = 2027-06-30
+   ```
+   Then rerun with `--config your-config.toml`. The finding moves
+   from undocumented to documented in the inventory.
+
+Full flag reference: see [Usage](#usage) below.
+
 ## Run the release binary
 
 Download the archive for your platform from the
@@ -49,6 +93,12 @@ with `SHA256SUMS`:
 The Linux binaries need glibc 2.17 or newer: Amazon Linux 2023, Ubuntu 22.04
 and later, and most distributions since 2014. Each archive holds the
 `lakescan` binary, `LICENSE` and `README.md`.
+
+**Windows:** A native Windows binary is not yet available.
+The Linux x86_64 binary runs under WSL2 (Windows Subsystem for
+Linux), which is the recommended path. Inside a WSL2 terminal,
+use the Linux x86_64 install commands above. Alternatively,
+install from source with `cargo install` as shown below.
 
 Verify the download against `SHA256SUMS`, then unpack it:
 
@@ -92,6 +142,10 @@ Or clone the repository and run `cargo build --release`; the binary is
 `target/release/lakescan`.
 
 ## Try the local demo from source
+
+> Docker is only needed for this local demo. Scanning a real
+> S3 bucket requires only the binary and AWS credentials —
+> see [Run the release binary](#run-the-release-binary).
 
 The repository includes a seeder that fills a local S3 fake with a demo
 bucket. That bucket has 2,413 objects across three listing pages, a few
