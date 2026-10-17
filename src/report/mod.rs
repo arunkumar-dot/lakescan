@@ -17,8 +17,8 @@
 //!   samples, histograms, the distinct-content estimate — as either
 //!   [`Format::Text`] or [`Format::Json`]. This is always a single,
 //!   complete snapshot, written once at the end of a scan. The same
-//!   snapshot is also rendered as CSV ([`write_inventory_csv`]) and as a
-//!   self-contained HTML report ([`write_html`]), on request.
+//!   snapshot is also rendered as CSV ([`write_inventory_csv`]) and as an
+//!   interactive HTML dashboard ([`write_html`]), on request.
 //! - An **optional per-finding stream**, from [`crate::rules::evaluate`]:
 //!   [`FindingsWriter`] renders one JSON Lines record per [`Finding`] *as it
 //!   arrives*, independent of the summary and independent of whether a
@@ -552,9 +552,9 @@ pub fn write_inventory_csv<W: Write>(
     sink.flush().map_err(LakeScanError::Report)
 }
 
-/// Writes the HTML report (`--html`) for a run ending with `code`; see the
-/// `html` submodule for its guarantees (self-contained, offline, every
-/// bucket-derived string escaped). Behind the same 64 KB buffer as
+/// Writes the HTML dashboard (`--html`) for a run ending with `code`. The
+/// page is the compiled-in dashboard with this run's JSON substituted for
+/// its fixture; see the `html` submodule. Behind the same 64 KB buffer as
 /// [`write_summary`], with the same broken-pipe rule.
 ///
 /// # Errors

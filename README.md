@@ -192,7 +192,7 @@ container or instance credentials.
 | `--concurrency <N>` | `16` | With `--pii`: Parquet files scanned at once, `1` to `256`. Findings, the inventory and the summary are the same for any value, apart from this number in the recorded settings and the timing lines. Requires `--pii`. See [Speed and memory](#speed-and-memory). |
 | `--memory-budget <BYTES>` | `536870912` (512 MiB) | With `--pii`: the most bytes in-flight file scans hold at once. Must cover the most one file can need (~108 MiB at the default `--pii-whole-file-max`, ~137 MiB at 64 MiB), and at most `68719476736` (64 GiB). Anything else is a usage error; the semaphore is created with exactly this many permits. Requires `--pii`. |
 | `--coalesce-gap <BYTES>` | `1048576` (1 MiB) | With `--pii`: page ranges of one file at most `BYTES` apart are read as one request (merged reads stay within 8 MiB). `0` reads each range alone. Requires `--pii`. |
-| `--html <PATH>` | off | Also write a self-contained [HTML report](#html-report) to `PATH`. `-` means stdout, which then requires every other output to go to a file. Works with or without `--pii`. |
+| `--html <PATH>` | off | Also write an interactive [HTML dashboard](#html-report) to `PATH`. `-` means stdout, which then requires every other output to go to a file. Works with or without `--pii`. Open the file in any browser; it works offline and makes no network requests. |
 | `--inventory <PATH>` | off | With `--pii`: also write the [PII inventory](#pii-inventory-and-coverage) as CSV to `PATH`, one row per table, column and rule. `-` means stdout, which then requires `--output` to name a file, and `--findings` not to be `-`. Requires `--pii`. |
 
 A progress line (`scanned N objects, M findings`) is shown on stderr only when
@@ -216,7 +216,7 @@ temporary file. `-` means stdout.
 | `--output <PATH>` | The text or JSON summary. Omitted, or `-`, writes it to stdout. | The default destination for the summary. |
 | `--findings <PATH>` | Every unsuppressed finding as JSON Lines, as it is found. | `-` requires `--output` to name a file, so the summary is not mixed into the stream. |
 | `--inventory <PATH>` | The PII inventory as CSV. Requires `--pii`. | `-` requires `--output` to name a file, and `--findings` not to be `-`. |
-| `--html <PATH>` | A self-contained HTML report. Works with or without `--pii`. | `-` requires every other output to go to a file. |
+| `--html <PATH>` | An interactive HTML dashboard. Works with or without `--pii`. | `-` requires every other output to go to a file. |
 
 One of them may be stdout. Two may not: `--findings -` with the summary
 also on stdout is a usage error, and so is `--html -` together with any
@@ -641,35 +641,24 @@ prefix to see the rest.
 
 ### HTML report
 
-`--html report.html` writes the same results as one file to open in a
-browser, print, or send: the scan's target, version, timing and exit code
-with its meaning; an **Action needed** banner listing what to do
-(undocumented PII columns, undocumented unscanned files, findings at the
-failing threshold), or **No action needed**; headline cards; the PII
-inventory by table, ordered as in the text summary, with status badges and
-documented reasons, and filters (All, Undocumented, Documented); a
-**Coverage** section (files scanned, sampled inspection, and what was out of
-scope or sniffed and not Parquet); the files not scanned, by table and
-reason; and the metadata findings per rule. When the inventory's caps left
-anything out, a **PII inventory truncated** banner says so above
-everything else. The header records the scan's settings. Without `--pii` it
-has the metadata sections only.
+`--html report.html` writes an interactive dashboard: one file for the
+scan's bucket, timing, settings and exit code; coverage; the PII inventory
+with status filters and documented reasons; files not scanned; and the
+metadata rules. Open the file in any browser; it works offline and makes
+no network requests.
 
 - **Offline.** All CSS and JavaScript are inline, fonts are the system's,
   and a Content-Security-Policy (`default-src 'none'`) stops the page from
-  loading anything: opening it makes no network request.
+  loading anything.
 - **No values.** Like every other output, it holds no sampled personal
   data: keys, table and column names, counts, and your documented reasons.
   The footer says: "Contains object and column names but no personal-data
   values; share within your organization."
 - **Escaped names.** Keys, table and column names and reasons are
-  attacker-controlled. Each is escaped like the text summary (control and
-  bidi characters as `\u{XXXX}`, backslashes doubled), then HTML-escaped,
-  so a name like `<script>…</script>` shows as text. The small script reads
-  its data from a JSON block in which `<` is written `\u003c`, and only sets
+  attacker-controlled. They are embedded as JSON, escaped the same way as
+  the JSON summary, and every `<` in that JSON is written `\u003c`, so a
+  name like `</script>` cannot break out of the script. The page only sets
   text, never HTML.
-- **Works without JavaScript**: every row is shown and the filters are
-  hidden. Printing shows every row, without the filters.
 - **Deterministic**: the same for any `--concurrency`, apart from its start
   time, duration, and the recorded concurrency.
 

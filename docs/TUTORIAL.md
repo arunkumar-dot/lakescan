@@ -611,25 +611,26 @@ What to notice:
 
 ```text
 $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --config demo.toml --html report.html --quiet > /dev/null
-report.html: 17821 bytes
 $ open report.html
 exit code: 1
 ```
 
 What to notice:
 
-- It is one ~18 KB file with inline CSS and script, and a
-  Content-Security-Policy of `default-src 'none'`, so opening it makes no
-  network request.
-- **Action needed** banner at the top, with headline cards below it.
-- **Inventory** by table, with UNDOCUMENTED and documented badges, the
-  documented reason, and All, Undocumented and Documented filters.
-- **Files not scanned**, by table and reason. With `demo.toml` they show
-  as documented.
-- **Metadata findings**, per rule.
-- **Exit code 1**, as in f2, and the page states that code and its
-  meaning too.
-- It works without JavaScript (all rows shown) and prints cleanly.
+- `--html` writes an interactive dashboard. Open the file in any browser;
+  it works offline and makes no network requests. CSS and script are
+  inline, and a Content-Security-Policy of `default-src 'none'` stops the
+  page from loading anything.
+- The header shows the bucket, when the scan ran, how long it took, and
+  the exit code with its meaning.
+- **PII inventory**: filter All, Undocumented and Documented, and click a
+  rule or a table to narrow the rows. Documented rows show the reason and
+  expiry. **Document ›** copies a suppression snippet for an undocumented
+  column.
+- **Files not scanned**, with the reason and whether it is documented.
+- **Coverage detail** and **Metadata findings** are collapsed at the
+  bottom; open them for the file counts and the six metadata rules.
+- **Exit code 1**, as in f2. The page states that code and its meaning.
 
 ### Step i: `--fail-on none`
 

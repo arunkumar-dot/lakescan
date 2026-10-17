@@ -1,0 +1,1496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>LakeScan report</title>
+<script>
+try {
+  var savedTheme = localStorage.getItem("lakescan-theme");
+  if (savedTheme === "light" || savedTheme === "dark") {
+    document.documentElement.setAttribute("data-theme", savedTheme);
+  }
+} catch (err) {}
+</script>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #FAFAFA;
+  --surface: #FFFFFF;
+  --border: #E5E7EB;
+  --text: #111827;
+  --muted: #6B7280;
+  --primary: #4F46E5;
+  --primary-ink: #FFFFFF;
+  --danger: #DC2626;
+  --warning: #D97706;
+  --success: #059669;
+  --row-hover: #F9FAFB;
+  --zebra: rgba(17, 24, 39, 0.025);
+  --shadow-card: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+  --shadow-panel: 0 4px 6px rgba(0,0,0,.07), 0 10px 15px rgba(0,0,0,.05);
+  --shadow-lift: 0 4px 6px rgba(0,0,0,.07), 0 10px 15px rgba(0,0,0,.05);
+  --code-bg: #0F172A;
+  --code-text: #E2E8F0;
+  --code-key: #818CF8;
+  --code-str: #34D399;
+  --code-num: #94A3B8;
+  --tint-danger: rgba(220, 38, 38, 0.1);
+  --tint-warning: rgba(217, 119, 6, 0.14);
+  --tint-success: rgba(5, 150, 105, 0.12);
+  --tint-primary: rgba(79, 70, 229, 0.12);
+  --focus: #4F46E5;
+  --bar-doc: #4F46E5;
+  --bar-undoc: #D97706;
+  --bar-gap-doc: #94A3B8;
+  --flash: rgba(79, 70, 229, 0.14);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0F172A;
+    --surface: #1E293B;
+    --border: #334155;
+    --text: #F1F5F9;
+    --muted: #94A3B8;
+    --primary: #818CF8;
+    --primary-ink: #0F172A;
+    --danger: #F87171;
+    --warning: #FCD34D;
+    --success: #34D399;
+    --row-hover: #1E293B;
+    --zebra: rgba(241, 245, 249, 0.035);
+    --shadow-card: none;
+    --shadow-panel: none;
+    --shadow-lift: none;
+    --tint-danger: rgba(248, 113, 113, 0.14);
+    --tint-warning: rgba(252, 211, 77, 0.14);
+    --tint-success: rgba(52, 211, 153, 0.14);
+    --tint-primary: rgba(129, 140, 248, 0.16);
+    --focus: #818CF8;
+    --bar-doc: #818CF8;
+    --bar-undoc: #FCD34D;
+    --bar-gap-doc: #64748B;
+    --flash: rgba(129, 140, 248, 0.2);
+  }
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0F172A;
+  --surface: #1E293B;
+  --border: #334155;
+  --text: #F1F5F9;
+  --muted: #94A3B8;
+  --primary: #818CF8;
+  --primary-ink: #0F172A;
+  --danger: #F87171;
+  --warning: #FCD34D;
+  --success: #34D399;
+  --row-hover: #1E293B;
+  --zebra: rgba(241, 245, 249, 0.035);
+  --shadow-card: none;
+  --shadow-panel: none;
+  --shadow-lift: none;
+  --tint-danger: rgba(248, 113, 113, 0.14);
+  --tint-warning: rgba(252, 211, 77, 0.14);
+  --tint-success: rgba(52, 211, 153, 0.14);
+  --tint-primary: rgba(129, 140, 248, 0.16);
+  --focus: #818CF8;
+  --bar-doc: #818CF8;
+  --bar-undoc: #FCD34D;
+  --bar-gap-doc: #64748B;
+  --flash: rgba(129, 140, 248, 0.2);
+}
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #FAFAFA;
+  --surface: #FFFFFF;
+  --border: #E5E7EB;
+  --text: #111827;
+  --muted: #6B7280;
+  --primary: #4F46E5;
+  --primary-ink: #FFFFFF;
+  --danger: #DC2626;
+  --warning: #D97706;
+  --success: #059669;
+  --row-hover: #F9FAFB;
+  --zebra: rgba(17, 24, 39, 0.025);
+  --shadow-card: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+  --shadow-panel: 0 4px 6px rgba(0,0,0,.07), 0 10px 15px rgba(0,0,0,.05);
+  --shadow-lift: 0 4px 6px rgba(0,0,0,.07), 0 10px 15px rgba(0,0,0,.05);
+  --tint-danger: rgba(220, 38, 38, 0.1);
+  --tint-warning: rgba(217, 119, 6, 0.14);
+  --tint-success: rgba(5, 150, 105, 0.12);
+  --tint-primary: rgba(79, 70, 229, 0.12);
+  --focus: #4F46E5;
+  --bar-doc: #4F46E5;
+  --bar-undoc: #D97706;
+  --bar-gap-doc: #94A3B8;
+  --flash: rgba(79, 70, 229, 0.14);
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  min-width: 320px;
+}
+button, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus { outline: none; }
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px 48px; }
+h1, h2, h3, .tile-value, .brand-name {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+.mono, code, .key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 56px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.topbar-inner, .identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.topbar-inner { max-width: 1120px; margin: 0 auto; padding: 8px 24px; width: 100%; justify-content: space-between; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 8px; color: var(--primary); }
+.brand-name { font-size: 14px; color: var(--text); }
+.icon { width: 20px; height: 20px; display: block; flex: none; }
+.header-block { padding: 24px 0 8px; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+.bucket-row { display: flex; align-items: center; gap: 8px; color: var(--muted); min-width: 0; }
+.bucket { font-size: 20px; color: var(--text); overflow-wrap: anywhere; }
+.subline { color: var(--muted); font-size: 12px; margin: 4px 0 0; overflow-wrap: anywhere; }
+.exit-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.pill, .badge, .tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.pill-danger { background: var(--tint-danger); color: var(--danger); }
+.pill-warning { background: var(--tint-warning); color: var(--warning); }
+.pill-success { background: var(--tint-success); color: var(--success); }
+.pill-neutral { background: var(--zebra); color: var(--muted); border-color: var(--border); }
+.meaning { color: var(--muted); font-size: 12px; max-width: 360px; }
+.icon-btn, .ghost, .text-btn {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-height: 32px;
+  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: background 150ms ease, border-color 150ms ease, transform 150ms ease;
+}
+.icon-btn:hover, .ghost:hover, .text-btn:hover { border-color: var(--primary); }
+.icon-btn:active, .ghost:active, .text-btn:active, .tab:active, .bar:active { transform: scale(0.98); }
+.ghost { background: transparent; color: var(--primary); font-weight: 600; font-size: 12px; }
+.banner {
+  margin: 16px 0 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 8px;
+  padding: 16px 48px 16px 16px;
+  position: relative;
+  box-shadow: var(--shadow-card);
+}
+.banner.danger { border-left-color: var(--danger); background: var(--tint-danger); }
+.banner.warning { border-left-color: var(--warning); background: var(--tint-warning); }
+.banner.success { border-left-color: var(--success); background: var(--tint-success); }
+.banner h2 { font-size: 16px; margin-bottom: 4px; }
+.banner p { margin: 0; }
+.banner-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+.banner-actions a { color: var(--primary); font-weight: 600; }
+.dismiss {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: 0;
+  background: transparent;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+}
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-card);
+  padding: 16px;
+  position: relative;
+  overflow: hidden;
+  transition: transform 150ms ease, box-shadow 150ms ease;
+}
+.tile:hover { transform: translateY(-2px); box-shadow: var(--shadow-lift); }
+.tile::before {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; top: 0;
+  height: 3px;
+  background: var(--strip, var(--border));
+}
+.tile-value { font-size: 32px; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.tile-label { color: var(--muted); margin-top: 8px; }
+.tile-sub { color: var(--muted); font-size: 12px; }
+.gauge { width: 36px; height: 36px; position: absolute; top: 16px; right: 12px; }
+.charts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 32px;
+}
+.panel-card, .card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-card);
+  padding: 16px;
+}
+.card h2, .section-head h2 { font-size: 16px; }
+.card-desc, .muted { color: var(--muted); font-size: 12px; margin: 4px 0 12px; }
+.card-head { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+.text-btn {
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  padding: 0;
+  min-height: 24px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.chart-svg { width: 100%; height: auto; display: block; overflow: visible; }
+.seg:hover { filter: brightness(1.15); }
+.legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 4px; }
+.coverage-bar { display: flex; height: 8px; border-radius: 6px; overflow: hidden; background: var(--border); margin-top: 16px; }
+.coverage-bar span { display: block; height: 100%; }
+.section { margin: 32px 0; }
+.tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.tab {
+  border: 1px solid var(--border);
+  background: transparent;
+  border-radius: 999px;
+  padding: 4px 12px;
+  min-height: 32px;
+  color: var(--muted);
+  transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+.tab[aria-selected="true"] {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--primary-ink);
+}
+.chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid var(--primary);
+  color: var(--primary);
+  background: var(--tint-primary);
+  padding: 2px 4px 2px 10px;
+  font-size: 12px;
+  max-width: 100%;
+}
+.chip span { overflow-wrap: anywhere; }
+.chip button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+}
+.summary-line { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+table { border-collapse: collapse; width: 100%; min-width: 760px; }
+.narrow-table { min-width: 0; width: 100%; }
+.narrow { max-width: 760px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; background: var(--surface); }
+tbody tr:nth-child(even) { background: var(--zebra); }
+tbody tr { transition: background 100ms ease; }
+tbody tr:hover { background: var(--row-hover); }
+tbody tr.flash { animation: rowflash 100ms ease; }
+@keyframes rowflash { from { background: var(--flash); } to { background: transparent; } }
+.linkish {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--text);
+  font-weight: 600;
+  text-align: left;
+  border-radius: 4px;
+}
+.indent { padding-left: 16px; }
+.badge-confirmed { background: var(--tint-success); color: var(--success); }
+.badge-likely { background: var(--tint-warning); color: var(--warning); }
+.badge-possible { background: var(--zebra); color: var(--muted); border-color: var(--border); }
+.badge-undocumented { background: var(--tint-warning); color: var(--warning); }
+.badge-documented { background: var(--tint-primary); color: var(--primary); }
+.tag { background: var(--zebra); color: var(--muted); border-color: var(--border); font-weight: 500; }
+.reason { display: block; color: var(--muted); font-size: 12px; font-weight: 400; white-space: normal; margin-top: 4px; }
+.empty { padding: 24px; color: var(--muted); }
+.collapse { padding: 0; }
+.collapse > button.head {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  padding: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  border-radius: 12px;
+}
+.collapse-body { padding: 0 16px 16px; }
+.rule-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.rule {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  border-top: 3px solid var(--rule, var(--border));
+}
+.rule .count { font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
+.info {
+  background: var(--zebra);
+  border-radius: 8px;
+  padding: 12px;
+  color: var(--muted);
+  margin-top: 12px;
+}
+.note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+footer { text-align: center; color: var(--muted); font-size: 12px; padding: 24px 0 8px; }
+footer p { margin: 0; }
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.48);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease;
+  z-index: 20;
+}
+.backdrop.open { opacity: 1; pointer-events: auto; }
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100%;
+  width: min(320px, 100%);
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: var(--shadow-panel);
+  z-index: 21;
+  transform: translateX(100%);
+  transition: transform 200ms ease;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+}
+.drawer.open { transform: translateX(0); }
+.drawer h2 { font-size: 16px; padding-right: 32px; }
+.drawer .dismiss { top: 12px; right: 12px; }
+.code {
+  position: relative;
+  background: var(--code-bg);
+  color: var(--code-text);
+  border-radius: 8px;
+  padding: 12px 12px 12px 8px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.code .copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: #1E293B;
+  color: #F1F5F9;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  min-height: 28px;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+.ln { color: var(--code-num); display: inline-block; width: 24px; text-align: right; margin-right: 8px; }
+.tok-key { color: var(--code-key); }
+.tok-str { color: var(--code-str); }
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.field input {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: 8px;
+  min-height: 32px;
+}
+.tooltip {
+  position: fixed;
+  z-index: 30;
+  background: var(--text);
+  color: var(--bg);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  pointer-events: none;
+  max-width: 280px;
+}
+.skeleton { display: grid; gap: 12px; padding-top: 24px; }
+.sk {
+  height: 16px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--border) 25%, var(--surface) 37%, var(--border) 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.2s ease infinite;
+}
+.sk.lg { height: 88px; }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.seg {
+  transform-box: fill-box;
+  transform-origin: left;
+  transform: scaleX(0);
+  transition: transform 300ms ease-out;
+}
+.seg.grow { transform: scaleX(1); }
+.gauge-arc { transition: stroke-dasharray 600ms ease-out; }
+.noscript-charts { display: none; }
+@media (max-width: 960px) {
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .charts, .rule-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 420px) {
+  .wrap, .topbar-inner { padding-left: 16px; padding-right: 16px; }
+  .tiles { grid-template-columns: 1fr; }
+  .tile-value { font-size: 32px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+  .seg { transform: scaleX(1) !important; }
+}
+@media print {
+  @page { size: A4; margin: 14mm; }
+  body { background: #fff; color: #111; }
+  .topbar, .no-print, .filters, .charts, .chips, .backdrop, .drawer, .tooltip, .skeleton, .ghost, .icon-btn, .tabs { display: none !important; }
+  .collapse-body { display: block !important; }
+  #inventory tbody tr { display: table-row !important; }
+  #inventory tbody tr.no-print { display: none !important; }
+  .filter-label { display: none !important; }
+  .table-wrap { overflow: visible; border: 0; }
+  table { min-width: 0; }
+  .tile, .card, .banner, .panel-card { box-shadow: none; break-inside: avoid; }
+  a { color: inherit; text-decoration: none; }
+}
+</style>
+</head>
+<body>
+<div id="app" class="app" aria-busy="true">
+  <div class="skeleton wrap" aria-hidden="true">
+    <div class="sk lg"></div>
+    <div class="sk"></div>
+    <div class="sk lg"></div>
+    <div class="sk"></div>
+  </div>
+</div>
+<noscript>
+<style>#app{display:none}</style>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand"><span class="brand-name">LakeScan 0.1.0</span></div>
+  </div>
+</header>
+<main class="wrap">
+  <div class="header-block">
+    <div>
+      <div class="bucket-row"><h1 class="bucket mono">s3://lakescan-pii</h1></div>
+      <p class="subline">2023-11-14T22:13:20Z · 28.1s · lakescan.toml</p>
+    </div>
+    <p class="pill pill-danger">Exit 6 · ContentNotScanned</p>
+  </div>
+  <section class="banner danger" role="region" aria-label="Action needed">
+    <h2>Action needed</h2>
+    <p><strong>1 Parquet file was not scanned and has no documented reason. 30 PII columns are undocumented.</strong></p>
+  </section>
+  <section class="tiles" aria-label="Headline">
+    <article class="tile" style="--strip:#DC2626"><div class="tile-value">30</div><div class="tile-label">Undocumented PII</div><div class="tile-sub">columns needing a reason</div></article>
+    <article class="tile" style="--strip:#4F46E5"><div class="tile-value">1</div><div class="tile-label">Documented</div><div class="tile-sub">reason recorded</div></article>
+    <article class="tile" style="--strip:#6B7280"><div class="tile-value">4</div><div class="tile-label">Tables with PII</div><div class="tile-sub">tables with a finding</div></article>
+    <article class="tile" style="--strip:#6B7280"><div class="tile-value">72.7%</div><div class="tile-label">Coverage</div><div class="tile-sub">8 of 11 Parquet files</div></article>
+    <article class="tile" style="--strip:#DC2626"><div class="tile-value">3</div><div class="tile-label">Files not scanned</div><div class="tile-sub">1 undocumented</div></article>
+  </section>
+  <p class="noscript-charts" style="display:block">Charts need JavaScript. Every row is listed below.</p>
+  <section id="inventory">
+    <h2>PII inventory</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Table</th><th>Column</th><th>PII type</th><th>Confidence</th><th>Files</th><th>Status</th></tr></thead>
+        <tbody>
+<tr><td>lake/customers</td><td class="mono">aadhaar_no</td><td class="mono">pii-in-aadhaar</td><td>confirmed</td><td>4 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">billing.email</td><td class="mono">pii-email</td><td>confirmed</td><td>4 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">card_number</td><td class="mono">pii-card-number</td><td>confirmed</td><td>4 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">contact</td><td class="mono">pii-phone</td><td>confirmed</td><td>4 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">dob</td><td class="mono">pii-date-of-birth</td><td>likely</td><td>4 files likely · column name</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">full_name</td><td class="mono">pii-person-name</td><td>likely</td><td>4 files likely · column name</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">last_login_ip</td><td class="mono">pii-ip-address</td><td>confirmed</td><td>4 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">mobile_no</td><td class="mono">pii-phone</td><td>confirmed</td><td>4 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">pan</td><td class="mono">pii-in-pan</td><td>confirmed</td><td>4 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">email</td><td class="mono">pii-email</td><td>confirmed</td><td>4 files · values</td><td>Documented. Consented marketing contacts, DPA-12 until 2027-06-30</td></tr>
+<tr><td>lake/customers_brotli</td><td class="mono">aadhaar_no</td><td class="mono">pii-in-aadhaar</td><td>confirmed</td><td>1 file confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">billing.email</td><td class="mono">pii-email</td><td>confirmed</td><td>1 file confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">card_number</td><td class="mono">pii-card-number</td><td>confirmed</td><td>1 file confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">contact</td><td class="mono">pii-phone</td><td>confirmed</td><td>1 file confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">dob</td><td class="mono">pii-date-of-birth</td><td>likely</td><td>1 file likely · column name</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">email</td><td class="mono">pii-email</td><td>confirmed</td><td>1 file confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">full_name</td><td class="mono">pii-person-name</td><td>likely</td><td>1 file likely · column name</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">last_login_ip</td><td class="mono">pii-ip-address</td><td>confirmed</td><td>1 file confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">mobile_no</td><td class="mono">pii-phone</td><td>confirmed</td><td>1 file confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">pan</td><td class="mono">pii-in-pan</td><td>confirmed</td><td>1 file confirmed · values</td><td>Undocumented</td></tr>
+<tr><td>lake/customers_gzip</td><td class="mono">aadhaar_no</td><td class="mono">pii-in-aadhaar</td><td>confirmed</td><td>2 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">billing.email</td><td class="mono">pii-email</td><td>confirmed</td><td>2 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">card_number</td><td class="mono">pii-card-number</td><td>confirmed</td><td>2 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">contact</td><td class="mono">pii-phone</td><td>confirmed</td><td>2 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">dob</td><td class="mono">pii-date-of-birth</td><td>likely</td><td>2 files likely · column name</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">email</td><td class="mono">pii-email</td><td>confirmed</td><td>2 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">full_name</td><td class="mono">pii-person-name</td><td>likely</td><td>2 files likely · column name</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">last_login_ip</td><td class="mono">pii-ip-address</td><td>confirmed</td><td>2 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">mobile_no</td><td class="mono">pii-phone</td><td>confirmed</td><td>2 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td></td><td class="mono">pan</td><td class="mono">pii-in-pan</td><td>confirmed</td><td>2 files confirmed · values</td><td>Undocumented</td></tr>
+<tr><td>lake/events</td><td class="mono">contact_email</td><td class="mono">pii-email</td><td>confirmed</td><td>1 file confirmed · values</td><td>Undocumented</td></tr>
+</tbody>
+      </table>
+    </div>
+  </section>
+  <section id="not-scanned">
+    <h2>Files not scanned</h2>
+    <div class="table-wrap narrow"><table class="narrow-table">
+      <thead><tr><th>Object key</th><th>Reason</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">bad/not_parquet.parquet</td><td><code>not-parquet</code></td><td>Documented. A CSV export misnamed .parquet; no personal data, reviewed 2026-10-16</td></tr>
+        <tr><td class="mono">bad/truncated.parquet</td><td><code>unreadable</code></td><td>Documented. Known-corrupt partial upload, kept for the incident record</td></tr>
+        <tr><td class="mono">skipped/too_large.parquet</td><td><code>no-column-examined</code></td><td>Undocumented</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note">Any undocumented file makes the scan exit 6.</p>
+  </section>
+  <section id="coverage">
+    <h2>Coverage detail</h2>
+    <p>11 Parquet files eligible. 6 scanned whole, 2 scanned partially, 3 not scanned (2 documented, 1 undocumented).</p>
+    <p>Columns examined: 107. Columns skipped: 17 (repeated 7, unsupported type 9, page too large 1, unreadable 0, unsupported codec 0).</p>
+    <p class="info">Inspection is sampled: up to 3 row groups, up to 2,000 values per column per row group. A finding means personal data was detected in the sample. No finding means none was detected in the sample, not that none exists.</p>
+  </section>
+  <section id="metadata">
+    <h2>Metadata findings</h2>
+    <p>sensitive-key 0 · reduced-redundancy 0 · stale-standard 0 · small-object-cold-tier 0 · zero-byte-object 0 · unknown-storage-class 0</p>
+  </section>
+  <footer>
+    <p>Contains object and column names but no personal-data values · Share within your organization</p>
+    <p>LakeScan 0.1.0 · Discovery aid, not a compliance assessment · Generated 2023-11-14T22:13:20Z</p>
+  </footer>
+</main>
+</noscript>
+<script>
+(function () {
+  // Replace DATA with a real LakeScan JSON summary of this shape.
+  // Escape "<" as \u003c inside this script so a name cannot close the script tag.
+  const DATA = { tool: { name: "LakeScan", version: "0.1.0" }, scan: { bucket: "s3://lakescan-pii", startedAt: "2023-11-14T22:13:20Z", elapsedSeconds: 28.1, config: "lakescan.toml" }, exit: { code: 6, name: "ContentNotScanned", meaning: "At least one Parquet file could not be content-scanned and no suppression documents it." }, coverage: { eligible: 11, scannedWhole: 6, scannedPartial: 2, notScannedDocumented: 2, notScannedUndocumented: 1, columnsExamined: 107, columnsSkipped: { repeated: 7, unsupportedType: 9, pageTooLarge: 1, unreadable: 0, unsupportedCodec: 0 }, caveat: "Inspection is sampled: up to 3 row groups, up to 2,000 values per column per row group. A finding means personal data was detected in the sample. No finding means none was detected in the sample, not that none exists." }, columns: [ { table: "lake/customers", column: "aadhaar_no", rule: "pii-in-aadhaar", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "billing.email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "card_number", rule: "pii-card-number", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "contact", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "dob", rule: "pii-date-of-birth", confidence: "likely", evidence: "column-name", files: 4, status: "undocumented" }, { table: "lake/customers", column: "full_name", rule: "pii-person-name", confidence: "likely", evidence: "column-name", files: 4, status: "undocumented" }, { table: "lake/customers", column: "last_login_ip", rule: "pii-ip-address", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "mobile_no", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "pan", rule: "pii-in-pan", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 4, status: "documented", reason: "Consented marketing contacts, DPA-12", expires: "2027-06-30" }, { table: "lake/customers_brotli", column: "aadhaar_no", rule: "pii-in-aadhaar", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "billing.email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "card_number", rule: "pii-card-number", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "contact", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "dob", rule: "pii-date-of-birth", confidence: "likely", evidence: "column-name", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "full_name", rule: "pii-person-name", confidence: "likely", evidence: "column-name", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "last_login_ip", rule: "pii-ip-address", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "mobile_no", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "pan", rule: "pii-in-pan", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_gzip", column: "aadhaar_no", rule: "pii-in-aadhaar", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "billing.email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "card_number", rule: "pii-card-number", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "contact", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "dob", rule: "pii-date-of-birth", confidence: "likely", evidence: "column-name", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "full_name", rule: "pii-person-name", confidence: "likely", evidence: "column-name", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "last_login_ip", rule: "pii-ip-address", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "mobile_no", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "pan", rule: "pii-in-pan", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/events", column: "contact_email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" } ], unscanned: [ { key: "bad/not_parquet.parquet", reasonCode: "not-parquet", status: "documented", reason: "A CSV export misnamed .parquet; no personal data, reviewed 2026-10-16" }, { key: "bad/truncated.parquet", reasonCode: "unreadable", status: "documented", reason: "Known-corrupt partial upload, kept for the incident record" }, { key: "skipped/too_large.parquet", reasonCode: "no-column-examined", status: "undocumented" } ], metadataRules: [ { rule: "sensitive-key", title: "Key looks like a credential or secret file", count: 0, severity: "high" }, { rule: "reduced-redundancy", title: "Object uses the deprecated REDUCED_REDUNDANCY storage class", count: 0, severity: "medium" }, { rule: "stale-standard", title: "Large STANDARD object has gone unmodified for a long time", count: 0, severity: "medium" }, { rule: "small-object-cold-tier", title: "Small object sits in a cold storage tier that bills a size minimum", count: 0, severity: "low" }, { rule: "zero-byte-object", title: "Zero-byte object that is not a folder marker", count: 0, severity: "info" }, { rule: "unknown-storage-class", title: "Object reports a storage class this build of LakeScan does not recognize", count: 0, severity: "info" } ] };
+
+  var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var state = { status: "all", rule: null, table: null };
+  var panelReturn = null;
+  var app = document.getElementById("app");
+  var live = el("div", { class: "sr-only", "aria-live": "polite" });
+  var tooltip = el("div", { class: "tooltip", role: "tooltip" });
+  tooltip.hidden = true;
+
+  function el(tag, attrs, kids) {
+    var node = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (key) {
+        var value = attrs[key];
+        if (value == null || value === false) return;
+        if (key === "class") node.className = value;
+        else if (key === "text") node.textContent = String(value);
+        else node.setAttribute(key, value === true ? "" : String(value));
+      });
+    }
+    (kids || []).forEach(function (kid) {
+      if (kid == null || kid === false) return;
+      node.appendChild(typeof kid === "string" ? document.createTextNode(kid) : kid);
+    });
+    return node;
+  }
+
+  function svg(tag, attrs, kids) {
+    var node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (key) {
+        if (attrs[key] != null) node.setAttribute(key, String(attrs[key]));
+      });
+    }
+    (kids || []).forEach(function (kid) { if (kid) node.appendChild(kid); });
+    return node;
+  }
+
+  function icon(pathD, extra) {
+    return svg("svg", { viewBox: "0 0 24 24", class: "icon", "aria-hidden": "true", fill: "none" }, [
+      extra || null,
+      svg("path", { d: pathD, fill: "currentColor" })
+    ].filter(Boolean));
+  }
+
+  function shield() {
+    return svg("svg", { viewBox: "0 0 24 24", class: "icon", "aria-hidden": "true" }, [
+      svg("path", { fill: "currentColor", d: "M12 2.2l7.2 2.7v6.2c0 4.6-3.1 7.8-7.2 10.2C8 18.9 4.8 15.7 4.8 11.1V4.9L12 2.2z" })
+    ]);
+  }
+
+  function bucketIcon() {
+    return svg("svg", { viewBox: "0 0 24 24", class: "icon", "aria-hidden": "true", fill: "none", stroke: "currentColor", "stroke-width": "1.6" }, [
+      svg("ellipse", { cx: "12", cy: "6", rx: "8", ry: "3" }),
+      svg("path", { d: "M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6" }),
+      svg("path", { d: "M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" })
+    ]);
+  }
+
+  function store(key, value) {
+    try { sessionStorage.setItem(key, value); } catch (err) {}
+  }
+  function read(key) {
+    try { return sessionStorage.getItem(key); } catch (err) { return null; }
+  }
+
+  function counts() {
+    var undocumented = 0;
+    var documented = 0;
+    DATA.columns.forEach(function (row) {
+      if (row.status === "documented") documented += 1;
+      else undocumented += 1;
+    });
+    return { all: DATA.columns.length, undocumented: undocumented, documented: documented };
+  }
+
+  function tablesWithPii() {
+    var seen = {};
+    DATA.columns.forEach(function (row) { seen[row.table] = true; });
+    return Object.keys(seen).length;
+  }
+
+  function scanned() {
+    return DATA.coverage.scannedWhole + DATA.coverage.scannedPartial;
+  }
+
+  function coveragePct() {
+    if (!DATA.coverage.eligible) return 0;
+    return (scanned() / DATA.coverage.eligible) * 100;
+  }
+
+  function formatPct(value) {
+    return (Math.round(value * 10) / 10).toFixed(1);
+  }
+
+  function evidenceLabel(value) {
+    return value === "column-name" ? "column name" : value;
+  }
+
+  function filesLabel(row) {
+    var noun = row.files === 1 ? "file" : "files";
+    if (row.status === "documented") return row.files + " " + noun;
+    return row.files + " " + noun + " " + row.confidence;
+  }
+
+  function exitTone(code) {
+    if (code === 0) return "success";
+    if (code === 1) return "warning";
+    if (code === 6) return "danger";
+    return "neutral";
+  }
+
+  function countUp(node, target, delay, decimals, suffix) {
+    suffix = suffix || "";
+    function paint(value) {
+      node.textContent = String(Math.round(value)) + suffix;
+    }
+    if (reduceMotion) { paint(target); return; }
+    var duration = 600;
+    var startAt = performance.now() + delay;
+    function frame(now) {
+      if (now < startAt) { requestAnimationFrame(frame); return; }
+      var t = Math.min(1, (now - startAt) / duration);
+      var eased = 1 - Math.pow(1 - t, 3);
+      paint(target * eased);
+      if (t < 1) requestAnimationFrame(frame);
+    }
+    paint(0);
+    requestAnimationFrame(frame);
+  }
+
+  function readHash() {
+    var raw = location.hash.replace(/^#/, "");
+    if (!raw || document.getElementById(decodeURIComponent(raw))) return;
+    var params = new URLSearchParams(raw);
+    var status = params.get("status");
+    state.status = (status === "undocumented" || status === "documented") ? status : "all";
+    state.rule = params.get("rule");
+    state.table = params.get("table");
+  }
+
+  function writeHash() {
+    var params = new URLSearchParams();
+    if (state.status !== "all") params.set("status", state.status);
+    if (state.rule) params.set("rule", state.rule);
+    if (state.table) params.set("table", state.table);
+    var next = params.toString();
+    var base = location.href.split("#")[0];
+    history.replaceState(null, "", next ? base + "#" + next : base);
+  }
+
+  function visibleRows() {
+    return DATA.columns.filter(function (row) {
+      if (state.status !== "all" && row.status !== state.status) return false;
+      if (state.rule && row.rule !== state.rule) return false;
+      if (state.table && row.table !== state.table) return false;
+      return true;
+    });
+  }
+
+  function copyText(text, button) {
+    function done() {
+      var prev = button.textContent;
+      button.textContent = "Copied";
+      live.textContent = "Copied";
+      setTimeout(function () { button.textContent = prev; }, 1200);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(function () { fallback(); });
+    } else fallback();
+    function fallback() {
+      var area = el("textarea", { text: text });
+      area.style.position = "fixed";
+      area.style.left = "-999px";
+      document.body.appendChild(area);
+      area.select();
+      try { document.execCommand("copy"); done(); } catch (err) { live.textContent = "Copy failed"; }
+      area.remove();
+    }
+  }
+
+  function oneYearFromToday() {
+    var date = new Date();
+    date.setFullYear(date.getFullYear() + 1);
+    var month = String(date.getMonth() + 1).padStart(2, "0");
+    var day = String(date.getDate()).padStart(2, "0");
+    return date.getFullYear() + "-" + month + "-" + day;
+  }
+
+  function tomlEscape(value) {
+    return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  function snippetLines(entry, expires) {
+    var lines = ["[[suppress]]", 'rule = "' + tomlEscape(entry.rule) + '"'];
+    if (entry.key) lines.push('key = "' + tomlEscape(entry.key) + '"');
+    if (entry.prefix) lines.push('prefix = "' + tomlEscape(entry.prefix) + '"');
+    if (entry.column) lines.push('column = "' + tomlEscape(entry.column) + '"');
+    lines.push('reason = ""');
+    if (expires) lines.push('expires = "' + tomlEscape(expires) + '"');
+    return lines;
+  }
+
+  function paintCode(host, lines) {
+    while (host.firstChild) host.removeChild(host.firstChild);
+    lines.forEach(function (line, index) {
+      var row = el("div");
+      row.appendChild(el("span", { class: "ln", text: String(index + 1) }));
+      if (line.indexOf(" = ") !== -1) {
+        var parts = line.split(" = ");
+        row.appendChild(el("span", { class: "tok-key", text: parts[0] }));
+        row.appendChild(document.createTextNode(" = "));
+        row.appendChild(el("span", { class: "tok-str", text: parts.slice(1).join(" = ") }));
+      } else {
+        row.appendChild(el("span", { class: "tok-key", text: line }));
+      }
+      host.appendChild(row);
+    });
+  }
+
+  function severityColor(severity) {
+    if (severity === "high" || severity === "critical") return "var(--danger)";
+    if (severity === "medium") return "var(--warning)";
+    if (severity === "low") return "var(--primary)";
+    return "var(--muted)";
+  }
+
+  function openPanel(entry, opener) {
+    panelReturn = opener || document.activeElement;
+    var expires = oneYearFromToday();
+    var lines = snippetLines(entry, expires);
+    var backdrop = el("div", { class: "backdrop open" });
+    var drawer = el("div", { class: "drawer open", role: "dialog", "aria-modal": "true", "aria-labelledby": "doc-title" });
+    var close = el("button", { class: "dismiss", type: "button" }, [el("span", { class: "sr-only", text: "Close" }), document.createTextNode("×")]);
+    var code = el("div", { class: "code" });
+    var copy = el("button", { class: "copy", type: "button", text: "Copy" });
+    var input = el("input", { id: "expires", type: "date", value: expires });
+    function refresh() {
+      lines = snippetLines(entry, input.value);
+      paintCode(code, lines);
+      code.appendChild(copy);
+    }
+    close.addEventListener("click", closePanel);
+    backdrop.addEventListener("click", closePanel);
+    copy.addEventListener("click", function () { copyText(lines.join("\n"), copy); });
+    input.addEventListener("input", refresh);
+    drawer.appendChild(close);
+    drawer.appendChild(el("h2", { id: "doc-title", text: "Document this location" }));
+    drawer.appendChild(el("p", { text: "Add this entry to your config. Documented means your team recorded a reason; it is not a compliance approval." }));
+    refresh();
+    drawer.appendChild(code);
+    drawer.appendChild(el("label", { class: "field", text: "Expires" }, [input]));
+    document.body.appendChild(backdrop);
+    document.body.appendChild(drawer);
+    document.body.classList.add("panel-open");
+    document.body.style.overflow = "hidden";
+    close.focus();
+    drawer.addEventListener("keydown", function (event) {
+      if (event.key === "Escape") { event.preventDefault(); closePanel(); return; }
+      if (event.key !== "Tab") return;
+      var items = drawer.querySelectorAll("button, input, a, textarea");
+      if (!items.length) return;
+      var first = items[0];
+      var last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    });
+    function closePanel() {
+      backdrop.remove();
+      drawer.remove();
+      document.body.style.overflow = "";
+      if (panelReturn && panelReturn.focus) panelReturn.focus();
+    }
+    backdrop.closePanel = closePanel;
+  }
+
+  function ruleSeries() {
+    var map = {};
+    DATA.columns.forEach(function (row) {
+      if (!map[row.rule]) map[row.rule] = { rule: row.rule, undocumented: 0, documented: 0 };
+      map[row.rule][row.status === "documented" ? "documented" : "undocumented"] += 1;
+    });
+    return Object.keys(map).map(function (key) { return map[key]; }).sort(function (a, b) {
+      return (b.undocumented + b.documented) - (a.undocumented + a.documented) || a.rule.localeCompare(b.rule);
+    });
+  }
+
+  function tableSeries() {
+    var map = {};
+    DATA.columns.forEach(function (row) {
+      if (!map[row.table]) map[row.table] = { table: row.table, undocumented: 0 };
+      if (row.status !== "documented") map[row.table].undocumented += 1;
+    });
+    return Object.keys(map).map(function (key) { return map[key]; }).sort(function (a, b) {
+      return b.undocumented - a.undocumented || a.table.localeCompare(b.table);
+    });
+  }
+
+  function showTip(text, event) {
+    tooltip.hidden = false;
+    tooltip.textContent = text;
+    var x = event.clientX + 12;
+    var y = event.clientY + 16;
+    tooltip.style.left = "0px";
+    tooltip.style.top = "0px";
+    var width = tooltip.offsetWidth;
+    if (x + width > window.innerWidth - 8) x = window.innerWidth - width - 8;
+    tooltip.style.left = x + "px";
+    tooltip.style.top = y + "px";
+  }
+
+  function hideTip() { tooltip.hidden = true; }
+
+  function barChart(items, options) {
+    var labelW = 148;
+    var rowH = 28;
+    var height = items.length * rowH + 8;
+    var max = 1;
+    items.forEach(function (item) { max = Math.max(max, options.total(item)); });
+    var root = svg("svg", { class: "chart-svg", viewBox: "0 0 520 " + height, role: "img", "aria-label": options.label });
+    items.forEach(function (item, index) {
+      var y = 8 + index * rowH;
+      var total = options.total(item);
+      var track = 520 - labelW - 36;
+      var width = total === 0 ? 0 : Math.max(2, (total / max) * track);
+      var active = options.active(item);
+      var group = svg("g", { class: "bar", tabindex: "0", role: "button", "aria-pressed": active ? "true" : "false", "aria-label": options.tip(item) });
+      group.appendChild(svg("text", { x: labelW - 8, y: y + 16, "text-anchor": "end", "font-size": "12", "font-family": "ui-monospace, SFMono-Regular, monospace", fill: "currentColor" }, [document.createTextNode(options.name(item))]));
+      var cursor = labelW;
+      options.segments(item, width).forEach(function (seg, segIndex) {
+        var rect = svg("rect", { class: "seg", x: cursor, y: y + 4, width: Math.max(seg.value > 0 ? 1 : 0, seg.width), height: 14, rx: "3", fill: seg.color });
+        group.appendChild(rect);
+        cursor += seg.width;
+      });
+      if (active) {
+        group.appendChild(svg("rect", { x: labelW - 1, y: y + 2, width: Math.max(width, 2) + 2, height: 18, rx: "4", fill: "none", stroke: "var(--primary)", "stroke-width": "2" }));
+      }
+      group.appendChild(svg("text", { x: labelW + width + 6, y: y + 16, "font-size": "12", fill: "currentColor" }, [document.createTextNode(String(total))]));
+      group.addEventListener("click", function () { options.onpick(item); });
+      group.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); options.onpick(item); }
+      });
+      group.addEventListener("pointerenter", function (event) { showTip(options.tip(item), event); });
+      group.addEventListener("pointermove", function (event) { showTip(options.tip(item), event); });
+      group.addEventListener("pointerleave", hideTip);
+      root.appendChild(group);
+    });
+    return root;
+  }
+
+  function render() {
+    readHash();
+    var c = counts();
+    var pct = coveragePct();
+    var filesNot = DATA.coverage.notScannedDocumented + DATA.coverage.notScannedUndocumented;
+    var fileStrip = DATA.coverage.notScannedUndocumented > 0 ? "var(--danger)" : "var(--muted)";
+    hideTip();
+    while (app.firstChild) app.removeChild(app.firstChild);
+    app.removeAttribute("aria-busy");
+
+    var share = el("button", { class: "icon-btn no-print", type: "button" }, [el("span", { class: "sr-only", text: "Copy page link" }), document.createTextNode("Share")]);
+    var printBtn = el("button", { class: "icon-btn no-print", type: "button" }, [el("span", { class: "sr-only", text: "Print" }), document.createTextNode("Print")]);
+    var themeBtn = el("button", { class: "icon-btn no-print", type: "button", "aria-pressed": document.documentElement.getAttribute("data-theme") === "dark" ? "true" : "false" });
+    themeBtn.appendChild(el("span", { class: "sr-only", text: "Toggle dark mode" }));
+    themeBtn.appendChild(document.createTextNode(document.documentElement.getAttribute("data-theme") === "light" ? "Dark" : "Theme"));
+    share.addEventListener("click", function () { copyText(location.href, share); });
+    printBtn.addEventListener("click", function () { window.print(); });
+    themeBtn.addEventListener("click", function () {
+      var current = document.documentElement.getAttribute("data-theme");
+      var next = current === "dark" || (!current && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "light" : "dark";
+      if (current === "light") next = "dark";
+      if (current === "dark") next = "light";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("lakescan-theme", next); } catch (err) {}
+      themeBtn.setAttribute("aria-pressed", next === "dark" ? "true" : "false");
+      themeBtn.lastChild.textContent = next === "light" ? "Dark" : "Light";
+    });
+    if (!document.documentElement.getAttribute("data-theme") && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+      themeBtn.lastChild.textContent = "Light";
+      themeBtn.setAttribute("aria-pressed", "true");
+    } else if (document.documentElement.getAttribute("data-theme") === "dark") {
+      themeBtn.lastChild.textContent = "Light";
+    } else themeBtn.lastChild.textContent = "Dark";
+
+    var top = el("header", { class: "topbar" }, [
+      el("div", { class: "topbar-inner" }, [
+        el("div", { class: "brand" }, [shield(), el("span", { class: "brand-name", text: DATA.tool.name + " " + DATA.tool.version })])
+      ])
+    ]);
+
+    var banner = null;
+    if (read("lakescan-banner-dismissed") !== "1") {
+      var tone = exitTone(DATA.exit.code);
+      var title = "Scan result";
+      var summary = DATA.exit.meaning;
+      var actions = [];
+      if (DATA.exit.code === 6) {
+        tone = "danger";
+        title = "Action needed";
+        summary = DATA.coverage.notScannedUndocumented + " Parquet file was not scanned and has no documented reason. " + c.undocumented + " PII columns are undocumented.";
+        actions = [
+          ["Review undocumented columns", "inventory"],
+          ["Review files not scanned", "not-scanned"]
+        ];
+      } else if (DATA.exit.code === 1) {
+        tone = "warning";
+        title = "Findings need review";
+        var meta = DATA.metadataRules.reduce(function (sum, rule) { return sum + rule.count; }, 0);
+        summary = meta + " metadata findings reached the report, and " + c.undocumented + " PII columns are undocumented.";
+      } else if (DATA.exit.code === 0) {
+        tone = "success";
+        title = "All PII locations are documented";
+        summary = "All PII locations are documented";
+      }
+      banner = el("section", { class: "banner " + tone, role: "region", "aria-label": title });
+      banner.appendChild(el("h2", { text: title }));
+      var strong = el("strong", { text: summary });
+      var para = el("p");
+      para.appendChild(strong);
+      banner.appendChild(para);
+      if (actions.length) {
+        var row = el("div", { class: "banner-actions" });
+        actions.forEach(function (item) {
+          var link = el("a", { href: "#" + item[1], text: item[0] });
+          link.addEventListener("click", function (event) {
+            var target = document.getElementById(item[1]);
+            if (target) { event.preventDefault(); target.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" }); }
+          });
+          row.appendChild(link);
+        });
+        banner.appendChild(row);
+      }
+      var dismiss = el("button", { class: "dismiss no-print", type: "button" }, [el("span", { class: "sr-only", text: "Dismiss" }), document.createTextNode("×")]);
+      dismiss.addEventListener("click", function () { store("lakescan-banner-dismissed", "1"); banner.remove(); });
+      banner.appendChild(dismiss);
+    }
+
+    function tile(value, label, sub, strip, decimals, delay, suffix, gauge) {
+      var card = el("article", { class: "tile" });
+      card.style.setProperty("--strip", strip);
+      var number = el("div", { class: "tile-value", text: "0" });
+      card.appendChild(number);
+      card.appendChild(el("div", { class: "tile-label", text: label }));
+      card.appendChild(el("div", { class: "tile-sub", text: sub }));
+      if (gauge) {
+        var r = 14;
+        var circ = 2 * Math.PI * r;
+        var dash = circ * (pct / 100);
+        var arc = svg("circle", { class: "gauge-arc", cx: "18", cy: "18", r: String(r), fill: "none", stroke: "var(--primary)", "stroke-width": "3", "stroke-linecap": "round", "data-dash": dash + " " + circ, transform: "rotate(-90 18 18)" });
+        arc.style.strokeDasharray = "0 " + circ;
+        card.appendChild(svg("svg", { class: "gauge", viewBox: "0 0 36 36", "aria-hidden": "true" }, [
+          svg("circle", { cx: "18", cy: "18", r: String(r), fill: "none", stroke: "var(--border)", "stroke-width": "3" }),
+          arc
+        ]));
+      }
+      countUp(number, value, delay, decimals, suffix);
+      return card;
+    }
+
+    var tiles = el("section", { class: "tiles", role: "region", "aria-label": "Headline" }, [
+      tile(c.undocumented, "Undocumented PII", "columns needing a reason", "var(--danger)", 0, 0, ""),
+      tile(c.documented, "Documented", "reason recorded", "var(--primary)", 0, 60, ""),
+      tile(tablesWithPii(), "Tables with PII", "tables with a finding", "var(--muted)", 0, 120, ""),
+      tile(pct, "Coverage", scanned() + " of " + DATA.coverage.eligible + " Parquet files", "var(--muted)", 1, 180, "%", true),
+      tile(filesNot, "Files not scanned", DATA.coverage.notScannedUndocumented + " undocumented", fileStrip, 0, 240, "")
+    ]);
+
+    var rules = ruleSeries();
+    var tables = tableSeries();
+    var clearRule = el("button", { class: "text-btn", type: "button", text: "Clear filter", hidden: state.rule ? null : "" });
+    if (!state.rule) clearRule.hidden = true;
+    clearRule.addEventListener("click", function () { state.rule = null; writeHash(); render(); });
+    var clearTable = el("button", { class: "text-btn", type: "button", text: "Clear filter" });
+    clearTable.hidden = !state.table;
+    clearTable.addEventListener("click", function () { state.table = null; writeHash(); render(); });
+
+    var ruleChart = el("section", { class: "panel-card", role: "region", "aria-label": "PII by type" }, [
+      el("div", { class: "card-head" }, [
+        el("div", {}, [el("h2", { text: "PII by type" }), el("p", { class: "card-desc", text: "Undocumented and documented columns for each rule." })]),
+        clearRule
+      ])
+    ]);
+    ruleChart.appendChild(barChart(rules, {
+      label: "PII columns by rule",
+      name: function (item) { return item.rule; },
+      total: function (item) { return item.undocumented + item.documented; },
+      active: function (item) { return state.rule === item.rule; },
+      tip: function (item) { return item.rule + ": " + item.undocumented + " undocumented, " + item.documented + " documented"; },
+      segments: function (item, width) {
+        var total = item.undocumented + item.documented || 1;
+        return [
+          { width: width * (item.undocumented / total), value: item.undocumented, color: "var(--bar-undoc)" },
+          { width: width * (item.documented / total), value: item.documented, color: "var(--bar-doc)" }
+        ];
+      },
+      onpick: function (item) {
+        state.rule = state.rule === item.rule ? null : item.rule;
+        writeHash();
+        render();
+        var inv = document.getElementById("inventory");
+        if (inv) inv.scrollIntoView({ block: "start" });
+      }
+    }));
+    ruleChart.appendChild(el("div", { class: "legend" }, [
+      el("span", {}, [el("i", { class: "swatch" }), document.createTextNode("Undocumented")]),
+      el("span", {}, [el("i", { class: "swatch" }), document.createTextNode("Documented")])
+    ]));
+    ruleChart.querySelectorAll(".swatch")[0].style.background = "var(--bar-undoc)";
+    ruleChart.querySelectorAll(".swatch")[1].style.background = "var(--bar-doc)";
+
+    var tableChart = el("section", { class: "panel-card", role: "region", "aria-label": "Tables" }, [
+      el("div", { class: "card-head" }, [
+        el("div", {}, [el("h2", { text: "Tables" }), el("p", { class: "card-desc", text: "Undocumented PII columns in each table." })]),
+        clearTable
+      ])
+    ]);
+    tableChart.appendChild(barChart(tables, {
+      label: "Undocumented columns by table",
+      name: function (item) { return item.table; },
+      total: function (item) { return item.undocumented; },
+      active: function (item) { return state.table === item.table; },
+      tip: function (item) { return item.table + ": " + item.undocumented + " undocumented"; },
+      segments: function (item, width) { return [{ width: width, value: item.undocumented, color: "var(--bar-undoc)" }]; },
+      onpick: function (item) {
+        state.table = state.table === item.table ? null : item.table;
+        writeHash();
+        render();
+      }
+    }));
+    var eligible = DATA.coverage.eligible || 1;
+    var scannedN = scanned();
+    var gapDoc = DATA.coverage.notScannedDocumented;
+    var gapUndoc = DATA.coverage.notScannedUndocumented;
+    var bar = el("div", { class: "coverage-bar", role: "img", "aria-label": "File coverage " + formatPct(pct) + " percent" }, [
+      el("span"), el("span"), el("span")
+    ]);
+    var parts = bar.querySelectorAll("span");
+    parts[0].style.width = (100 * scannedN / eligible) + "%";
+    parts[0].style.background = "var(--bar-doc)";
+    parts[1].style.width = (100 * gapDoc / eligible) + "%";
+    parts[1].style.background = "var(--bar-gap-doc)";
+    parts[2].style.width = (100 * gapUndoc / eligible) + "%";
+    parts[2].style.background = "var(--bar-undoc)";
+    tableChart.appendChild(bar);
+    tableChart.appendChild(el("div", { class: "legend" }, [
+      el("span", { text: "Scanned " + formatPct(100 * scannedN / eligible) + "%" }),
+      el("span", { text: "Documented gap " + formatPct(100 * gapDoc / eligible) + "%" }),
+      el("span", { text: "Undocumented gap " + formatPct(100 * gapUndoc / eligible) + "%" })
+    ]));
+    var legendBits = tableChart.querySelectorAll(".legend span");
+    ["var(--bar-doc)", "var(--bar-gap-doc)", "var(--bar-undoc)"].forEach(function (color, index) {
+      var sw = el("i", { class: "swatch" });
+      sw.style.background = color;
+      legendBits[index].insertBefore(sw, legendBits[index].firstChild);
+    });
+
+    var charts = el("div", { class: "charts" }, [ruleChart, tableChart]);
+
+    var rows = visibleRows();
+    var visibleKey = {};
+    rows.forEach(function (row) { visibleKey[row.table + "\n" + row.column + "\n" + row.rule] = true; });
+    var inventory = el("section", { id: "inventory", class: "section", role: "region", "aria-label": "PII inventory" });
+    inventory.appendChild(el("h2", { text: "PII inventory" }));
+    var tabs = el("div", { class: "tabs filters", role: "tablist", "aria-label": "PII status" });
+    ["all", "undocumented", "documented"].forEach(function (name) {
+      var label = name.charAt(0).toUpperCase() + name.slice(1) + " (" + c[name] + ")";
+      var tab = el("button", { class: "tab", type: "button", role: "tab", "aria-selected": state.status === name ? "true" : "false", text: label });
+      tab.addEventListener("click", function () { state.status = name; writeHash(); render(); });
+      tabs.appendChild(tab);
+    });
+    inventory.appendChild(tabs);
+    var chips = el("div", { class: "chips filters" });
+    function chip(kind, value) {
+      var node = el("span", { class: "chip" }, [el("span", { text: value })]);
+      var x = el("button", { type: "button" }, [el("span", { class: "sr-only", text: "Clear " + value }), document.createTextNode("×")]);
+      x.addEventListener("click", function () {
+        state[kind] = null;
+        writeHash();
+        render();
+      });
+      node.appendChild(x);
+      chips.appendChild(node);
+    }
+    if (state.rule) chip("rule", state.rule);
+    if (state.table) chip("table", state.table);
+    inventory.appendChild(chips);
+    var bits = ["Showing " + rows.length + " of " + c.all + " columns"];
+    if (state.rule) bits.push(state.rule);
+    if (state.table) bits.push(state.table);
+    inventory.appendChild(el("p", { class: "summary-line", text: bits.join(" · ") }));
+    var tbody = el("tbody");
+    var lastTable = null;
+    var namedVisible = {};
+    if (!rows.length) {
+      tbody.appendChild(el("tr", { class: "no-print" }, [el("td", { colspan: "7", class: "empty", text: "No columns match these filters." })]));
+    }
+    DATA.columns.forEach(function (row, index) {
+      var matched = !!visibleKey[row.table + "\n" + row.column + "\n" + row.rule];
+      var first = row.table !== lastTable;
+      if (first) lastTable = row.table;
+      var tableCell = el("td");
+      function nameButton(extra) {
+        var nameBtn = el("button", { class: "linkish" + (extra ? " " + extra : ""), type: "button", text: row.table });
+        nameBtn.addEventListener("click", function () {
+          state.table = state.table === row.table ? null : row.table;
+          writeHash();
+          render();
+        });
+        return nameBtn;
+      }
+      if (first) {
+        tableCell.appendChild(nameButton(""));
+      } else if (matched && !namedVisible[row.table]) {
+        tableCell.appendChild(nameButton("filter-label"));
+      } else {
+        tableCell.appendChild(el("span", { class: "sr-only", text: row.table }));
+        tableCell.className = "indent";
+      }
+      if (matched) namedVisible[row.table] = true;
+      var ruleBtn = el("button", { class: "linkish mono", type: "button", text: row.rule });
+      ruleBtn.addEventListener("click", function () {
+        state.rule = state.rule === row.rule ? null : row.rule;
+        writeHash();
+        render();
+      });
+      var status = el("td");
+      status.appendChild(el("span", { class: "badge badge-" + row.status, text: row.status === "documented" ? "Documented" : "Undocumented" }));
+      if (row.reason) status.appendChild(el("span", { class: "reason", text: row.reason }));
+      if (row.expires) status.appendChild(el("span", { class: "reason", text: "until " + row.expires }));
+      var action = el("td", { class: "col-action" });
+      if (row.status !== "documented") {
+        var doc = el("button", { class: "ghost", type: "button", text: "Document ›" });
+        doc.addEventListener("click", function () {
+          openPanel({ rule: row.rule, prefix: row.table + "/", column: row.column }, doc);
+        });
+        action.appendChild(doc);
+      }
+      var tr = el("tr", { class: matched && index % 2 === 1 ? "flash" : "" }, [
+        tableCell,
+        el("td", { class: "mono", text: row.column }),
+        el("td", {}, [ruleBtn]),
+        el("td", {}, [el("span", { class: "badge badge-" + row.confidence, text: row.confidence })]),
+        el("td", {}, [
+          document.createTextNode(filesLabel(row) + " "),
+          el("span", { class: "tag", text: evidenceLabel(row.evidence) })
+        ]),
+        status,
+        action
+      ]);
+      tr.hidden = !matched;
+      tbody.appendChild(tr);
+    });
+    var table = el("table", {}, [
+      el("thead", {}, [el("tr", {}, ["Table", "Column", "PII type", "Confidence", "Files", "Status", "Action"].map(function (name) {
+        return el("th", { scope: "col", class: name === "Action" ? "col-action" : "", text: name });
+      }))]),
+      tbody
+    ]);
+    inventory.appendChild(el("div", { class: "table-wrap" }, [table]));
+
+    var files = el("section", { id: "not-scanned", class: "section", role: "region", "aria-label": "Files not scanned" });
+    files.appendChild(el("h2", { text: "Files not scanned" }));
+    var fileBody = el("tbody");
+    DATA.unscanned.forEach(function (file) {
+      var status = el("td");
+      status.appendChild(el("span", { class: "badge badge-" + file.status, text: file.status === "documented" ? "Documented" : "Undocumented" }));
+      if (file.reason) status.appendChild(el("span", { class: "reason", text: file.reason }));
+      var action = el("td", { class: "col-action" });
+      if (file.status !== "documented") {
+        var doc = el("button", { class: "ghost", type: "button", text: "Document ›" });
+        doc.addEventListener("click", function () {
+          openPanel({ rule: "content-not-scanned", key: file.key }, doc);
+        });
+        action.appendChild(doc);
+      }
+      fileBody.appendChild(el("tr", {}, [
+        el("td", { class: "mono", text: file.key }),
+        el("td", {}, [el("code", { text: file.reasonCode })]),
+        status,
+        action
+      ]));
+    });
+    files.appendChild(el("div", { class: "card narrow" }, [
+      el("div", { class: "table-wrap" }, [
+        el("table", { class: "narrow-table" }, [
+          el("thead", {}, [el("tr", {}, ["Object key", "Reason", "Status", "Action"].map(function (name) {
+            return el("th", { scope: "col", class: name === "Action" ? "col-action" : "", text: name });
+          }))]),
+          fileBody
+        ])
+      ]),
+      el("p", { class: "note", text: "Any undocumented file makes the scan exit 6." })
+    ]));
+
+    var saved = {};
+    try { saved = JSON.parse(read("lakescan-sections") || "{}"); } catch (err) { saved = {}; }
+    function collapse(id, title, body) {
+      var open = saved[id] === true;
+      var section = el("section", { id: id, class: "section panel-card collapse", role: "region", "aria-label": title });
+      var btn = el("button", { class: "head", type: "button", "aria-expanded": open ? "true" : "false" }, [
+        el("h2", { text: title }),
+        el("span", { class: "muted", text: open ? "Hide" : "Show" })
+      ]);
+      var wrap = el("div", { class: "collapse-body" });
+      wrap.hidden = !open;
+      body.forEach(function (node) { wrap.appendChild(node); });
+      btn.addEventListener("click", function () {
+        open = !open;
+        wrap.hidden = !open;
+        btn.setAttribute("aria-expanded", open ? "true" : "false");
+        btn.lastChild.textContent = open ? "Hide" : "Show";
+        saved[id] = open;
+        store("lakescan-sections", JSON.stringify(saved));
+      });
+      section.appendChild(btn);
+      section.appendChild(wrap);
+      return section;
+    }
+
+    var skipped = DATA.coverage.columnsSkipped;
+    var skippedTotal = skipped.repeated + skipped.unsupportedType + skipped.pageTooLarge + skipped.unreadable + skipped.unsupportedCodec;
+    function statRow(name, value) {
+      return el("tr", {}, [el("td", { text: name }), el("td", { text: String(value) })]);
+    }
+    var coverageBody = [
+      el("div", { class: "table-wrap" }, [el("table", { class: "narrow-table" }, [
+        el("thead", {}, [el("tr", {}, [el("th", { scope: "col", text: "Files" }), el("th", { scope: "col", text: "Count" })])]),
+        el("tbody", {}, [
+          statRow("Eligible Parquet", DATA.coverage.eligible),
+          statRow("Scanned whole", DATA.coverage.scannedWhole),
+          statRow("Scanned partially", DATA.coverage.scannedPartial),
+          statRow("Not scanned, documented", DATA.coverage.notScannedDocumented),
+          statRow("Not scanned, undocumented", DATA.coverage.notScannedUndocumented)
+        ])
+      ])]),
+      el("div", { class: "table-wrap" }, [el("table", { class: "narrow-table" }, [
+        el("thead", {}, [el("tr", {}, [el("th", { scope: "col", text: "Columns" }), el("th", { scope: "col", text: "Count" })])]),
+        el("tbody", {}, [
+          statRow("Examined", DATA.coverage.columnsExamined),
+          statRow("Skipped", skippedTotal),
+          statRow("Skipped, repeated", skipped.repeated),
+          statRow("Skipped, unsupported type", skipped.unsupportedType),
+          statRow("Skipped, page too large", skipped.pageTooLarge),
+          statRow("Skipped, unreadable", skipped.unreadable),
+          statRow("Skipped, unsupported codec", skipped.unsupportedCodec)
+        ])
+      ])]),
+      el("p", { class: "info", text: DATA.coverage.caveat })
+    ];
+
+    var rulesGrid = el("div", { class: "rule-grid" });
+    DATA.metadataRules.forEach(function (rule) {
+      var card = el("article", { class: "rule" });
+      card.style.setProperty("--rule", severityColor(rule.severity));
+      card.appendChild(el("div", { class: "mono", text: rule.rule }));
+      card.appendChild(el("div", { class: "count", text: String(rule.count) }));
+      card.appendChild(el("div", { class: "muted", text: rule.title }));
+      card.appendChild(el("div", { class: "tag", text: rule.severity }));
+      rulesGrid.appendChild(card);
+    });
+
+    var footer = el("footer", {}, [
+      el("p", { text: "Contains object and column names but no personal-data values · Share within your organization" }),
+      el("p", { text: DATA.tool.name + " " + DATA.tool.version + " · Discovery aid, not a compliance assessment · Generated " + DATA.scan.startedAt })
+    ]);
+
+    var main = el("main", { class: "wrap" }, [
+      el("div", { class: "header-block" }, [
+        el("div", {}, [
+          el("div", { class: "bucket-row" }, [bucketIcon(), el("h1", { class: "bucket mono", text: DATA.scan.bucket })]),
+          el("p", { class: "subline", text: DATA.scan.startedAt + " · " + DATA.scan.elapsedSeconds + "s · " + DATA.scan.config })
+        ]),
+        el("div", { class: "exit-row" }, [
+          el("span", { class: "pill pill-" + exitTone(DATA.exit.code), text: "Exit " + DATA.exit.code }),
+          el("span", { class: "meaning", text: DATA.exit.name + ". " + DATA.exit.meaning }),
+          share, printBtn, themeBtn
+        ])
+      ]),
+      banner,
+      tiles,
+      charts,
+      inventory,
+      files,
+      collapse("coverage", "Coverage detail", coverageBody),
+      collapse("metadata", "Metadata findings", [rulesGrid]),
+      footer
+    ].filter(Boolean));
+
+    app.appendChild(top);
+    app.appendChild(main);
+    if (!tooltip.parentNode) document.body.appendChild(tooltip);
+    if (!live.parentNode) document.body.appendChild(live);
+    requestAnimationFrame(function () {
+      var segs = app.querySelectorAll(".seg");
+      if (reduceMotion) {
+        for (var i = 0; i < segs.length; i++) segs[i].classList.add("grow");
+      } else {
+        for (var i = 0; i < segs.length; i++) {
+          (function (seg, idx) {
+            setTimeout(function () { seg.classList.add("grow"); }, idx * 30);
+          })(segs[i], i);
+        }
+      }
+      var arcs = app.querySelectorAll(".gauge-arc");
+      for (var j = 0; j < arcs.length; j++) {
+        arcs[j].style.strokeDasharray = arcs[j].getAttribute("data-dash");
+      }
+    });
+  }
+
+  // Fill the no-JS table if the browser kept the noscript body (it does not when scripts run).
+  var staticRows = document.getElementById("noscript-rows");
+  if (staticRows) {
+    var last = "";
+    DATA.columns.forEach(function (row) {
+      var tr = document.createElement("tr");
+      var tableCell = document.createElement("td");
+      tableCell.textContent = row.table === last ? "" : row.table;
+      last = row.table;
+      var col = document.createElement("td");
+      col.className = "mono";
+      col.textContent = row.column;
+      var rule = document.createElement("td");
+      rule.textContent = row.rule;
+      var conf = document.createElement("td");
+      conf.textContent = row.confidence;
+      var filesCell = document.createElement("td");
+      filesCell.textContent = filesLabel(row) + " · " + evidenceLabel(row.evidence);
+      var status = document.createElement("td");
+      status.textContent = (row.status === "documented" ? "Documented" : "Undocumented") + (row.reason ? ". " + row.reason : "") + (row.expires ? " until " + row.expires : "");
+      tr.appendChild(tableCell);
+      tr.appendChild(col);
+      tr.appendChild(rule);
+      tr.appendChild(conf);
+      tr.appendChild(filesCell);
+      tr.appendChild(status);
+      staticRows.appendChild(tr);
+    });
+  }
+
+  render();
+  window.addEventListener("hashchange", render);
+})();
+</script>
+</body>
+</html>

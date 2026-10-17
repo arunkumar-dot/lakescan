@@ -1059,7 +1059,9 @@ mod tests {
                 // The settings record --concurrency, which these runs vary.
                 for field in [
                     "\"started_at\":\"",
+                    "\"startedAt\":\"",
                     "\"elapsed_ms\":",
+                    "\"elapsedSeconds\":",
                     "\"concurrency\":",
                     "concurrency=",
                 ] {
@@ -1293,23 +1295,37 @@ mod tests {
         let (run, _, _) =
             content_run_with(&files, config, Format::Text, &RunSettings::default()).await?;
         let html = run.html;
-        assert!(
-            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
-            "{html}"
+        let data = html
+            .lines()
+            .find(|line| line.trim_start().starts_with("const DATA = "))
+            .and_then(|line| line.trim_start().strip_prefix("const DATA = "))
+            .and_then(|line| line.strip_suffix(';'))
+            .ok_or("no DATA line")?;
+        assert!(!data.contains('<'), "{data}");
+        assert!(data.contains("\\u003c/script>"), "{data}");
+        let value: serde_json::Value = serde_json::from_str(data)?;
+        let columns = value
+            .get("columns")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("no columns")?;
+        let names: Vec<&str> = columns
+            .iter()
+            .filter_map(|row| row.get("column").and_then(serde_json::Value::as_str))
+            .collect();
+        for name in &hostile {
+            assert!(names.contains(name), "{name:?} missing from {names:?}");
+        }
+        let reason = columns
+            .iter()
+            .find(|row| row.get("column").and_then(serde_json::Value::as_str) == Some("</script>"));
+        assert_eq!(
+            reason
+                .and_then(|row| row.get("reason"))
+                .and_then(serde_json::Value::as_str),
+            Some("<script>alert('reason')</script>")
         );
-        assert!(html.contains("&lt;script&gt;alert(&#39;reason&#39;)&lt;/script&gt;"));
-        assert!(html.contains("&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"));
-        assert!(html.contains("esc\\u{001b}[31m"));
-        assert!(html.contains("rtl\\u{202e}gnp.exe"));
-        // Nothing hostile survives raw: the page's only tags are its own.
-        for raw in [
-            "<script>alert",
-            "<img",
-            "<b>",
-            "onerror=alert(1)>",
-            "\u{1b}",
-            "\u{202e}",
-        ] {
+        assert!(data.contains("\\u001b"), "{data}");
+        for raw in ["<script>alert", "<img", "<b>", "\u{1b}"] {
             assert!(!html.contains(raw), "{raw:?} reached the page");
         }
         assert_eq!(
@@ -1804,7 +1820,7 @@ reason = "Never matches"
             "columns not examined: 1 in 1 file (unsupported-type=1)",
             "\"columns_not_examined\"",
             "NOT_EXAMINED",
-            "<li><span class=\"key\">home_phone</span>",
+            "\"unsupportedType\":1",
         ] {
             assert!(
                 outputs.contains(state),

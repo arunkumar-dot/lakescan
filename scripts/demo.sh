@@ -293,7 +293,7 @@ exit_code "$code" "6 again: this run has no --config, so the 3 unscannable files
 
 # ---------------------------------------------------------------- h
 
-step h "HTML report" "--html writes one self-contained page (no network requests) to open, print or send. With demo.toml, so it shows documented entries."
+step h "HTML report" "--html writes an interactive dashboard. Open the file in any browser; it works offline and makes no network requests. With demo.toml, so documented columns show their reason."
 show lakescan scan "$S3_PII" --endpoint-url "$ENDPOINT" --pii --config demo.toml --html report.html --quiet '>' /dev/null
 lakescan scan "$S3_PII" --endpoint-url "$ENDPOINT" --pii --config demo.toml --html report.html --quiet >/dev/null
 code=$?
@@ -307,8 +307,8 @@ elif command -v xdg-open >/dev/null 2>&1; then
 else
   note "Open $OUT/report.html in a browser."
 fi
-note "Look for the 'Action needed' banner, the inventory filters (All / Undocumented / Documented), and the documented reasons."
-exit_code "$code" "1, as in step f2: same scan, same config. The report also shows this code and its meaning."
+note "Look at the exit pill, the inventory filters (All / Undocumented / Documented), a documented reason, and Coverage detail."
+exit_code "$code" "1, as in step f2: same scan, same config. The dashboard shows this code and its meaning."
 
 # ---------------------------------------------------------------- i
 

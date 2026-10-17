@@ -811,10 +811,25 @@ fn every_output_is_identical_at_concurrency_1_and_16() -> TestResult {
         // The HTML report, without its timing lines.
         let untimed_html = |html: &str| {
             html.lines()
-                .filter(|line| !line.contains("class=\"timing\""))
                 .map(|line| {
-                    line.replace("concurrency=16", "concurrency=")
-                        .replace("concurrency=1", "concurrency=")
+                    let mut line = line
+                        .replace("concurrency=16", "concurrency=")
+                        .replace("concurrency=1", "concurrency=");
+                    for field in [
+                        "\"startedAt\":\"",
+                        "\"elapsedSeconds\":",
+                        "\"concurrency\":",
+                    ] {
+                        if let Some(at) = line.find(field) {
+                            let from = at + field.len();
+                            let end = line
+                                .get(from..)
+                                .and_then(|rest| rest.find([',', '}', ' ']))
+                                .map_or(line.len(), |len| from + len);
+                            line.replace_range(from..end, "");
+                        }
+                    }
+                    line
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -835,8 +850,10 @@ fn without_pii_nothing_is_read() -> TestResult {
     assert_eq!(run.summary.get("coverage"), Some(&Value::Null));
     assert_eq!(run.summary.get("pii_inventory"), Some(&Value::Null));
     assert!(pii_found(&run).is_empty());
-    // Without --pii, the HTML report has the metadata sections only.
+    // Without --pii the dashboard still has its sections, and the embedded
+    // data records that content scanning was off and found no columns.
     assert!(run.html.contains("<h2>Metadata findings</h2>"));
-    assert!(!run.html.contains("PII inventory"));
+    assert!(run.html.contains("\"pii\":false"));
+    assert!(run.html.contains("\"columns\":[]"));
     Ok(())
 }
