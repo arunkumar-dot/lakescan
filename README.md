@@ -9,7 +9,7 @@ Indian PAN and Aadhaar numbers, card numbers, IP addresses, and, by column
 name, people's names and dates of birth. It reports which columns hold what,
 never the values themselves, and exits with a code your CI can act on.
 
-![LakeScan dashboard — PII inventory with exit code, action banner, headline tiles and type/table charts](docs/images/dashboard.png)
+![LakeScan dashboard — exit code, action banner, headline tiles and PII charts](docs/images/dashboard.png)
 
 A discovery aid, not a compliance assessment: no finding does not prove there is no personal data.
 
@@ -567,7 +567,7 @@ PII INVENTORY
     email  pii-email  confirmed  evidence=values  4 files, documented until 2027-06-30: Consented marketing contacts, DPA-12
 ```
 
-![LakeScan PII inventory — documented row with reason, expiry date and confidence badges](docs/images/inventory.png)
+![LakeScan PII inventory — documented row with reason, expiry and confidence badges](docs/images/inventory.png)
 
 (Trimmed: the real output lists every table and row.)
 
