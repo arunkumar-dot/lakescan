@@ -9,7 +9,23 @@ Indian PAN and Aadhaar numbers, card numbers, IP addresses, and, by column
 name, people's names and dates of birth. It reports which columns hold what,
 never the values themselves, and exits with a code your CI can act on.
 
+![LakeScan dashboard — PII inventory with exit code, action banner, headline tiles and type/table charts](docs/images/dashboard.png)
+
 A discovery aid, not a compliance assessment: no finding does not prove there is no personal data.
+
+**Quick install (macOS, Apple silicon):**
+
+```bash
+VERSION=0.1.0
+gh release download v0.1.0 --repo arunkumar-dot/lakescan
+shasum -a 256 --check --ignore-missing SHA256SUMS
+tar -xzf "lakescan-$VERSION-aarch64-apple-darwin.tar.gz"
+cd "lakescan-$VERSION-aarch64-apple-darwin"
+xattr -d com.apple.quarantine ./lakescan 2>/dev/null || true
+./lakescan --version
+```
+
+Other platforms: see [Run the release binary](#run-the-release-binary) below.
 
 Where the product is headed, and why, is in [docs/PRODUCT.md](docs/PRODUCT.md).
 
@@ -45,9 +61,8 @@ cd "lakescan-$VERSION-$TARGET"
 ./lakescan --version
 ```
 
-Once the repository is public, each archive also carries a signed build
-provenance attestation, linking it to the workflow run and commit that built
-it. Verify it with the [GitHub CLI](https://cli.github.com/):
+Each archive also carries a signed build provenance attestation, linking
+it to the workflow run and commit that built it. Verify it with the [GitHub CLI](https://cli.github.com/):
 
 ```sh
 gh attestation verify "lakescan-$VERSION-$TARGET.tar.gz" --repo arunkumar-dot/lakescan
@@ -551,6 +566,8 @@ PII INVENTORY
     pan  pii-in-pan  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
     email  pii-email  confirmed  evidence=values  4 files, documented until 2027-06-30: Consented marketing contacts, DPA-12
 ```
+
+![LakeScan PII inventory — documented row with reason, expiry date and confidence badges](docs/images/inventory.png)
 
 (Trimmed: the real output lists every table and row.)
 
