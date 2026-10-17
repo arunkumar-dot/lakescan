@@ -23,6 +23,7 @@
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
+use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
@@ -123,7 +124,10 @@ impl PageSource for S3Source {
             request = request.continuation_token(token);
         }
 
-        let output = request.send().await.map_err(classify_sdk_error)?;
+        let output = request.send().await.map_err(|err| {
+            let region = bucket_region(&err);
+            classify_sdk_error(err, region.as_deref())
+        })?;
 
         let ListObjectsV2Output {
             is_truncated,
@@ -264,15 +268,34 @@ fn hex_digit_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// The bucket's region, from the `x-amz-bucket-region` header S3 sends with
+/// a `PermanentRedirect` (and most other bucket-level responses), or `None`
+/// when the response has no such header or it is not a plausible region
+/// name. The value is printed, so anything but lowercase letters, digits
+/// and `-` is refused rather than echoed to a terminal.
+fn bucket_region(err: &SdkError<ListObjectsV2Error, HttpResponse>) -> Option<String> {
+    let region = err.raw_response()?.headers().get("x-amz-bucket-region")?;
+    let plausible = !region.is_empty()
+        && region.len() <= 32
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    plausible.then(|| region.to_owned())
+}
+
 /// Classifies a failed `ListObjectsV2` call into the `LakeScan` error
-/// category it belongs to.
+/// category it belongs to. `region` is the bucket's region when the
+/// response named it (see [`bucket_region`]).
 ///
 /// Generic over the SDK's raw-response type so this function never needs to
 /// name it: at the real call site it is inferred from `.send()`'s error
 /// type, and tests below pin it to `()`.
-fn classify_sdk_error<R>(err: SdkError<ListObjectsV2Error, R>) -> LakeScanError {
+fn classify_sdk_error<R>(
+    err: SdkError<ListObjectsV2Error, R>,
+    region: Option<&str>,
+) -> LakeScanError {
     if let SdkError::ServiceError(service) = &err {
-        return classify_service_error(service.err().code(), service.err().message());
+        return classify_service_error(service.err().code(), service.err().message(), region);
     }
 
     let is_credential_failure = matches!(err, SdkError::ConstructionFailure(_));
@@ -289,7 +312,8 @@ fn classify_sdk_error<R>(err: SdkError<ListObjectsV2Error, R>) -> LakeScanError 
 }
 
 /// Classifies an S3 error code and message into the `LakeScan` error
-/// category it belongs to.
+/// category it belongs to. A `PermanentRedirect` names the bucket's
+/// `region` when it is known.
 ///
 /// Pure and network-free, which is what makes the mapping unit-testable as a
 /// plain table: see `error_codes_classify_into_their_contracted_category`
@@ -297,7 +321,11 @@ fn classify_sdk_error<R>(err: SdkError<ListObjectsV2Error, R>) -> LakeScanError 
 /// variant; every other code (including ones `aws-sdk-s3` has never heard
 /// of) arrives as `Unhandled`, so classification has to run on the string
 /// code rather than on the SDK's enum shape.
-fn classify_service_error(code: Option<&str>, message: Option<&str>) -> LakeScanError {
+fn classify_service_error(
+    code: Option<&str>,
+    message: Option<&str>,
+    region: Option<&str>,
+) -> LakeScanError {
     let code = code.unwrap_or("unknown");
     let message = message.unwrap_or("no message provided");
     let detail = format!("{code}: {message}");
@@ -316,9 +344,16 @@ fn classify_service_error(code: Option<&str>, message: Option<&str>) -> LakeScan
         "InvalidBucketName" => {
             LakeScanError::Usage(format!("{detail} (the bucket name is not valid)"))
         }
-        "PermanentRedirect" => LakeScanError::Usage(format!(
-            "{detail} (the bucket is in a different region; set AWS_REGION to match it)"
-        )),
+        "PermanentRedirect" => LakeScanError::Usage(match region {
+            Some(region) => {
+                format!("{detail} (bucket is in {region}; rerun with --region {region})")
+            }
+            None => {
+                format!(
+                    "{detail} (the bucket is in a different region; set AWS_REGION to match it)"
+                )
+            }
+        }),
         "AuthorizationHeaderMalformed" => LakeScanError::Usage(format!(
             "{detail} (the configured AWS_REGION does not match the bucket's region)"
         )),
@@ -332,7 +367,10 @@ mod tests {
     use aws_sdk_s3::error::{ConnectorError, ErrorMetadata};
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
 
-    use super::{classify_sdk_error, classify_service_error, decode_url_key};
+    use aws_sdk_s3::config::http::HttpResponse;
+    use aws_sdk_s3::primitives::SdkBody;
+
+    use super::{bucket_region, classify_sdk_error, classify_service_error, decode_url_key};
     use crate::error::LakeScanError;
 
     fn decode(raw: &str) -> Result<String, LakeScanError> {
@@ -430,7 +468,7 @@ mod tests {
         for code in auth_codes {
             assert!(
                 matches!(
-                    classify_service_error(Some(code), Some("x")),
+                    classify_service_error(Some(code), Some("x"), None),
                     LakeScanError::Auth(_)
                 ),
                 "{code} should classify as Auth"
@@ -446,7 +484,7 @@ mod tests {
         for code in usage_codes {
             assert!(
                 matches!(
-                    classify_service_error(Some(code), Some("x")),
+                    classify_service_error(Some(code), Some("x"), None),
                     LakeScanError::Usage(_)
                 ),
                 "{code} should classify as Usage"
@@ -463,7 +501,7 @@ mod tests {
         for code in transport_codes {
             assert!(
                 matches!(
-                    classify_service_error(Some(code), Some("x")),
+                    classify_service_error(Some(code), Some("x"), None),
                     LakeScanError::Transport(_)
                 ),
                 "{code} should classify as Transport"
@@ -471,7 +509,7 @@ mod tests {
         }
 
         assert!(matches!(
-            classify_service_error(None, None),
+            classify_service_error(None, None, None),
             LakeScanError::Transport(_)
         ));
     }
@@ -479,14 +517,17 @@ mod tests {
     #[test]
     fn construction_failure_classifies_as_auth() {
         let err: SdkErrorUnit = aws_sdk_s3::error::SdkError::construction_failure("no credentials");
-        assert!(matches!(classify_sdk_error(err), LakeScanError::Auth(_)));
+        assert!(matches!(
+            classify_sdk_error(err, None),
+            LakeScanError::Auth(_)
+        ));
     }
 
     #[test]
     fn timeout_dispatch_and_response_failures_classify_as_transport() {
         let timeout: SdkErrorUnit = aws_sdk_s3::error::SdkError::timeout_error("took too long");
         assert!(matches!(
-            classify_sdk_error(timeout),
+            classify_sdk_error(timeout, None),
             LakeScanError::Transport(_)
         ));
 
@@ -494,14 +535,14 @@ mod tests {
             ConnectorError::io("connection reset".into()),
         );
         assert!(matches!(
-            classify_sdk_error(dispatch),
+            classify_sdk_error(dispatch, None),
             LakeScanError::Transport(_)
         ));
 
         let response: SdkErrorUnit =
             aws_sdk_s3::error::SdkError::response_error("unparseable body", ());
         assert!(matches!(
-            classify_sdk_error(response),
+            classify_sdk_error(response, None),
             LakeScanError::Transport(_)
         ));
     }
@@ -514,7 +555,52 @@ mod tests {
             .build();
         let err: SdkErrorUnit =
             aws_sdk_s3::error::SdkError::service_error(ListObjectsV2Error::generic(meta), ());
-        assert!(matches!(classify_sdk_error(err), LakeScanError::Usage(_)));
+        assert!(matches!(
+            classify_sdk_error(err, None),
+            LakeScanError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn a_redirect_names_the_buckets_region_when_it_is_known() {
+        let redirect =
+            |region| classify_service_error(Some("PermanentRedirect"), Some("moved"), region);
+        assert!(matches!(
+            redirect(Some("eu-west-1")),
+            LakeScanError::Usage(message) if message
+                == "PermanentRedirect: moved (bucket is in eu-west-1; rerun with --region eu-west-1)"
+        ));
+        assert!(matches!(
+            redirect(None),
+            LakeScanError::Usage(message) if message
+                == "PermanentRedirect: moved (the bucket is in a different region; set AWS_REGION \
+                    to match it)"
+        ));
+    }
+
+    #[test]
+    fn the_region_is_read_from_the_redirect_header_and_must_look_like_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let region_of =
+            |header: Option<&str>| -> Result<Option<String>, Box<dyn std::error::Error>> {
+                let mut raw = HttpResponse::new(301.try_into()?, SdkBody::empty());
+                if let Some(value) = header {
+                    raw.headers_mut()
+                        .try_insert("x-amz-bucket-region", value.to_owned())?;
+                }
+                let meta = ErrorMetadata::builder().code("PermanentRedirect").build();
+                let err = aws_sdk_s3::error::SdkError::service_error(
+                    ListObjectsV2Error::generic(meta),
+                    raw,
+                );
+                Ok(bucket_region(&err))
+            };
+        assert_eq!(region_of(Some("eu-west-1"))?.as_deref(), Some("eu-west-1"));
+        assert_eq!(region_of(None)?, None);
+        assert_eq!(region_of(Some(""))?, None);
+        assert_eq!(region_of(Some("eu-west-1; rm -rf"))?, None);
+        assert_eq!(region_of(Some("EU-WEST-1"))?, None);
+        Ok(())
     }
 
     /// `SdkError<ListObjectsV2Error, R>` with the raw-response type pinned to

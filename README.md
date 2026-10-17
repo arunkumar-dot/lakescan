@@ -197,6 +197,11 @@ container or instance credentials.
 
 A progress line (`scanned N objects, M findings`) is shown on stderr only when
 stderr is a terminal. Errors print one line to stderr, `lakescan: <error>`.
+A listing that returns no objects still exits 0, but prints `lakescan: no
+objects found under s3://<bucket>/<prefix>; check that the prefix is correct`
+to stderr, `--quiet` or not, so a mistyped prefix does not pass silently. When
+the bucket is in a different region, the error names that region, from S3's
+redirect response.
 
 ### Output files
 

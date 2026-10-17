@@ -50,6 +50,21 @@ table status, all additive, so `schema_version` stays 1.
   new status `columns_not_examined`, never `no_pii_in_scanned_files`. They
   are reported only: the exit code is unchanged.
 
+### Real-S3 fixes (M12.1)
+
+From the first real-S3 test
+([docs/experiments/real-s3.md](docs/experiments/real-s3.md)). Exit codes
+are unchanged.
+
+- A scan whose listing returns no objects (an empty or mistyped prefix)
+  prints `lakescan: no objects found under s3://<bucket>/<prefix>; check
+  that the prefix is correct` to stderr, `--quiet` or not, and still
+  exits 0.
+- When S3 redirects a listing to the bucket's region (`PermanentRedirect`,
+  exit 2), the error names that region from the `x-amz-bucket-region`
+  header: `bucket is in eu-west-1; rerun with --region eu-west-1`. Without
+  the header, the message is unchanged.
+
 ### Fixtures
 
 - The committed fixtures' emails moved to the reserved `.example`

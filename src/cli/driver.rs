@@ -179,7 +179,7 @@ where
             .write_all(CLEAR_LINE.as_bytes())
             .and_then(|()| out.flush());
     }
-    listed?;
+    let object_count = listed?;
     let elapsed = clock.elapsed();
 
     if let Some(findings) = findings {
@@ -224,6 +224,12 @@ where
         .and_then(|()| errors.flush());
     }
 
+    if object_count == 0 {
+        // Always, `--quiet` or not: a mistyped prefix lists nothing and
+        // would otherwise pass as a clean scan. Best effort, like the rest.
+        let _ = write_nothing_listed(&mut errors, &info);
+    }
+
     if code == ExitCode::ContentNotScanned
         && let Some(content) = aggregates.content()
     {
@@ -241,6 +247,17 @@ fn decide(aggregates: &Aggregates, fail_on: Option<Severity>) -> ExitCode {
         Some(coverage) if coverage.not_scanned_unsuppressed > 0 => ExitCode::ContentNotScanned,
         _ => verdict(aggregates.worst_severity(), fail_on),
     }
+}
+
+/// Warns that the listing returned no objects, naming the target.
+fn write_nothing_listed<E: Write>(out: &mut E, info: &ScanInfo) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "lakescan: no objects found under s3://{}/{}; check that the prefix is correct",
+        info.bucket,
+        info.prefix.as_deref().unwrap_or_default()
+    )?;
+    out.flush()
 }
 
 /// Explains [`ExitCode::ContentNotScanned`]: the undocumented files by
@@ -344,14 +361,15 @@ impl<F: Write> Sinks<'_, F> {
 /// eligible Parquet object, content scanning) through `sinks`, in listing
 /// order, and rewrites the progress line after every page. Eligible files
 /// are scanned as tasks, at most `concurrency` at once, their buffers held
-/// only under the shared memory budget.
+/// only under the shared memory budget. Returns how many objects were
+/// listed.
 async fn walk<S, R, F, P>(
     scanner: &mut Scanner<S>,
     ctx: &EvalContext,
     content: Option<&mut Content<R>>,
     sinks: &mut Sinks<'_, F>,
     mut progress: Option<&mut P>,
-) -> Result<(), LakeScanError>
+) -> Result<u64, LakeScanError>
 where
     S: PageSource,
     R: ObjectReader,
@@ -405,7 +423,7 @@ where
         window.apply_front(ctx, sinks).await?;
     }
 
-    Ok(())
+    Ok(object_count)
 }
 
 /// A spawned file scan, aborted if dropped unfinished (a listing error
@@ -747,6 +765,68 @@ mod tests {
                  {CLEAR_LINE}"
             )
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_empty_listing_warns_on_stderr_and_still_exits_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (prefix, shown) in [
+            (Some("does-not-exist/"), "s3://test-bucket/does-not-exist/"),
+            (None, "s3://test-bucket/"),
+        ] {
+            let mut errors = Vec::new();
+            let code = scan(
+                source(vec![Step::Page(Vec::new(), None)]),
+                Target {
+                    bucket: "test-bucket".to_owned(),
+                    prefix: prefix.map(str::to_owned),
+                },
+                Config::default(),
+                Format::Text,
+                Some(Severity::High),
+                None::<Content<MemoryReader>>,
+                Outputs {
+                    summary: Vec::new(),
+                    findings: None::<Vec<u8>>,
+                    inventory: None,
+                    html: None,
+                    progress: None::<Vec<u8>>,
+                    warnings: None::<Vec<u8>>,
+                    errors: &mut errors,
+                },
+            )
+            .await?;
+            assert_eq!(code, ExitCode::Ok);
+            assert_eq!(
+                String::from_utf8(errors)?,
+                format!(
+                    "lakescan: no objects found under {shown}; check that the prefix is correct\n"
+                )
+            );
+        }
+
+        // A listing with objects says nothing.
+        let mut errors = Vec::new();
+        scan(
+            two_pages(),
+            target(),
+            Config::default(),
+            Format::Text,
+            None,
+            None::<Content<MemoryReader>>,
+            Outputs {
+                summary: Vec::new(),
+                findings: None::<Vec<u8>>,
+                inventory: None,
+                html: None,
+                progress: None::<Vec<u8>>,
+                warnings: None::<Vec<u8>>,
+                errors: &mut errors,
+            },
+        )
+        .await?;
+        assert_eq!(errors, Vec::<u8>::new());
         Ok(())
     }
 
