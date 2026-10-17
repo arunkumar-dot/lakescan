@@ -186,11 +186,11 @@ container or instance credentials.
 | `--endpoint-url <URL>` | AWS | An S3-compatible endpoint (`http://` or `https://`). Implies path-style addressing. |
 | `--config <PATH>` | none | A suppression file (see [Suppressions](#suppressions)). Only used when given; never discovered automatically. |
 | `--quiet` | off | No progress line and no suppression warnings on stderr. |
-| `--pii` | off | Also scan Parquet for structured personal data, including extensionless Parquet found by sniffing. Sampled inspection; repeated columns, free text and other formats are skipped. See [PII content scanning](#pii-content-scanning). Without it, no object is read. |
+| `--pii` | off | Also scan Parquet for structured personal data, including extensionless Parquet found by sniffing. Sampled inspection, list and map columns included; free text and other formats are skipped. See [PII content scanning](#pii-content-scanning). Without it, no object is read. |
 | `--pii-sniff unknown\|none` | `unknown` | With `--pii`: which objects without a `.parquet` or `.parq` extension to sniff. `unknown` (default) sniffs a key with no extension, or an extension not on the known non-Parquet list, with one ranged GET of the last 8 bytes, and checks the `PAR1` magic. `none` sniffs nothing. Folder markers and zero-byte objects are never candidates. Each sniff is one small GET, counted in the GET totals. Requires `--pii`. |
 | `--pii-whole-file-max <BYTES>` | `8388608` (8 MiB) | With `--pii`: Parquet files of at most `BYTES` are downloaded whole, in one request, and still sampled. Larger ones are read partially. `0` to `67108864` (64 MiB). Requires `--pii`. |
 | `--concurrency <N>` | `16` | With `--pii`: Parquet files scanned at once, `1` to `256`. Findings, the inventory and the summary are the same for any value, apart from this number in the recorded settings and the timing lines. Requires `--pii`. See [Speed and memory](#speed-and-memory). |
-| `--memory-budget <BYTES>` | `536870912` (512 MiB) | With `--pii`: the most bytes in-flight file scans hold at once. Must cover the most one file can need (~103 MiB at the default `--pii-whole-file-max`, ~132 MiB at 64 MiB), and at most `68719476736` (64 GiB). Anything else is a usage error; the semaphore is created with exactly this many permits. Requires `--pii`. |
+| `--memory-budget <BYTES>` | `536870912` (512 MiB) | With `--pii`: the most bytes in-flight file scans hold at once. Must cover the most one file can need (~108 MiB at the default `--pii-whole-file-max`, ~137 MiB at 64 MiB), and at most `68719476736` (64 GiB). Anything else is a usage error; the semaphore is created with exactly this many permits. Requires `--pii`. |
 | `--coalesce-gap <BYTES>` | `1048576` (1 MiB) | With `--pii`: page ranges of one file at most `BYTES` apart are read as one request (merged reads stay within 8 MiB). `0` reads each range alone. Requires `--pii`. |
 | `--html <PATH>` | off | Also write a self-contained [HTML report](#html-report) to `PATH`. `-` means stdout, which then requires every other output to go to a file. Works with or without `--pii`. |
 | `--inventory <PATH>` | off | With `--pii`: also write the [PII inventory](#pii-inventory-and-coverage) as CSV to `PATH`, one row per table, column and rule. `-` means stdout, which then requires `--output` to name a file, and `--findings` not to be `-`. Requires `--pii`. |
@@ -291,13 +291,13 @@ names one column, and its severity follows from its confidence (see
 | Code | Flags |
 |---|---|
 | `pii-email` | A column of email addresses. |
-| `pii-phone` | A column of phone numbers: E.164 (`+14155550123`), or Indian mobile numbers with an optional `+91`, `91` or `0`. Spaces, dashes, dots and parentheses are ignored. |
+| `pii-phone` | A column of phone numbers: E.164 (`+14155550123`), Indian mobile numbers with an optional `+91`, `91` or `0`, and, written with separators as people write them, North American numbers (`(201) 555-0123`, `+1 201 555 0123`), national numbers with a trunk `0` (UK and EU: `020 7946 0123`, `01 23 45 67 89`) and international numbers dialled with `00`. Spaces, dashes, dots, slashes and parentheses are separators. A bare run of digits (no `+`, no separators, as in any integer column) counts only as an Indian mobile number, and only in a column whose name has a phone or contact word in it (`phone`, `mobile`, `cell`, `tel`, `contact`, `msisdn`): elsewhere it is as likely an identifier (a US NPI number looks like an Indian mobile). A phone column is `confirmed` only when its name is about a person or a personal device (`customer_phone`, `contact`, `mobile`) or at least 95% of its values match: organisations have phone numbers too. |
 | `pii-in-pan` | A column of Indian PAN numbers (`ABCPE1234F`, in either case). |
 | `pii-in-aadhaar` | A column of Aadhaar numbers: 12 digits, the first 2–9, with a valid Verhoeff check digit. |
 | `pii-card-number` | A column of payment card numbers: 13 to 19 digits with a valid Luhn check digit. |
 | `pii-ip-address` | A column of IPv4 or IPv6 addresses. |
-| `pii-person-name` | A column whose name says it holds people's names (`full_name`, `lastName`, …). Detected by name only. |
-| `pii-date-of-birth` | A column whose name says it holds dates of birth (`dob`, `birth_date`, …). Detected by name only. |
+| `pii-person-name` | A column whose name says it holds people's names: a name part as the whole name (`FIRST`, `LAST`, `MAIDEN`, `family`, `given`), a name word (`surname`, `forename`, `fname`, `lname`), or `name` qualified by a name part or a person noun (`full_name`, `nameFirst`, `customer_display_name`, `username`). A bare `name`, or one qualified by anything else (`Short Name`, `drug_name`, `company_name`), is no hint. Detected by name only. |
+| `pii-date-of-birth` | A column whose name says it holds dates of birth (`dob`, `birth_date`, `date_of_birth`, `birthdate`, `bdate`, `bday`, …), but not a count, rate or flag of births (`multipleBirthInteger`, `birth_rate`, `births`). Detected by name only. |
 | `content-not-scanned` | `info`: a Parquet file that could not be scanned, with a reason: `not-parquet`, `unreadable`, `access-denied`, `encrypted`, `footer-too-large`, `no-column-examined` (it has string or integer columns, but every one was skipped, so no value was examined), `fetch-failed` (a `GetObject` still failed after the SDK's retries: throttling, timeouts, 5xx, an object deleted mid-scan), `too-many-columns` (the schema has more than 16,384 leaf columns), or `budget-timeout` (it waited more than 10 minutes for memory-budget permits). It never stops the scan, but unless suppressed it fails the run with exit code 6 (see [Coverage](#coverage-fails-closed)). |
 
 ## PII content scanning
@@ -321,7 +321,7 @@ the writer stored one, and the first data page of a column, in up to 3 row
 groups and at most 2,000 values per column per row group. A file at or
 below `--pii-whole-file-max` is downloaded whole, in one request, and then
 sampled the same way. A whole-file download is not an exhaustive read of
-every page. Repeated (list and map) columns are skipped. Free text is not
+every page. Repeated (list and map) columns are read like any other. Free text is not
 scanned: an email inside a notes column is not a finding. CSV, JSON, Avro,
 ORC and every other format are not read.
 
@@ -344,8 +344,11 @@ sampled again in the middle row group, then the last: never more than 3 row
 groups per column. This catches junk or nulls clustered at the start of a
 file. Candidate columns are string, binary, INT32 and INT64 columns, plus
 DATE and TIMESTAMP columns for the date-of-birth name check. Struct fields
-count; repeated (list and map) columns are skipped and counted. At most
-2,000 values per column per row group are evaluated.
+count, and so do the leaves of lists and maps (`tags.list.element`,
+`telecom.list.element.value`), named for their hints by the field behind
+the list or map wrapper (`value`, `given`). A repeated column's first data
+page may declare at most 131,072 values; a larger one is `page-too-large`.
+At most 2,000 values per column per row group are evaluated.
 
 A candidate column is skipped, and counted by reason, when its first pages
 are over the page cap (`page-too-large`), can't be decoded (`unreadable`),
@@ -359,6 +362,24 @@ birth, are still reported for such a file. A file with no string or integer
 columns at all (only doubles, say) has nothing to examine and counts as
 scanned.
 
+### Columns not examined
+
+A column that could hold personal data but wasn't examined is recorded, so
+a table whose personal-data columns couldn't be checked never reads as
+clean. That is a string or integer column skipped for any reason
+(`page-too-large`, `unreadable`, `unsupported-codec`), and a column of a type
+LakeScan doesn't read (a float, a decimal, a time; not a boolean) whose name
+hints personal data, such as a phone number stored as a double
+(`unsupported-type`). Each table counts them per reason, once per file; a
+table with no PII found and any such column has status
+`columns_not_examined`, `No structured PII detected in the columns examined
+from N files; PII unknown in the columns not examined`, and lists the
+columns. COVERAGE gives the totals. The 64 smallest `(table, column,
+reason)` are listed, in every format (in CSV as `NOT_EXAMINED` rows, with
+the reason in the last column, `not_examined_reason`); the counts include
+every one. Columns not examined are reported, not failed on: they don't
+change the exit code.
+
 Each file's `PAR1` magic bytes are checked first. A file without them is not
 Parquet and is skipped (`content-not-scanned`, `not-parquet`), not an error.
 
@@ -366,14 +387,22 @@ Parquet and is skipped (`content-not-scanned`, `not-parquet`), not an error.
 strings, values made of one repeated character (`0000000000`, `----`) and
 the placeholders `n/a`, `na`, `null`, `none`, `nil`, `unknown`, `undefined`,
 `unk`, `tbd`, `test`, `sample`, `dummy`, `-`, `?` and `.` (in any case) are
-dropped. So is a value that makes up more than half of a column's sample,
-such as a default address, unless it is the column's only value.
+dropped. So are three sentinels seen in real datasets: emails at the
+reserved test domains `example.com`, `example.org` and `example.net` (and
+their subdomains) or under `.test`, which are test accounts, not people;
+masked values, with a run of four or more of one masking symbol (`*`, `x`,
+`X`, `#`, `•`, `-`: `****1234`, `XXXX-XXXX-XXXX-0004`); and the dates
+`1900-01-01` and `1970-01-01` (with an all-zero time, if any). So is a
+value that makes up more than half of a column's sample, such as a default
+address, unless it is the column's only value. A column with no value left
+after cleaning (all null, empty or placeholder) is never reported, whatever
+its name; a date column whose statistics say it is all null neither.
 
 ### Confidence and severity
 
 | Confidence | When | Severity |
 |---|---|---|
-| `confirmed` | At least 80% of at least 30 cleaned values match. | `high` |
+| `confirmed` | At least 80% of at least 30 cleaned values match (for a phone column whose name isn't about a person, at least 95%). | `high` |
 | `likely` | 50–80% of at least 30 cleaned values match; or at least 80% match but there are fewer than 30; or the column's name suggests the type and at least one value matches; or, for names and dates of birth, a clear name hint on a column of fitting type. | `medium` |
 | `possible` | The column's name suggests the type, but there is no value evidence. | `info` |
 
@@ -462,8 +491,8 @@ code 6) unless documented.
 **Memory is bounded by `--memory-budget`** (512 MiB by default). Every read
 and every decode takes permits for its bytes (the bytes fetched, or the
 page sizes a header declares) before it starts, and gives them back when
-its buffers are freed. One file never needs more than ~103 MiB under
-LakeScan's caps (~132 MiB with `--pii-whole-file-max 64MiB`), and a budget
+its buffers are freed. One file never needs more than ~108 MiB under
+LakeScan's caps (~137 MiB with `--pii-whole-file-max 64MiB`), and a budget
 below that is a usage error, since that file could never start. Files
 share the budget so that none can wait forever: each in-flight file may
 hold an equal share freely, and one file at a time may go beyond it. On
@@ -500,12 +529,13 @@ COVERAGE
   scanned:        8 (72.7%)
   not scanned:    1 documented, 2 undocumented
   inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  columns not examined: 0 in 0 files of 0 tables
   Not in scope for --pii: none by extension
   sniffed, not Parquet: 0
   empty objects and folder markers: 0
 
 PII INVENTORY
-  4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented).
+  4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented), 0 with columns not examined.
   Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
   bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 undocumented); files dated 2026-10-16 to 2026-10-16
     not scanned: PII unknown
@@ -519,12 +549,15 @@ PII INVENTORY
 
 (Trimmed: the real output lists every table and row.)
 
-The headline counts the action items: undocumented PII locations, and
-tables with files that weren't scanned. A table never claims more than was
-read: one with no file scanned says `not scanned: PII unknown`, and one
-where nothing was found says `No structured PII detected in sampled data from N files`, adding
+The headline counts the action items: undocumented PII locations, tables
+with files that weren't scanned, and tables with [columns not
+examined](#columns-not-examined). A table never claims more than was read:
+one with no file scanned says `not scanned: PII unknown`, one where columns
+that could hold PII weren't examined says so and lists them, and one where
+nothing was found says `No structured PII detected in sampled data from N files`, adding
 `; M not scanned` when some weren't (JSON: each table's `status`,
-`pii_found`, `no_pii_in_scanned_files` or `not_scanned`, and
+`pii_found`, `no_pii_in_scanned_files`, `columns_not_examined` or
+`not_scanned`, and
 `pii_inventory.summary` for the headline). The undocumented count is split
 by the highest confidence of each location: `30 undocumented (24 confirmed, 6 likely, 0 possible)`.
 
@@ -592,7 +625,7 @@ formula. Read such a cell without its leading `'`. The JSON summary and the
 byte for byte (JSON-escaped).
 
 **Caps.** At most 4,096 tables and 16,384 entries (table, column, rule) are
-kept, so the inventory's memory stays bounded (~16.5 MiB at the caps). Over
+kept, so the inventory's memory stays bounded (~17.0 MiB at the caps). Over
 a cap, the lexicographically smallest tables and entries are kept, the
 same whatever order files arrive in, with every kept count exact. What is
 left out is counted (files and findings) and reported in a `WARNING: truncated:`
@@ -776,19 +809,26 @@ fields:
   `scanned_whole` (downloaded whole, then sampled), `scanned_partially`,
   and `not_scanned` by reason (every reason code, including
   `budget-timeout`, `0` when none); `columns_examined`, and
-  `columns_skipped` by reason (`repeated`, `unsupported_type`,
-  `page_too_large`, `unreadable`, `unsupported_codec`); `bytes_read`,
+  `columns_skipped` by reason (`repeated`, always `0` since repeated
+  columns are read, `unsupported_type`, `page_too_large`, `unreadable`,
+  `unsupported_codec`); `columns_not_examined` by reason (every code:
+  `unsupported-type`, `page-too-large`, `unreadable`, `unsupported-codec`;
+  see [Columns not examined](#columns-not-examined)) and
+  `files_with_columns_not_examined`; `bytes_read`,
   `get_requests` (sniffs included) and `sniffed` (one 8-byte GET per
   candidate). `null` without `--pii`.
 - `coverage`: with `--pii`, `files_eligible`, `files_scanned`,
   `not_scanned_suppressed`, `not_scanned_unsuppressed`, and `percent`
   (rounded down to one decimal; `null` with no eligible file);
-  `out_of_scope` (`objects`, `by_extension` of `extension` and `count`,
+  `columns_not_examined` (`total`, counted once per file; `files`;
+  `tables`; `by_reason`; `examples`, the 64 smallest by table, column and
+  reason, each with `table`, `column` and `reason`; and
+  `examples_truncated`); `out_of_scope` (`objects`, `by_extension` of `extension` and `count`,
   `other_extensions`, `sniffed_not_parquet`, `empty`); and `sampling`
   (`method`, and `exhaustive`, always `false`). `null` without `--pii`.
 - `pii_inventory`: with `--pii`, `tables` (sorted by name), each with
-  `table`, `status` (`pii_found`, `no_pii_in_scanned_files` or
-  `not_scanned`), `files_eligible`, `files_scanned`, `files_not_scanned`,
+  `table`, `status` (`pii_found`, `no_pii_in_scanned_files`,
+  `columns_not_examined` or `not_scanned`), `files_eligible`, `files_scanned`, `files_not_scanned`,
   `not_scanned` (per reason with any, its `suppressed` and `unsuppressed`
   file counts),
   `example_key` (or `null`), `oldest_file` and `newest_file` (RFC 3339, or
@@ -796,12 +836,15 @@ fields:
   with `column`, `rule`, `highest_confidence`, `evidence`,
   `files_confirmed`, `files_likely`, `files_possible`, `files_suppressed`,
   `status` (`UNDOCUMENTED` or `documented`), `reason` (or `null`) and
-  `expires` (`YYYY-MM-DD`, or `null`); plus
+  `expires` (`YYYY-MM-DD`, or `null`); and `columns_not_examined`
+  (`total`, `files`, `by_reason`, and `examples`, each with `column` and
+  `reason`); plus
   `summary` (`tables_with_pii`, `pii_columns`, `undocumented`,
   `undocumented_confirmed`, `undocumented_likely`, `undocumented_possible`,
   `documented`,
-  `tables_not_fully_scanned`, and `tables_not_fully_scanned_documented`:
-  of those, the tables whose every unscanned file is documented),
+  `tables_not_fully_scanned`, `tables_not_fully_scanned_documented`:
+  of those, the tables whose every unscanned file is documented, and
+  `tables_with_columns_not_examined`),
   `truncated`, `left_out` (`files`, `findings`) and `caps` (`tables`,
   `entries`). `null` without `--pii`.
 - `suppressions`: `expired` and `unused` entries, each with `rule`, `key`
@@ -854,9 +897,12 @@ v0.1.0: `largest_objects` entries no longer carry `severity`, which was always
   not read.
 - **Structured columns only.** Personal data embedded in free text (an email
   in a notes column) is not detected. Neither are names or dates of birth
-  under a column name that doesn't say so.
-- **Repeated columns are skipped.** List and map columns are counted but not
-  read.
+  under a column name that doesn't say so: a bare `name`, or a generic
+  `value` whose sibling says what it holds (FHIR's `telecom.value`).
+- **Name and phone rules were tuned on public datasets.** See
+  [docs/experiments/real-data.md](docs/experiments/real-data.md) for what
+  they still miss, such as US SSNs, passports and street addresses, which
+  LakeScan doesn't detect.
 - **It samples rather than reads everything.** A column is judged from the
   dictionary and the first data page of up to three row groups (at most
   2,000 values each), including when the file was downloaded whole.

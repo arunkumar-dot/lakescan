@@ -113,16 +113,18 @@ CONTENT
     downloaded whole:  1
     read partially:    0
     not scanned:       0
-  columns examined:   15
-  columns skipped:    2 (repeated=1, unsupported-type=1, page-too-large=0, unreadable=0, unsupported-codec=0)
-  bytes read:         1909661 (1.8 MiB)
+  columns examined:   16
+  columns skipped:    1 (repeated=0, unsupported-type=1, page-too-large=0, unreadable=0, unsupported-codec=0)
+  bytes read:         1914681 (1.8 MiB)
   GET requests:       1
   sniffed:            0 (objects without a Parquet extension; one 8-byte GET each)
 ```
 
 The file has 17 leaf columns (the struct `billing` holds two: `email` and
-`city`). `tags` is a list, so it is skipped as `repeated`. `amount` is a
-double, so it is skipped as `unsupported-type`. The other 15 are examined.
+`city`). `tags` is a list of strings: its elements are read like any other
+column (`tags.list.element`). `amount` is a double, so it is skipped as
+`unsupported-type`; its name hints nothing personal, so it is not a column
+*not examined*. The other 16 are examined.
 
 The real lake's big files take the partial path. To see it on this
 small file, set `--pii-whole-file-max 0` (another extra run). LakeScan
@@ -135,7 +137,7 @@ $ lakescan scan s3://lakescan-pii/lake/customers/dt=2026-01-01/ --endpoint-url h
 ...
     read partially:    1
 ...
-  bytes read:         972453 (949.6 KiB)
+  bytes read:         974316 (951.4 KiB)
   GET requests:       4
   sniffed:            0 (objects without a Parquet extension; one 8-byte GET each)
 ```
@@ -389,9 +391,9 @@ CONTENT
     downloaded whole:  8
     read partially:    0
     not scanned:       3 (not-parquet=1, unreadable=1, no-column-examined=1)
-  columns examined:   107
-  columns skipped:    17 (repeated=7, unsupported-type=9, page-too-large=1, unreadable=0, unsupported-codec=0)
-  bytes read:         11594785 (11.0 MiB)
+  columns examined:   114
+  columns skipped:    10 (repeated=0, unsupported-type=9, page-too-large=1, unreadable=0, unsupported-codec=0)
+  bytes read:         11607807 (11.0 MiB)
   GET requests:       11
   sniffed:            0 (objects without a Parquet extension; one 8-byte GET each)
 
@@ -400,12 +402,13 @@ COVERAGE
   scanned:        8 (72.7%)
   not scanned:    0 documented, 3 undocumented
   inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  columns not examined: 0 in 0 files of 0 tables
   Not in scope for --pii: none by extension
   sniffed, not Parquet: 0
   empty objects and folder markers: 0
 
 PII INVENTORY
-  4 tables with PII, 31 PII columns: 31 undocumented (25 confirmed, 6 likely, 0 possible), 0 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented).
+  4 tables with PII, 31 PII columns: 31 undocumented (25 confirmed, 6 likely, 0 possible), 0 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented), 0 with columns not examined.
   Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
   bad  files: 0 scanned, 2 not scanned (not-parquet=1 undocumented, unreadable=1 undocumented); files dated 2026-10-16 to 2026-10-16
     not scanned: PII unknown
@@ -452,7 +455,7 @@ $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --i
 lakescan: 3 of 11 eligible Parquet files could not be content-scanned and are not documented (not-parquet=1, unreadable=1, no-column-examined=1)
 ...
 $ head -6 inventory.csv
-table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,files_possible,files_suppressed,status,reason,example_key,oldest_file,newest_file,expires
+table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,files_possible,files_suppressed,status,reason,example_key,oldest_file,newest_file,expires,not_examined_reason
 lake/customers,aadhaar_no,pii-in-aadhaar,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,
 lake/customers,billing.email,pii-email,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,
 lake/customers,card_number,pii-card-number,confirmed,values,4,0,0,0,UNDOCUMENTED,,lake/customers/dt=2026-01-01/part-0.parquet,2026-10-16T16:52:42Z,2026-10-16T16:52:42Z,
@@ -501,12 +504,13 @@ COVERAGE
   scanned:        8 (72.7%)
   not scanned:    1 documented, 2 undocumented
   inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  columns not examined: 0 in 0 files of 0 tables
   Not in scope for --pii: none by extension
   sniffed, not Parquet: 0
   empty objects and folder markers: 0
 
 PII INVENTORY
-  4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented).
+  4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented), 0 with columns not examined.
   Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
   bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 undocumented); files dated 2026-10-16 to 2026-10-16
     not scanned: PII unknown
@@ -552,12 +556,13 @@ COVERAGE
   scanned:        8 (72.7%)
   not scanned:    3 documented, 0 undocumented
   inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  columns not examined: 0 in 0 files of 0 tables
   Not in scope for --pii: none by extension
   sniffed, not Parquet: 0
   empty objects and folder markers: 0
 
 PII INVENTORY
-  4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (2 documented).
+  4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (2 documented), 0 with columns not examined.
   Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
   bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 documented); files dated 2026-10-16 to 2026-10-16
     not scanned: PII unknown
@@ -606,7 +611,7 @@ What to notice:
 
 ```text
 $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --config demo.toml --html report.html --quiet > /dev/null
-report.html: 17735 bytes
+report.html: 17821 bytes
 $ open report.html
 exit code: 1
 ```
@@ -808,6 +813,6 @@ PII".
 
 **Memory budget.** The `--memory-budget` limit (512 MiB by default) on
 the bytes in-flight content scans may hold. Every fetch and decode takes
-permits for its size before it starts. One file needs at most ~103 MiB,
+permits for its size before it starts. One file needs at most ~108 MiB,
 so a smaller budget is a usage error. The bucket's size never changes
 memory use.

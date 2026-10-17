@@ -15,16 +15,26 @@
 //! because something smaller is always held in its place. What is left out
 //! is counted exactly too, as files and findings.
 //!
+//! **Columns not examined.** Each table counts, exactly and per reason, the
+//! columns that could hold personal data but were not examined in its
+//! scanned files (see [`crate::content::FileStats::not_examined`]), and
+//! the files that had any. A table with no PII found and such columns is
+//! [`TableStatus::ColumnsNotExamined`], never clean. Across the inventory,
+//! the [`MAX_NOT_EXAMINED_EXAMPLES`] smallest `(table, column, reason)`
+//! are kept as examples, the same whatever order files arrive in; whether
+//! any was left out is recorded too.
+//!
 //! **Memory.** Table names and example keys are cut to 1 KiB, column paths
 //! are at most [`MAX_COLUMN_BYTES`], and entries live inside their table,
 //! so a table name is stored once. [`PiiInventory::MAX_BYTES`] bounds the
-//! total, growth slack included: 17,399,872 bytes (~16.6 MiB) at the caps.
+//! total, growth slack included: 17,849,440 bytes (~17.0 MiB) at the caps.
 
 use std::time::SystemTime;
 
 use crate::content::FileOutcome;
 use crate::model::{
-    ColumnDetail, Confidence, Evidence, MAX_COLUMN_BYTES, NotScannedReason, RuleId, truncate_str,
+    ColumnDetail, Confidence, Evidence, MAX_COLUMN_BYTES, MAX_NOT_EXAMINED_EXAMPLES, NotExamined,
+    NotExaminedReason, NotScannedReason, RuleId, offer_not_examined, truncate_str,
 };
 
 /// The most tables held. A power of two, so the table list's capacity
@@ -39,6 +49,8 @@ pub const MAX_ENTRIES: usize = 16_384;
 const MAX_NAME_BYTES: usize = 1024;
 
 const NUM_REASONS: usize = NotScannedReason::ALL.len();
+
+const NUM_NOT_EXAMINED: usize = NotExaminedReason::ALL.len();
 
 const _: () = assert!(MAX_TABLES.is_power_of_two());
 
@@ -131,23 +143,39 @@ pub enum Status {
 pub enum TableStatus {
     /// At least one PII location was found.
     PiiFound,
-    /// Files were scanned and none held PII; others may not have been
-    /// scanned (see [`Table::files_not_scanned`]).
+    /// Files were scanned and none held PII, and every column that could
+    /// hold it was examined; other files may not have been scanned (see
+    /// [`Table::files_not_scanned`]).
     NoPiiInScannedFiles,
+    /// Files were scanned and no PII was found in the columns examined,
+    /// but some columns that could hold it were not examined (see
+    /// [`Table::not_examined`]): whether they hold PII is unknown.
+    ColumnsNotExamined,
     /// No file was scanned: whether it holds PII is unknown.
     NotScanned,
 }
 
 impl TableStatus {
-    /// `"pii_found"`, `"no_pii_in_scanned_files"` or `"not_scanned"`.
+    /// `"pii_found"`, `"no_pii_in_scanned_files"`, `"columns_not_examined"`
+    /// or `"not_scanned"`.
     #[must_use]
     pub fn code(self) -> &'static str {
         match self {
             Self::PiiFound => "pii_found",
             Self::NoPiiInScannedFiles => "no_pii_in_scanned_files",
+            Self::ColumnsNotExamined => "columns_not_examined",
             Self::NotScanned => "not_scanned",
         }
     }
+}
+
+/// A column not examined, in its table: one of the inventory's examples.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NotExaminedAt {
+    /// The table, cut to 1 KiB.
+    pub table: String,
+    /// The column and why.
+    pub column: NotExamined,
 }
 
 /// The inventory's headline counts, over the tables and entries held.
@@ -172,6 +200,8 @@ pub struct InventorySummary {
     /// Of those, the tables whose every unscanned file is documented (its
     /// `content-not-scanned` finding suppressed).
     pub tables_not_fully_scanned_documented: u64,
+    /// Tables with at least one column not examined in a scanned file.
+    pub tables_with_columns_not_examined: u64,
 }
 
 /// One `(table, column path, PII rule)` location and what was found there.
@@ -313,6 +343,11 @@ pub struct Table {
     /// The earliest and latest `last_modified` of the table's files,
     /// scanned or not.
     dates: Option<(SystemTime, SystemTime)>,
+    /// Columns not examined in scanned files, per reason (indexed by
+    /// [`NotExaminedReason::index`]), counted once per file.
+    not_examined: [u64; NUM_NOT_EXAMINED],
+    /// Scanned files with at least one column not examined.
+    files_with_columns_not_examined: u64,
     /// Sorted by `(column, rule)`.
     entries: Vec<InventoryEntry>,
 }
@@ -326,8 +361,31 @@ impl Table {
             files_scanned: 0,
             not_scanned: [[0; 2]; NUM_REASONS],
             dates: None,
+            not_examined: [0; NUM_NOT_EXAMINED],
+            files_with_columns_not_examined: 0,
             entries: Vec::new(),
         }
+    }
+
+    /// Columns not examined for `reason` in this table's scanned files,
+    /// counted once per file they appear in.
+    #[must_use]
+    pub fn not_examined(&self, reason: NotExaminedReason) -> u64 {
+        self.not_examined.get(reason.index()).copied().unwrap_or(0)
+    }
+
+    /// Columns not examined, for any reason, counted once per file.
+    #[must_use]
+    pub fn not_examined_total(&self) -> u64 {
+        self.not_examined
+            .iter()
+            .fold(0, |total, &n| total.saturating_add(n))
+    }
+
+    /// Scanned files with at least one column not examined.
+    #[must_use]
+    pub fn files_with_columns_not_examined(&self) -> u64 {
+        self.files_with_columns_not_examined
     }
 
     /// The `last_modified` of the table's oldest and newest Parquet files,
@@ -407,6 +465,8 @@ impl Table {
             TableStatus::PiiFound
         } else if self.files_scanned == 0 {
             TableStatus::NotScanned
+        } else if self.files_with_columns_not_examined > 0 {
+            TableStatus::ColumnsNotExamined
         } else {
             TableStatus::NoPiiInScannedFiles
         }
@@ -430,6 +490,13 @@ impl Table {
         let add = |total: &mut u64, n: u64| *total = total.saturating_add(n);
         add(&mut self.files_eligible, other.files_eligible);
         add(&mut self.files_scanned, other.files_scanned);
+        add(
+            &mut self.files_with_columns_not_examined,
+            other.files_with_columns_not_examined,
+        );
+        for (mine, theirs) in self.not_examined.iter_mut().zip(other.not_examined) {
+            add(mine, theirs);
+        }
         for (mine, theirs) in self.not_scanned.iter_mut().zip(other.not_scanned) {
             for (count, n) in mine.iter_mut().zip(theirs) {
                 add(count, n);
@@ -466,6 +533,12 @@ pub struct PiiInventory {
     max_entries: usize,
     left_out_files: u64,
     left_out_findings: u64,
+    /// The smallest columns not examined, sorted; at most
+    /// [`MAX_NOT_EXAMINED_EXAMPLES`].
+    not_examined: Vec<NotExaminedAt>,
+    /// Whether a distinct column not examined was left out of the
+    /// examples.
+    not_examined_left_out: bool,
 }
 
 impl Default for PiiInventory {
@@ -480,10 +553,16 @@ impl PiiInventory {
     /// column path). Entry lists grow by doubling from 4 and shrink when
     /// an entry is dropped, so a table of `n` entries reserves at most
     /// `max(4, 2n)` slots: `4 × MAX_TABLES + 2 × MAX_ENTRIES` in all.
+    ///
+    /// Plus the not-examined examples: a list that grows by doubling to at
+    /// most twice [`MAX_NOT_EXAMINED_EXAMPLES`] slots, each example with a
+    /// 1 KiB table name and a 256-byte column path.
     pub const MAX_BYTES: usize = size_of::<Self>()
         + MAX_TABLES * (size_of::<Table>() + 2 * MAX_NAME_BYTES)
         + (4 * MAX_TABLES + 2 * MAX_ENTRIES) * size_of::<InventoryEntry>()
-        + MAX_ENTRIES * MAX_COLUMN_BYTES;
+        + MAX_ENTRIES * MAX_COLUMN_BYTES
+        + 2 * MAX_NOT_EXAMINED_EXAMPLES * size_of::<NotExaminedAt>()
+        + MAX_NOT_EXAMINED_EXAMPLES * (MAX_NAME_BYTES + MAX_COLUMN_BYTES);
 
     /// An empty inventory holding at most `max_tables` tables and
     /// `max_entries` entries. Smaller caps than the defaults are for tests.
@@ -496,7 +575,32 @@ impl PiiInventory {
             max_entries,
             left_out_files: 0,
             left_out_findings: 0,
+            not_examined: Vec::new(),
+            not_examined_left_out: false,
         }
+    }
+
+    /// The columns not examined kept as examples, sorted by table, column
+    /// and reason: at most [`MAX_NOT_EXAMINED_EXAMPLES`].
+    #[must_use]
+    pub fn not_examined_examples(&self) -> &[NotExaminedAt] {
+        &self.not_examined
+    }
+
+    /// The examples kept for table `name`.
+    pub fn not_examined_in<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a NotExamined> {
+        self.not_examined
+            .iter()
+            .filter(move |at| at.table == name)
+            .map(|at| &at.column)
+    }
+
+    /// Whether a column not examined was left out of the examples (more
+    /// than [`MAX_NOT_EXAMINED_EXAMPLES`] distinct ones, or one in a table
+    /// left out over [`MAX_TABLES`]). The counts stay exact.
+    #[must_use]
+    pub fn not_examined_examples_truncated(&self) -> bool {
+        self.not_examined_left_out
     }
 
     /// The tables held, sorted by name.
@@ -530,6 +634,9 @@ impl PiiInventory {
         for table in &self.tables {
             if !table.entries.is_empty() {
                 summary.tables_with_pii += 1;
+            }
+            if table.files_with_columns_not_examined > 0 {
+                summary.tables_with_columns_not_examined += 1;
             }
             if table.files_not_scanned() > 0 {
                 summary.tables_not_fully_scanned += 1;
@@ -599,6 +706,43 @@ impl PiiInventory {
         }
     }
 
+    /// Records the columns not examined in the scanned file `key` (already
+    /// recorded with [`Self::observe_file`]): `counts` per reason, and
+    /// `examples`, the file's smallest.
+    pub(super) fn observe_not_examined(
+        &mut self,
+        key: &str,
+        counts: &[u64; NUM_NOT_EXAMINED],
+        examples: &[NotExamined],
+    ) {
+        if counts.iter().all(|&n| n == 0) {
+            return;
+        }
+        let name = truncate_str(table_of(key), MAX_NAME_BYTES);
+        let Ok(index) = self
+            .tables
+            .binary_search_by(|table| table.name.as_str().cmp(name))
+        else {
+            // The table was left out over the cap: so are its columns.
+            self.not_examined_left_out |= !examples.is_empty();
+            return;
+        };
+        if let Some(table) = self.tables.get_mut(index) {
+            for (total, &n) in table.not_examined.iter_mut().zip(counts) {
+                *total = total.saturating_add(n);
+            }
+            table.files_with_columns_not_examined =
+                table.files_with_columns_not_examined.saturating_add(1);
+        }
+        for column in examples {
+            let at = NotExaminedAt {
+                table: name.to_owned(),
+                column: column.clone(),
+            };
+            self.not_examined_left_out |= offer_not_examined(&mut self.not_examined, &at);
+        }
+    }
+
     /// Records one PII finding in the file `key`: suppressed by the entry
     /// at index `suppression`, or not.
     pub(super) fn observe_pii(
@@ -628,6 +772,10 @@ impl PiiInventory {
         self.left_out_findings = self
             .left_out_findings
             .saturating_add(other.left_out_findings);
+        self.not_examined_left_out |= other.not_examined_left_out;
+        for at in &other.not_examined {
+            self.not_examined_left_out |= offer_not_examined(&mut self.not_examined, at);
+        }
         for theirs in other.tables {
             let Some(table) = self.table_index(&theirs.name) else {
                 self.left_out_files = self.left_out_files.saturating_add(theirs.files_eligible);
@@ -655,6 +803,12 @@ impl PiiInventory {
     pub(super) fn heap_bytes(&self) -> usize {
         self.tables.capacity() * size_of::<Table>()
             + self.tables.iter().map(Table::heap_bytes).sum::<usize>()
+            + self.not_examined.capacity() * size_of::<NotExaminedAt>()
+            + self
+                .not_examined
+                .iter()
+                .map(|at| at.table.capacity() + at.column.column.capacity())
+                .sum::<usize>()
     }
 
     /// The index of table `name` (cut to 1 KiB), added if it is new and
@@ -679,6 +833,9 @@ impl PiiInventory {
             }
             // The evicted table sorts after `name`, so `at` still holds.
             if let Some(evicted) = self.tables.pop() {
+                let before = self.not_examined.len();
+                self.not_examined.retain(|at| at.table != evicted.name);
+                self.not_examined_left_out |= self.not_examined.len() < before;
                 self.entry_count = self.entry_count.saturating_sub(evicted.entries.len());
                 self.left_out_files = self.left_out_files.saturating_add(evicted.files_eligible);
                 self.left_out_findings = self.left_out_findings.saturating_add(evicted.findings());
@@ -754,7 +911,10 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use crate::content::FileOutcome;
-    use crate::model::{ColumnDetail, Confidence, Evidence, NotScannedReason, RuleId};
+    use crate::model::{
+        ColumnDetail, Confidence, Evidence, MAX_NOT_EXAMINED_EXAMPLES, NotExamined,
+        NotExaminedReason, NotScannedReason, RuleId,
+    };
 
     /// `days` after the epoch.
     fn at(days: u64) -> SystemTime {
@@ -1209,6 +1369,7 @@ mod tests {
                 tables_not_fully_scanned: 2,
                 // half's unscanned file is documented; dark's is not.
                 tables_not_fully_scanned_documented: 1,
+                tables_with_columns_not_examined: 0,
             }
         );
         // Review order: undocumented first, then documented, each by
@@ -1260,5 +1421,128 @@ mod tests {
             inventory.heap_bytes(),
             PiiInventory::MAX_BYTES
         );
+    }
+
+    fn not_examined(column: &str, reason: NotExaminedReason) -> NotExamined {
+        NotExamined::new(column, reason)
+    }
+
+    /// Counts per reason for `examples`, one each.
+    fn counts(examples: &[NotExamined]) -> [u64; NotExaminedReason::ALL.len()] {
+        let mut counts = [0; NotExaminedReason::ALL.len()];
+        for example in examples {
+            if let Some(count) = counts.get_mut(example.reason.index()) {
+                *count += 1;
+            }
+        }
+        counts
+    }
+
+    /// The experiment's FHIR practitioners, before M12: every column that
+    /// could hold PII was skipped, and the table read "no PII detected".
+    /// Now it says the columns were not examined, and which.
+    #[test]
+    fn a_table_with_columns_not_examined_is_never_clean() {
+        let mut inventory = PiiInventory::default();
+        let skipped = [
+            not_examined("telecom.value", NotExaminedReason::PageTooLarge),
+            not_examined("phone_number", NotExaminedReason::UnsupportedType),
+        ];
+        for key in ["fhir/practitioner/a.parquet", "fhir/practitioner/b.parquet"] {
+            inventory.observe_file(key, FileOutcome::ScannedWhole, false, at(0));
+            inventory.observe_not_examined(key, &counts(&skipped), &skipped);
+        }
+        inventory.observe_file("clean/a.parquet", FileOutcome::ScannedWhole, false, at(0));
+        inventory.observe_not_examined("clean/a.parquet", &counts(&[]), &[]);
+        let status: Vec<(&str, TableStatus)> = inventory
+            .tables()
+            .iter()
+            .map(|table| (table.name(), table.status()))
+            .collect();
+        assert_eq!(
+            status,
+            [
+                ("clean", TableStatus::NoPiiInScannedFiles),
+                ("fhir/practitioner", TableStatus::ColumnsNotExamined),
+            ]
+        );
+        let table = inventory.tables().last().ok_or(()).cloned();
+        let table = table.unwrap_or_else(|()| Table::new("missing"));
+        assert_eq!(table.not_examined_total(), 4);
+        assert_eq!(table.not_examined(NotExaminedReason::PageTooLarge), 2);
+        assert_eq!(table.files_with_columns_not_examined(), 2);
+        assert_eq!(
+            TableStatus::ColumnsNotExamined.code(),
+            "columns_not_examined"
+        );
+        // Examples are distinct columns, sorted.
+        let examples: Vec<&str> = inventory
+            .not_examined_in("fhir/practitioner")
+            .map(|example| example.column.as_str())
+            .collect();
+        assert_eq!(examples, ["phone_number", "telecom.value"]);
+        assert!(!inventory.not_examined_examples_truncated());
+        assert_eq!(inventory.summary().tables_with_columns_not_examined, 1);
+        // PII found elsewhere in the table wins the status, and the
+        // columns not examined stay listed.
+        let detail = detail("email", Confidence::Confirmed);
+        inventory.observe_pii(
+            "fhir/practitioner/a.parquet",
+            RuleId::PiiEmail,
+            &detail,
+            None,
+        );
+        let table = inventory.tables().last().map(Table::status);
+        assert_eq!(table, Some(TableStatus::PiiFound));
+        assert_eq!(inventory.not_examined_in("fhir/practitioner").count(), 2);
+    }
+
+    /// The examples are the smallest across the inventory, the same in any
+    /// order and however inventories are merged; leaving any out is
+    /// recorded, and the counts stay exact.
+    #[test]
+    fn not_examined_examples_are_the_smallest_in_any_order() {
+        let n = MAX_NOT_EXAMINED_EXAMPLES + 10;
+        let files: Vec<(String, Vec<NotExamined>)> = (0..n)
+            .map(|i| {
+                (
+                    format!("t{:03}/f.parquet", i % 7),
+                    vec![not_examined(
+                        &format!("c{i:03}"),
+                        NotExaminedReason::Unreadable,
+                    )],
+                )
+            })
+            .collect();
+        let observe = |inventory: &mut PiiInventory, files: &[(String, Vec<NotExamined>)]| {
+            for (key, examples) in files {
+                inventory.observe_file(key, FileOutcome::ScannedWhole, false, at(0));
+                inventory.observe_not_examined(key, &counts(examples), examples);
+            }
+        };
+        let mut forward = PiiInventory::default();
+        observe(&mut forward, &files);
+        let mut backward = PiiInventory::default();
+        let reversed: Vec<_> = files.iter().rev().cloned().collect();
+        observe(&mut backward, &reversed);
+        let (first, second) = files.split_at(n / 2);
+        let (mut left, mut right) = (PiiInventory::default(), PiiInventory::default());
+        observe(&mut left, first);
+        observe(&mut right, second);
+        right.merge(left);
+        for inventory in [&backward, &right] {
+            assert_eq!(
+                inventory.not_examined_examples(),
+                forward.not_examined_examples()
+            );
+            assert!(inventory.not_examined_examples_truncated());
+        }
+        assert_eq!(
+            forward.not_examined_examples().len(),
+            MAX_NOT_EXAMINED_EXAMPLES
+        );
+        let total: u64 = forward.tables().iter().map(Table::not_examined_total).sum();
+        assert_eq!(total, u64::try_from(n).unwrap_or(0));
+        assert!(forward.heap_bytes() <= PiiInventory::MAX_BYTES);
     }
 }

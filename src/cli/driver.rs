@@ -498,6 +498,7 @@ impl Window {
                 let scan = (&mut task.0).await.unwrap_or_else(|_| FileScan {
                     outcome: FileOutcome::NotScanned(NotScannedReason::Unreadable),
                     columns: Vec::new(),
+                    not_examined: Vec::new(),
                     stats: content::FileStats::default(),
                 });
                 self.scanning -= 1;
@@ -1365,6 +1366,7 @@ mod tests {
         let scan = |reason| crate::content::FileScan {
             outcome: crate::content::FileOutcome::NotScanned(reason),
             columns: Vec::new(),
+            not_examined: Vec::new(),
             stats: crate::content::FileStats::default(),
         };
         let file = object("t/a.parquet", 10, StorageClass::Standard);
@@ -1460,6 +1462,19 @@ mod tests {
                 "not_scanned_suppressed": 1,
                 "not_scanned_unsuppressed": 0,
                 "percent": 66.6,
+                "columns_not_examined": {
+                    "total": 0,
+                    "files": 0,
+                    "tables": 0,
+                    "by_reason": {
+                        "unsupported-type": 0,
+                        "page-too-large": 0,
+                        "unreadable": 0,
+                        "unsupported-codec": 0
+                    },
+                    "examples": [],
+                    "examples_truncated": false
+                },
                 "out_of_scope": {
                     "objects": 0,
                     "by_extension": [],
@@ -1528,7 +1543,7 @@ reason = "Consented contacts, see DPA-12"
             Some(
                 "table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,\
                  files_possible,files_suppressed,status,reason,example_key,oldest_file,\
-                 newest_file,expires"
+                 newest_file,expires,not_examined_reason"
                     .to_owned()
             )
         );
@@ -1558,6 +1573,7 @@ reason = "Consented contacts, see DPA-12"
                 "lake/crm/dt=2026-01-01/a.parquet",
                 "2024-10-04T00:00:00Z",
                 "2024-10-04T00:00:00Z",
+                "",
                 ""
             ]
         );
@@ -1626,8 +1642,11 @@ reason = "Never matches"
     }
 
     /// The no-values guarantee: seed known personal data into files, run
-    /// every output (text and JSON summaries, the findings stream,
-    /// warnings, errors) and check none of it appears anywhere.
+    /// every output (text and JSON summaries, the findings stream, the
+    /// inventory CSV, the HTML report, warnings, errors) and check none of
+    /// it appears anywhere: not from flat columns, not from a repeated one
+    /// (read since M12), not from one that could not be examined (a phone
+    /// stored as a double), whose state every output reports instead.
     #[tokio::test]
     async fn no_sampled_value_reaches_any_output() -> Result<(), Box<dyn std::error::Error>> {
         let rows = 300;
@@ -1637,6 +1656,19 @@ reason = "Never matches"
         let names: Vec<Option<String>> = (0..rows)
             .map(|i| Some(format!("Seeded Person {i:03}")))
             .collect();
+        let listed: Vec<Vec<String>> = (0..rows)
+            .map(|i| vec![format!("listed.{i}@mail.example")])
+            .collect();
+        let home_phones: Vec<f64> = (0..rows)
+            .map(|i| 9_123_000_000.0 + f64::from(u32::try_from(i).unwrap_or(0)))
+            .collect();
+        let unchecked = parquet_file(
+            &[
+                ("contact_emails", Values::List(listed.clone())),
+                ("home_phone", Values::Double(home_phones.clone())),
+            ],
+            Layout::default(),
+        )?;
         let body = parquet_file(
             &[
                 ("email", Values::Text(seeded_emails.clone())),
@@ -1653,6 +1685,8 @@ reason = "Never matches"
         values.extend(seeded_phones.into_iter().flatten().map(|n| n.to_string()));
         values.extend(seeded_aadhaar.into_iter().flatten().map(|n| n.to_string()));
         values.extend(names.into_iter().flatten());
+        values.extend(listed.into_iter().flatten());
+        values.extend(home_phones.iter().map(f64::to_string));
 
         let config = Config::parse(
             "version = 1\n[[suppress]]\nrule = \"pii-phone\"\nprefix = \"zzz/\"\n\
@@ -1663,6 +1697,7 @@ reason = "Never matches"
             ("pii/a.parquet", body.clone()),
             ("pii/b.parquet", body),
             ("pii/broken.parquet", b"PAR1 truncated".to_vec()),
+            ("unchecked/a.parquet", unchecked),
         ];
         let mut outputs = String::new();
         for (format, whole_file_max) in [(Format::Text, 8 * 1024 * 1024), (Format::Json, 0)] {
@@ -1682,6 +1717,20 @@ reason = "Never matches"
             }
         }
         assert!(outputs.contains("mobile_no"), "the outputs were produced");
+        // The repeated column was read and found; the double is reported
+        // as not examined, in every format.
+        assert!(outputs.contains("contact_emails.list.element"));
+        for state in [
+            "columns not examined: 1 in 1 file (unsupported-type=1)",
+            "\"columns_not_examined\"",
+            "NOT_EXAMINED",
+            "<li><span class=\"key\">home_phone</span>",
+        ] {
+            assert!(
+                outputs.contains(state),
+                "{state:?} missing from the outputs"
+            );
+        }
         for value in &values {
             assert!(
                 !outputs.contains(value.as_str()),

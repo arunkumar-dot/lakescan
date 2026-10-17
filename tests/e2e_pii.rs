@@ -262,10 +262,22 @@ fn every_writer_s_pii_is_found_at_the_expected_confidence() -> TestResult {
     assert_eq!(pii_found(&run), expected_lake());
     assert_eq!(content_u64(&run, "files_eligible")?, 8);
     assert_eq!(content_u64(&run, "scanned_whole")?, 8);
-    // One repeated column (tags) per customers file, and nothing else
-    // skipped but the one double (amount) in each.
-    assert_eq!(content_u64(&run, "columns_skipped/repeated")?, 7);
+    // The repeated column (tags) in each customers file is read since
+    // M12; nothing is skipped but the one double (amount) in each, whose
+    // name hints nothing, so no column is left unexamined.
+    assert_eq!(content_u64(&run, "columns_skipped/repeated")?, 0);
     assert_eq!(content_u64(&run, "columns_skipped/unsupported_type")?, 8);
+    for reason in [
+        "unsupported-type",
+        "page-too-large",
+        "unreadable",
+        "unsupported-codec",
+    ] {
+        assert_eq!(
+            content_u64(&run, &format!("columns_not_examined/{reason}"))?,
+            0
+        );
+    }
     for reason in ["page_too_large", "unreadable", "unsupported_codec"] {
         assert_eq!(content_u64(&run, &format!("columns_skipped/{reason}"))?, 0);
     }
@@ -369,7 +381,8 @@ fn the_inventory_groups_partitioned_files_into_tables() -> TestResult {
             "undocumented_possible": 0,
             "documented": 0,
             "tables_not_fully_scanned": 0,
-            "tables_not_fully_scanned_documented": 0
+            "tables_not_fully_scanned_documented": 0,
+            "tables_with_columns_not_examined": 0
         }))
     );
     assert!(tables.iter().all(|t| text(t, "status") == "pii_found"));
@@ -550,6 +563,21 @@ fn a_mixed_lake_fails_closed_until_its_unscannable_files_are_documented() -> Tes
             "not_scanned_suppressed": 0,
             "not_scanned_unsuppressed": 3,
             "percent": 72.7,
+            // The fully skipped file is not scanned, so its column counts
+            // there, not here.
+            "columns_not_examined": {
+                "total": 0,
+                "files": 0,
+                "tables": 0,
+                "by_reason": {
+                    "unsupported-type": 0,
+                    "page-too-large": 0,
+                    "unreadable": 0,
+                    "unsupported-codec": 0
+                },
+                "examples": [],
+                "examples_truncated": false
+            },
             "out_of_scope": {
                 "objects": 0,
                 "by_extension": [],
@@ -628,7 +656,7 @@ fn inventory_csv_rows(rows: &[Vec<String>]) {
         Some(
             "table,column,rule,highest_confidence,evidence,files_confirmed,files_likely,\
              files_possible,files_suppressed,status,reason,example_key,oldest_file,\
-             newest_file,expires"
+             newest_file,expires,not_examined_reason"
         )
     );
     let row = |table: &str, column: &str| {

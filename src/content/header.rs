@@ -10,9 +10,9 @@
 //!
 //! This reads only the Thrift compact protocol (the format of every Parquet
 //! header) far enough to get a few numbers: the page type, the uncompressed
-//! and compressed sizes, for a dictionary page its value count, and for a
-//! v2 data page the length of its (never compressed) levels and whether its
-//! values are compressed. It also returns the header's length, so the next
+//! and compressed sizes, for a dictionary page its value count, for a data
+//! page (v1 or v2) its value count, and for a v2 data page the length of
+//! its (never compressed) levels and whether its values are compressed. It also returns the header's length, so the next
 //! page can be located. Every other field is skipped generically. It
 //! decodes no values: that remains the `parquet` crate's job.
 //!
@@ -31,6 +31,10 @@ pub(super) struct PageHeader {
     pub(super) compressed: u64,
     /// A dictionary page's value count; 0 for any other page.
     pub(super) dictionary_values: u64,
+    /// A data page's (v1 or v2) `num_values`, nulls and list entries
+    /// included; 0 for any other page, or if the data page header is
+    /// missing (`parquet` then refuses the page).
+    pub(super) data_values: u64,
     /// A v2 data page's definition and repetition level bytes, which
     /// precede its values and are never compressed; 0 for any other page.
     pub(super) levels: u64,
@@ -208,15 +212,20 @@ impl Cursor<'_> {
         Ok(())
     }
 
-    /// A `DataPageHeaderV2`'s level byte lengths (fields 5 and 6, summed)
-    /// and `is_compressed` (field 7, default true); the rest skipped.
-    fn v2(&mut self) -> Result<(u64, bool), Stop> {
+    /// A `DataPageHeaderV2`'s `num_values` (field 1), level byte lengths
+    /// (fields 5 and 6, summed) and `is_compressed` (field 7, default
+    /// true); the rest skipped.
+    fn v2(&mut self) -> Result<(u64, u64, bool), Stop> {
+        let mut values = None;
         let mut definition = None;
         let mut repetition = None;
         let mut compressed = None;
         let mut last = 0;
         while let Some((id, kind)) = self.field(last)? {
             match (id, kind) {
+                (1, I32) if values.is_none() => {
+                    values = Some(u64::try_from(self.i32()?).map_err(|_| Stop::Invalid)?);
+                }
                 (5 | 6, I32) => {
                     let slot = if id == 5 {
                         &mut definition
@@ -231,7 +240,7 @@ impl Cursor<'_> {
                 (7, BOOL_TRUE | BOOL_FALSE) if compressed.is_none() => {
                     compressed = Some(kind == BOOL_TRUE);
                 }
-                (5..=7, _) => return Err(Stop::Invalid),
+                (1 | 5..=7, _) => return Err(Stop::Invalid),
                 _ => self.skip_value(kind, 1)?,
             }
             last = id;
@@ -239,7 +248,28 @@ impl Cursor<'_> {
         let (Some(definition), Some(repetition)) = (definition, repetition) else {
             return Err(Stop::Invalid);
         };
-        Ok((definition + repetition, compressed.unwrap_or(true)))
+        Ok((
+            values.unwrap_or(0),
+            definition + repetition,
+            compressed.unwrap_or(true),
+        ))
+    }
+
+    /// A `DataPageHeader`'s `num_values` (field 1); the rest skipped.
+    fn data_page_values(&mut self) -> Result<u64, Stop> {
+        let mut values = None;
+        let mut last = 0;
+        while let Some((id, kind)) = self.field(last)? {
+            if id == 1 && kind == I32 && values.is_none() {
+                values = Some(u64::try_from(self.i32()?).map_err(|_| Stop::Invalid)?);
+            } else if id == 1 {
+                return Err(Stop::Invalid);
+            } else {
+                self.skip_value(kind, 1)?;
+            }
+            last = id;
+        }
+        Ok(values.unwrap_or(0))
     }
 
     /// A `DictionaryPageHeader`'s `num_values` (field 1); the rest skipped.
@@ -275,6 +305,7 @@ fn header(cursor: &mut Cursor<'_>) -> Result<PageHeader, Stop> {
     let mut uncompressed = None;
     let mut compressed = None;
     let mut dictionary_values = None;
+    let mut data_values = None;
     let mut v2 = None;
     let mut last = 0;
     while let Some((id, field_kind)) = cursor.field(last)? {
@@ -296,6 +327,12 @@ fn header(cursor: &mut Cursor<'_>) -> Result<PageHeader, Stop> {
                 }
                 dictionary_values = Some(cursor.dictionary_values()?);
             }
+            None if id == 5 && field_kind == STRUCT => {
+                if data_values.is_some() {
+                    return Err(Stop::Invalid);
+                }
+                data_values = Some(cursor.data_page_values()?);
+            }
             None if id == 8 && field_kind == STRUCT => {
                 if v2.is_some() {
                     return Err(Stop::Invalid);
@@ -315,16 +352,22 @@ fn header(cursor: &mut Cursor<'_>) -> Result<PageHeader, Stop> {
     if kind == DICTIONARY_PAGE && dictionary_values.is_none() {
         return Err(Stop::Invalid);
     }
-    let (levels, values_compressed) = match v2 {
+    let (v2_values, levels, values_compressed) = match v2 {
         Some(v2) if kind == DATA_PAGE_V2 => v2,
-        None if kind != DATA_PAGE_V2 => (0, true),
+        None if kind != DATA_PAGE_V2 => (0, 0, true),
         _ => return Err(Stop::Invalid),
+    };
+    let data_values = match kind {
+        DATA_PAGE => data_values.unwrap_or(0),
+        DATA_PAGE_V2 => v2_values,
+        _ => 0,
     };
     Ok(PageHeader {
         kind,
         uncompressed: size(uncompressed)?,
         compressed: size(compressed)?,
         dictionary_values: dictionary_values.unwrap_or(0),
+        data_values,
         levels,
         values_compressed,
         len: cursor.pos,
@@ -462,6 +505,7 @@ pub(crate) mod tests {
                 unreachable!("not a header: {:?}", read(&bytes));
             };
             assert_eq!(header.levels, 10);
+            assert_eq!(header.data_values, 5);
             assert_eq!(header.values_compressed, expected);
         }
         // A v2 page without its v2 header, or a v1 page with one, is not
@@ -660,6 +704,7 @@ pub(crate) mod tests {
                 uncompressed: 1000,
                 compressed: 400,
                 dictionary_values: 0,
+                data_values: 1,
                 levels: 0,
                 values_compressed: true,
                 len: bytes.len(),

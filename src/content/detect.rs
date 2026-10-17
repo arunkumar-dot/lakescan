@@ -40,6 +40,16 @@ static PAN: LazyLock<Option<Regex>> =
 static E164: LazyLock<Option<Regex>> = LazyLock::new(|| pattern(r"^\+[1-9][0-9]{7,14}$"));
 static INDIAN_MOBILE: LazyLock<Option<Regex>> =
     LazyLock::new(|| pattern(r"^(?:\+?91|0)?[6-9][0-9]{9}$"));
+/// The North American Numbering Plan: an optional country code 1, an area
+/// code and an exchange that do not start with 0 or 1, four digits.
+static NANP: LazyLock<Option<Regex>> = LazyLock::new(|| pattern(r"^1?[2-9][0-9]{2}[2-9][0-9]{6}$"));
+/// A national number with a trunk prefix 0, as the UK and most of Europe
+/// write them: 9 to 11 digits in all (`020 7946 0123`, `01 23 45 67 89`,
+/// `030 1234567`).
+static NATIONAL_TRUNK: LazyLock<Option<Regex>> = LazyLock::new(|| pattern(r"^0[1-9][0-9]{7,9}$"));
+/// An international number dialled with `00` instead of `+`.
+static INTERNATIONAL_00: LazyLock<Option<Regex>> =
+    LazyLock::new(|| pattern(r"^00[1-9][0-9]{7,13}$"));
 
 fn matches(regex: &LazyLock<Option<Regex>>, value: &str) -> bool {
     regex.as_ref().is_some_and(|regex| regex.is_match(value))
@@ -53,13 +63,7 @@ pub(super) fn validates(pii: PiiType, value: &str) -> bool {
         // PAN letters are uppercase by definition; lowercase is the same
         // number typed carelessly.
         PiiType::InPan => matches(&PAN, &value.to_ascii_uppercase()),
-        PiiType::Phone => {
-            let compact: String = value
-                .chars()
-                .filter(|c| !matches!(c, ' ' | '-' | '(' | ')' | '.'))
-                .collect();
-            matches(&E164, &compact) || matches(&INDIAN_MOBILE, &compact)
-        }
+        PiiType::Phone => phone(value),
         PiiType::InAadhaar => {
             let digits = digits_without(value, &[' ']);
             digits.len() == 12 && digits.first().is_some_and(|&d| d >= 2) && verhoeff_valid(&digits)
@@ -71,6 +75,37 @@ pub(super) fn validates(pii: PiiType, value: &str) -> bool {
         PiiType::IpAddress => value.parse::<IpAddr>().is_ok(),
         PiiType::PersonName | PiiType::DateOfBirth => false,
     }
+}
+
+/// Whether `value` is a phone number: E.164 (`+` and 8 to 15 digits), an
+/// Indian mobile number, or, written with separators as people write
+/// them, a North American number (`(201) 555-0123`, `+1 201 555 0123`),
+/// a national number with a trunk 0 (UK, EU: `020 7946 0123`), or an
+/// international number dialled with `00`. Separators are spaces, `-`,
+/// `.`, `/` and parentheses. A bare run of digits is a phone only as an
+/// Indian mobile: as a NANP or national number it is as likely an
+/// identifier (`2015550123` is also an account number). Even then
+/// `classify` counts it only under a phone or contact name (see
+/// [`bare_digits`]).
+fn phone(value: &str) -> bool {
+    let compact: String = value
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '(' | ')' | '.' | '/'))
+        .collect();
+    if matches(&E164, &compact) || matches(&INDIAN_MOBILE, &compact) {
+        return true;
+    }
+    let separated = compact.len() < value.len();
+    separated
+        && (matches(&NANP, &compact)
+            || matches(&NATIONAL_TRUNK, &compact)
+            || matches(&INTERNATIONAL_00, &compact))
+}
+
+/// Whether `value` is a bare digit run: ASCII digits only, no `+` and no
+/// separators. As a phone it is as likely an identifier (see `classify`).
+pub(super) fn bare_digits(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// The digit values of `value` with every `separators` character removed,
@@ -154,12 +189,23 @@ fn luhn_valid(digits: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{E164, EMAIL, INDIAN_MOBILE, PAN, VALUE_TYPES, validates};
+    use super::{
+        E164, EMAIL, INDIAN_MOBILE, INTERNATIONAL_00, NANP, NATIONAL_TRUNK, PAN, VALUE_TYPES,
+        validates,
+    };
     use crate::model::PiiType;
 
     #[test]
     fn every_pattern_compiles() {
-        for regex in [&EMAIL, &PAN, &E164, &INDIAN_MOBILE] {
+        for regex in [
+            &EMAIL,
+            &PAN,
+            &E164,
+            &INDIAN_MOBILE,
+            &NANP,
+            &NATIONAL_TRUNK,
+            &INTERNATIONAL_00,
+        ] {
             assert!(regex.is_some());
         }
     }
@@ -206,6 +252,62 @@ mod tests {
             "+0123456789",
             "phone",
             "12345678901234567",
+        ] {
+            assert!(!validates(PiiType::Phone, bad), "{bad}");
+        }
+    }
+
+    /// National formats, with reserved numbers only: the NANP's fictional
+    /// 555-0100 to 555-0199, Ofcom's drama ranges (020 7946 0xxx, 07700
+    /// 900xxx), and the like-shaped French and German examples.
+    #[test]
+    fn phone_national_formats() {
+        for good in [
+            // US and Canada (NANP).
+            "(201) 555-0123",
+            "201-555-0142",
+            "201.555.0187",
+            "201 555 0199",
+            "1-201-555-0100",
+            "+1 201 555 0150",
+            "+1 (201) 555-0161",
+            // The experiment's FHIR patients: `555-xxx-xxxx`, area 555.
+            "555-234-0100",
+            // UK.
+            "020 7946 0123",
+            "07700 900123",
+            "+44 7700 900123",
+            "0044 20 7946 0123",
+            // EU groupings.
+            "01 23 45 67 89",
+            "+33 1 23 45 67 89",
+            "030 1234567",
+            "030/1234567",
+            "+49 30 1234567",
+            "020-123 4567",
+            "06 1234 5678",
+        ] {
+            assert!(validates(PiiType::Phone, good), "{good}");
+        }
+        for bad in [
+            // Bare digits: as likely identifiers.
+            "2015550123",
+            "02079460123",
+            "0012345678",
+            // NANP area codes and exchanges never start with 0 or 1.
+            "(101) 555-0123",
+            "201-155-0123",
+            // Dates, postcodes, SSNs, card numbers, versions, addresses.
+            "2026-01-15",
+            "15/01/2026",
+            "01.02.2026",
+            "94105-1234",
+            "123-45-6789",
+            "4111 1111 1111 1111",
+            "10.0.0.123",
+            "1.2.3",
+            "(201) 555-012",
+            "201-555-01234",
         ] {
             assert!(!validates(PiiType::Phone, bad), "{bad}");
         }

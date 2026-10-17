@@ -34,7 +34,7 @@ Round 2 (messy synthetic data; pyarrow, Polars, DuckDB, Spark): passed both pre-
 - Validation on real data, which only early users can provide.
 
 ## Status
-M0-M11: metadata pipeline, structured-PII scanning of Parquet (opt-in with --pii, GZIP and Brotli included), a per-table PII inventory with fail-closed coverage, concurrent, memory-budgeted, coalesced content scanning (measured on a simulated S3 latency model), and a self-contained HTML report (M10), plus release builds and a frozen JSON schema (v0.1.0). M11.1 makes coverage honest (sampled, not scanned, out of scope, inventory truncated) and ships the launch README. Next: launch.
+M0-M11: metadata pipeline, structured-PII scanning of Parquet (opt-in with --pii, GZIP and Brotli included), a per-table PII inventory with fail-closed coverage, concurrent, memory-budgeted, coalesced content scanning (measured on a simulated S3 latency model), and a self-contained HTML report (M10), plus release builds and a frozen JSON schema (v0.1.0). M11.1 makes coverage honest (sampled, not scanned, out of scope, inventory truncated) and ships the launch README. M12 fixes the detection gaps real public datasets exposed (name and date-of-birth hints, national phone formats, repeated columns, real-world placeholders) and reports columns that could not be examined (docs/experiments/real-data.md). Next: launch.
 
 ## Roadmap after v0.1.0
 - Explicit table roots in config, and later catalog integration.

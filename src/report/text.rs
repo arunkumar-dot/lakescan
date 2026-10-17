@@ -31,7 +31,9 @@ use crate::aggregate::{
     Aggregates, InventoryEntry, MAX_ENTRIES, MAX_TABLES, Sample, SampleDetail, Table, TableStatus,
 };
 use crate::error::LakeScanError;
-use crate::model::{Evidence, NotScannedReason, RuleId, Severity};
+use crate::model::{
+    Evidence, MAX_NOT_EXAMINED_EXAMPLES, NotExaminedReason, NotScannedReason, RuleId, Severity,
+};
 use crate::suppress::{Entry, Pattern};
 
 /// `write!`/`writeln!` to `out`, mapping any I/O error to
@@ -166,6 +168,47 @@ pub(super) fn no_pii_line(table: &Table) -> String {
         line.push_str(" not scanned");
     }
     line
+}
+
+/// "No structured PII detected in the columns examined from 3 files; PII
+/// unknown in the columns not examined", plus how many files were not
+/// scanned, for a table with columns that could not be checked.
+pub(super) fn not_examined_status_line(table: &Table) -> String {
+    let mut line = format!(
+        "No structured PII detected in the columns examined from {}; \
+         PII unknown in the columns not examined",
+        files(table.files_scanned)
+    );
+    if table.files_not_scanned() > 0 {
+        line.push_str("; ");
+        line.push_str(&table.files_not_scanned().to_string());
+        line.push_str(" not scanned");
+    }
+    line
+}
+
+/// `"unsupported-type=1, page-too-large=2"`: the non-zero counts of
+/// `count`, by reason.
+pub(super) fn not_examined_reasons(count: impl Fn(NotExaminedReason) -> u64) -> String {
+    NotExaminedReason::ALL
+        .into_iter()
+        .filter(|&reason| count(reason) > 0)
+        .map(|reason| format!("{}={}", reason.code(), count(reason)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// "columns not examined: 3 in 2 files (unsupported-type=1,
+/// page-too-large=2)" for a table with any; the examples follow it.
+pub(super) fn not_examined_heading(table: &Table) -> Option<String> {
+    (table.not_examined_total() > 0).then(|| {
+        format!(
+            "columns not examined: {} in {} ({})",
+            table.not_examined_total(),
+            files(table.files_with_columns_not_examined()),
+            not_examined_reasons(|reason| table.not_examined(reason))
+        )
+    })
 }
 
 /// "files dated 2019-03-02 to 2026-10-10" for a table with files.
@@ -376,6 +419,28 @@ fn write_coverage<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), 
         coverage.not_scanned_unsuppressed
     )?;
     wl!(out, "  inspection:     {SAMPLING_METHOD}")?;
+    if let (Some(content), Some(inventory)) = (aggregates.content(), aggregates.pii_inventory()) {
+        let total = content.not_examined_total();
+        w!(
+            out,
+            "  columns not examined: {} in {} of {}",
+            grouped(total),
+            files(content.files_with_columns_not_examined),
+            counted(
+                inventory.summary().tables_with_columns_not_examined,
+                "table",
+                "tables"
+            )
+        )?;
+        if total > 0 {
+            w!(
+                out,
+                " ({}; PII unknown in them)",
+                not_examined_reasons(|reason| content.not_examined(reason))
+            )?;
+        }
+        wl_empty!(out)?;
+    }
     if let Some(scope) = aggregates.out_of_scope() {
         match out_of_scope_line(scope) {
             Some(line) => {
@@ -538,12 +603,13 @@ fn write_pii_inventory<W: Write>(
     wl!(
         out,
         "  {} with PII, {}: {}, {} documented.{action} {} with files not \
-         scanned{gaps}.",
+         scanned{gaps}, {} with columns not examined.",
         counted(summary.tables_with_pii, "table", "tables"),
         counted(summary.pii_columns, "PII column", "PII columns"),
         undocumented_split(&summary),
         summary.documented,
         counted(summary.tables_not_fully_scanned, "table", "tables"),
+        summary.tables_with_columns_not_examined,
     )?;
     wl!(
         out,
@@ -561,11 +627,29 @@ fn write_pii_inventory<W: Write>(
                     write_entry_row(out, info, entry)?;
                 }
             }
-            // Never "no PII" about files that were not read, nor about
-            // more than was sampled.
+            // Never "no PII" about files that were not read, columns that
+            // were not examined, or more than was sampled.
             TableStatus::NoPiiInScannedFiles => wl!(out, "    {}", no_pii_line(table))?,
+            TableStatus::ColumnsNotExamined => {
+                wl!(out, "    {}", not_examined_status_line(table))?;
+            }
             TableStatus::NotScanned => wl!(out, "    not scanned: PII unknown")?,
         }
+        if let Some(heading) = not_examined_heading(table) {
+            wl!(out, "    {heading}")?;
+            for example in inventory.not_examined_in(table.name()) {
+                w!(out, "      ")?;
+                write_escaped(out, &example.column).map_err(LakeScanError::Report)?;
+                wl!(out, "  {}", example.reason.code())?;
+            }
+        }
+    }
+    if inventory.not_examined_examples_truncated() {
+        wl!(
+            out,
+            "  columns not examined: only the first {MAX_NOT_EXAMINED_EXAMPLES} are listed \
+             (by table, column and reason); the counts include every one"
+        )?;
     }
     if inventory.truncated() {
         wl!(
@@ -855,10 +939,22 @@ mod tests {
                     None => aggregates.observe_finding(finding),
                 }
             }
+            // A file under `unchecked/` has a phone stored as a double, under
+            // a hostile name: not examined.
+            let mut stats = crate::content::FileStats::default();
+            let mut not_examined = Vec::new();
+            if key.starts_with("unchecked/") {
+                let reason = crate::model::NotExaminedReason::UnsupportedType;
+                if let Some(count) = stats.not_examined.get_mut(reason.index()) {
+                    *count = 1;
+                }
+                not_examined.push(crate::model::NotExamined::new("\u{1b}[31mphone", reason));
+            }
             let scan = crate::content::FileScan {
                 outcome: *outcome,
                 columns: Vec::new(),
-                stats: crate::content::FileStats::default(),
+                not_examined,
+                stats,
             };
             aggregates.observe_content(&object, &scan, *suppressed);
         }
@@ -883,6 +979,10 @@ mod tests {
             ("half/c.parquet", NotScanned(Unreadable), true, &[]),
             // All read, nothing found.
             ("clean/a.parquet", ScannedWhole, false, &[]),
+            // Read, nothing found, but a column could not be examined:
+            // never "no PII".
+            ("unchecked/a.parquet", ScannedWhole, false, &[]),
+            ("unchecked/b.parquet", ScannedWhole, false, &[]),
             // PII, documented and not, with mixed confidences.
             (
                 "pii/a.parquet",
@@ -910,7 +1010,7 @@ mod tests {
             "PII INVENTORY\n\
              \x20 1 table with PII, 3 PII columns: 2 undocumented (1 confirmed, 1 likely, 0 \
              possible), 1 documented. Action needed on the undocumented. 2 tables with files not \
-             scanned (1 documented).\n\
+             scanned (1 documented), 1 with columns not examined.\n\
              \x20 Tables are inferred from object paths. Documented means your team recorded a \
              reason: an operational exception, not a compliance approval.\n\
              \x20 clean  files: 1 scanned, 0 not scanned; files dated 2023-11-14 to 2023-11-14\n\
@@ -929,6 +1029,12 @@ mod tests {
              UNDOCUMENTED\n\
              \x20   email  pii-email  confirmed  evidence=values  2 files, documented \
              until 2024-06-30: Consented, DPA-12\n\
+             \x20 unchecked  files: 2 scanned, 0 not scanned; files dated 2023-11-14 to \
+             2023-11-14\n\
+             \x20   No structured PII detected in the columns examined from 2 files; PII unknown \
+             in the columns not examined\n\
+             \x20   columns not examined: 2 in 2 files (unsupported-type=2)\n\
+             \x20     \\u{001b}[31mphone  unsupported-type\n\
              \n"
         );
         Ok(())

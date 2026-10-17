@@ -38,12 +38,14 @@ ROWS = 12_000
 ROW_GROUP = 4_000
 FIRST = "Aarav Aditi Arjun Bhavna Chetan Deepa Farhan Gaurav Ishaan Jaya Karan Kavya Meera Neha Priya Rahul Sneha Varun Alice Daniel Emma Grace Henry Liam Mia Noah Olivia Sofia Yuki Wei".split()
 LAST = "Sharma Verma Gupta Singh Patel Shah Mehta Iyer Nair Reddy Rao Menon Kulkarni Patil Smith Brown Garcia Miller Davis Lee Kim Chen Tanaka Wang".split()
-# Reserved values only (RFC 2606 / RFC 6761 domains, RFC 5737 and RFC 3849
-# address ranges, the NANP's fictional 555-0100 to 555-0199 numbers, and the
+# Reserved values only (names under the RFC 2606 `.example` TLD, RFC 5737
+# and RFC 3849 address ranges, the NANP's fictional 555-0100 to 555-0199 numbers, and the
 # card networks' published test numbers), so no fixture value can belong to
 # a real person. Aadhaar, PAN and Indian mobile numbers have no reserved
-# ranges: those are synthetic and random.
-DOMAINS = "example.com example.org example.net mail.test acme.test fintech.test".split()
+# ranges: those are synthetic and random. Emails use `.example`, not
+# example.com/.org/.net or `.test`: LakeScan drops those as placeholders
+# (test accounts), so fixture emails under them would test nothing.
+DOMAINS = "mail.example acme.example fintech.example shop.example corp.example bank.example".split()
 IPV4_NETS = ["192.0.2", "198.51.100", "203.0.113"]
 # Several networks and several numbers each, so no single value is more
 # than half a column (LakeScan drops a value that dominates a sample).
@@ -168,7 +170,7 @@ def customers(n, rng):
 def escalation(rng):
     junk = [None, "N/A", "", "  ", "-", "0000000000"]
     contact = [junk[i % len(junk)] for i in range(2000)]
-    contact += [f"user{i}@example.org" for i in range(6000)]
+    contact += [f"user{i}@mail.example" for i in range(6000)]
     return pl.DataFrame({
         "event_id": np.arange(8000, dtype=np.int64),
         "contact_email": contact,
@@ -180,7 +182,7 @@ def too_large():
     """16,000 emails of about 600 bytes: one ~9.6 MB data page."""
     n = 16_000
     return pa.table({
-        "email": [f"{'customer.' * 64}{i}@example.org" for i in range(n)],
+        "email": [f"{'customer.' * 64}{i}@mail.example" for i in range(n)],
         "amount": np.linspace(0.0, 1.0, n),
     })
 
@@ -218,7 +220,7 @@ def main():
     bad.mkdir(exist_ok=True)
     whole = (out / "pyarrow" / "customers.parquet").read_bytes()
     (bad / "truncated.parquet").write_bytes(whole[: int(len(whole) * 0.6)])
-    (bad / "not_parquet.parquet").write_bytes(b"customer_id,email\n1,someone@example.org\n")
+    (bad / "not_parquet.parquet").write_bytes(b"customer_id,email\n1,someone@mail.example\n")
     skipped = out / "skipped"
     skipped.mkdir(exist_ok=True)
     pq.write_table(too_large(), skipped / "too_large.parquet", use_dictionary=False,

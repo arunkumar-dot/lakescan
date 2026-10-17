@@ -10,8 +10,11 @@ synthetic: every name, email, number and address is generated.
 Wherever a reserved range exists, the fixtures use only values from it, so
 no value can belong to a real person, host, phone line or card:
 
-- Emails: the domains `example.com`, `example.org` and `example.net`
-  (RFC 2606) and names under `.test` (RFC 6761).
+- Emails: names under the `.example` top-level domain (RFC 2606):
+  `mail.example`, `acme.example` and four more. Not `example.com`,
+  `example.org`, `example.net` or `.test`: LakeScan drops emails at those
+  as placeholders (test accounts), so fixture emails there would test
+  nothing (M12).
 - IPv4: `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24` (RFC 5737).
   IPv6: `2001:db8::/32` (RFC 3849).
 - US phone numbers: `+1 415 555-0100` to `555-0199`, the range the North
@@ -72,7 +75,7 @@ writers do.
 | `dob` | date | dates of birth | `pii-date-of-birth`, likely (name only) |
 | `email_sha256` | string | SHA-256 hex digests of the emails: a decoy | none |
 | `billing` | struct | `email` (emails), `city` | `billing.email`: `pii-email`, confirmed |
-| `tags` | list of strings | | skipped (repeated) |
+| `tags` | list of strings | | none: read since M12 (`tags.list.element`), holds no personal data |
 | `amount` | double | | skipped (unsupported type) |
 | `signup_ts` | timestamp | | none |
 | `notes` | string | free text without personal data | none |

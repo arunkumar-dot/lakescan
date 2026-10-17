@@ -63,7 +63,15 @@
 //! `coverage.out_of_scope` and `coverage.sampling`,
 //! `pii_inventory.truncated`, the undocumented confidence split on
 //! `pii_inventory.summary`, `oldest_file` and `newest_file` on a table,
-//! and `expires` on an inventory column. M8 also made a PII rule's
+//! and `expires` on an inventory column. M12 added, still at version 1:
+//! `content.columns_not_examined` and
+//! `content.files_with_columns_not_examined`,
+//! `coverage.columns_not_examined`, a table's `columns_not_examined`,
+//! `summary.tables_with_columns_not_examined`, and the table status
+//! `columns_not_examined` (a new code: a table that would have read
+//! `no_pii_in_scanned_files` though columns that could hold PII were not
+//! examined). Since M12 repeated columns are read, so
+//! `content.columns_skipped.repeated` is always 0. M8 also made a PII rule's
 //! `bytes` and `suppressed.bytes` always 0: they double-counted files
 //! (once per column), and a consumer summing them was already wrong.
 //!
@@ -150,12 +158,23 @@
 //!     },
 //!     "columns_examined": integer, // candidate columns sampled and classified
 //!     "columns_skipped": {
-//!       "repeated": integer,        // list/map columns, never read
+//!       "repeated": integer,        // always 0 since M12, which reads
+//!                                   // list and map columns
 //!       "unsupported_type": integer,// booleans, floats, decimals, times
 //!       "page_too_large": integer,  // a page over the 8 MiB cap
 //!       "unreadable": integer,      // pages that could not be decoded
 //!       "unsupported_codec": integer // a codec not decoded safely (LZO)
 //!     },
+//!     "columns_not_examined": {    // columns that could hold personal
+//!       "unsupported-type": integer, // data but were not examined, in
+//!       "page-too-large": integer, // scanned files, counted once per
+//!       "unreadable": integer,     // file, by NotExaminedReason::code():
+//!       "unsupported-codec": integer // always all four. A string or
+//!                                  // integer column skipped for any
+//!                                  // reason, or an unread type (float,
+//!                                  // decimal, time) named like PII (M12)
+//!     },
+//!     "files_with_columns_not_examined": integer, // scanned files with any
 //!     "bytes_read": integer,       // bytes returned by every GetObject
 //!     "get_requests": integer,     // GetObject requests made, sniffs included
 //!     "sniffed": integer           // extensionless or unknown-extension
@@ -171,6 +190,17 @@
 //!     "percent": number | null,    // files_scanned / files_eligible * 100,
 //!                                  // rounded down to one decimal; null
 //!                                  // when files_eligible is 0
+//!     "columns_not_examined": {    // in scanned files: PII unknown in them
+//!       "total": integer,          // counted once per file
+//!       "files": integer,          // scanned files with any
+//!       "tables": integer,         // tables with any
+//!       "by_reason": { "<not-examined reason code>": integer },
+//!                                  // every NotExaminedReason::code()
+//!       "examples": [              // the 64 smallest by (table, column,
+//!         { "table": string, "column": string, "reason": string }
+//!       ],                         // reason), each distinct
+//!       "examples_truncated": bool // true if any distinct one was left out
+//!     },
 //!     "out_of_scope": {            // listed objects content scanning did
 //!       "objects": integer,        // not read
 //!       "by_extension": [          // the most common, at most 32
@@ -198,8 +228,10 @@
 //!       "undocumented_possible": integer,
 //!       "documented": integer,
 //!       "tables_not_fully_scanned": integer, // with any file not scanned
-//!       "tables_not_fully_scanned_documented": integer // of those, every
+//!       "tables_not_fully_scanned_documented": integer, // of those, every
 //!                                  // unscanned file documented
+//!       "tables_with_columns_not_examined": integer // with any column not
+//!                                  // examined in a scanned file (M12)
 //!     },
 //!     "tables": [                  // sorted by table; a table is
 //!       {                          // aggregate::table_of(key): the key's
@@ -208,7 +240,10 @@
 //!         "table": string,         // "" for the bucket root; at most 1 KiB
 //!         "status": string,        // "pii_found"; "no_pii_in_scanned_files"
 //!                                  // (some files may not have been
-//!                                  // scanned); "not_scanned": no file was
+//!                                  // scanned); "columns_not_examined":
+//!                                  // none found in the columns examined,
+//!                                  // but PII is unknown in the rest
+//!                                  // (M12); "not_scanned": no file was
 //!                                  // read, so PII is unknown
 //!         "files_eligible": integer,
 //!         "files_scanned": integer,
@@ -244,7 +279,15 @@
 //!             "expires": string | null // YYYY-MM-DD when that entry expires;
 //!                                  // null otherwise
 //!           }
-//!         ]
+//!         ],
+//!         "columns_not_examined": { // in this table's scanned files (M12)
+//!           "total": integer,      // counted once per file
+//!           "files": integer,      // scanned files with any
+//!           "by_reason": { "<not-examined reason code>": integer },
+//!           "examples": [          // this table's share of
+//!             { "column": string, "reason": string } // coverage's examples
+//!           ]
+//!         }
 //!       }
 //!     ],
 //!     "truncated": bool,           // true when left_out is non-zero
@@ -603,9 +646,21 @@ mod tests {
     /// The objects whose keys are codes rather than field names, by path
     /// (`[]` for any list element), and the placeholder the schema doc
     /// writes for them.
-    const CODE_MAPS: [(&str, &str); 3] = [
+    const CODE_MAPS: [(&str, &str); 6] = [
         ("content.not_scanned", "\"not-parquet\": integer"),
+        (
+            "content.columns_not_examined",
+            "\"unsupported-type\": integer",
+        ),
+        (
+            "coverage.columns_not_examined.by_reason",
+            "\"<not-examined reason code>\"",
+        ),
         ("pii_inventory.tables.[].not_scanned", "\"<reason code>\""),
+        (
+            "pii_inventory.tables.[].columns_not_examined.by_reason",
+            "\"<not-examined reason code>\"",
+        ),
         ("samples", "\"<rule code>\""),
     ];
 

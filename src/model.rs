@@ -519,6 +519,99 @@ impl NotScannedReason {
     }
 }
 
+/// Why a column that could hold personal data was not examined, in a file
+/// that was otherwise scanned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NotExaminedReason {
+    /// A type detection does not read (a float, a decimal, a time), on a
+    /// column whose name hints personal data (`phone` stored as a double).
+    UnsupportedType,
+    /// A string or integer column whose dictionary or first data page is
+    /// over the page cap; or, for a repeated column, declares more values
+    /// than the repeated-page cap.
+    PageTooLarge,
+    /// A string or integer column whose pages could not be decoded.
+    Unreadable,
+    /// A string or integer column compressed with a codec `LakeScan`
+    /// cannot decode safely (LZO).
+    UnsupportedCodec,
+}
+
+impl NotExaminedReason {
+    /// Every reason, in declaration order.
+    pub const ALL: [Self; 4] = [
+        Self::UnsupportedType,
+        Self::PageTooLarge,
+        Self::Unreadable,
+        Self::UnsupportedCodec,
+    ];
+
+    /// The stable code, e.g. `"unsupported-type"`. **Frozen contract**.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::UnsupportedType => "unsupported-type",
+            Self::PageTooLarge => "page-too-large",
+            Self::Unreadable => "unreadable",
+            Self::UnsupportedCodec => "unsupported-codec",
+        }
+    }
+
+    /// This reason's position in [`NotExaminedReason::ALL`].
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::UnsupportedType => 0,
+            Self::PageTooLarge => 1,
+            Self::Unreadable => 2,
+            Self::UnsupportedCodec => 3,
+        }
+    }
+}
+
+/// A column that could hold personal data but was not examined: its path
+/// (at most [`MAX_COLUMN_BYTES`]) and why. Ordered by path, then reason.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NotExamined {
+    /// The column path, cut to [`MAX_COLUMN_BYTES`].
+    pub column: String,
+    /// Why it was not examined.
+    pub reason: NotExaminedReason,
+}
+
+impl NotExamined {
+    /// Builds one, truncating `column` to [`MAX_COLUMN_BYTES`].
+    #[must_use]
+    pub fn new(column: &str, reason: NotExaminedReason) -> Self {
+        Self {
+            column: truncate_str(column, MAX_COLUMN_BYTES).to_owned(),
+            reason,
+        }
+    }
+}
+
+/// The most not-examined columns kept as examples, per file and across the
+/// PII inventory: the smallest by (table, column, reason). Counts are
+/// always exact.
+pub const MAX_NOT_EXAMINED_EXAMPLES: usize = 64;
+
+/// Adds `item` to `examples`, a sorted, duplicate-free list, keeping only
+/// the [`MAX_NOT_EXAMINED_EXAMPLES`] smallest. The kept set is the same
+/// whatever order items arrive in. Returns whether a distinct item was
+/// left out: `item` itself, or the largest one it displaced.
+pub fn offer_not_examined<T: Ord + Clone>(examples: &mut Vec<T>, item: &T) -> bool {
+    let Err(at) = examples.binary_search(item) else {
+        return false;
+    };
+    if at >= MAX_NOT_EXAMINED_EXAMPLES {
+        return true;
+    }
+    examples.insert(at, item.clone());
+    let over = examples.len() > MAX_NOT_EXAMINED_EXAMPLES;
+    examples.truncate(MAX_NOT_EXAMINED_EXAMPLES);
+    over
+}
+
 /// The longest column path a [`ColumnDetail`] keeps; longer paths are cut
 /// at a `char` boundary.
 pub const MAX_COLUMN_BYTES: usize = 256;

@@ -15,7 +15,7 @@ use crate::aggregate::{
     MAX_ENTRIES, MAX_TABLES, OutOfScope, PiiInventory, Sample, SampleDetail, Table,
 };
 use crate::error::LakeScanError;
-use crate::model::{NotScannedReason, RuleId, Severity};
+use crate::model::{NotExaminedReason, NotScannedReason, RuleId, Severity};
 use crate::suppress::{Entry, Outcome, Pattern};
 
 #[derive(Serialize)]
@@ -289,9 +289,19 @@ struct ContentSection {
     not_scanned: BTreeMap<&'static str, u64>,
     columns_examined: u64,
     columns_skipped: ColumnsSkipped,
+    columns_not_examined: BTreeMap<&'static str, u64>,
+    files_with_columns_not_examined: u64,
     bytes_read: u64,
     get_requests: u64,
     sniffed: u64,
+}
+
+/// Columns not examined, per reason code, from `count`.
+fn not_examined_by_reason(count: impl Fn(NotExaminedReason) -> u64) -> BTreeMap<&'static str, u64> {
+    NotExaminedReason::ALL
+        .into_iter()
+        .map(|reason| (reason.code(), count(reason)))
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -321,6 +331,8 @@ impl ContentSection {
                 unreadable: summary.skipped_unreadable,
                 unsupported_codec: summary.skipped_unsupported_codec,
             },
+            columns_not_examined: not_examined_by_reason(|reason| summary.not_examined(reason)),
+            files_with_columns_not_examined: summary.files_with_columns_not_examined,
             bytes_read: summary.bytes_read,
             get_requests: summary.get_requests,
             sniffed: summary.sniffed,
@@ -360,8 +372,43 @@ struct CoverageSection<'a> {
     not_scanned_suppressed: u64,
     not_scanned_unsuppressed: u64,
     percent: Option<f64>,
+    columns_not_examined: ColumnsNotExaminedSection<'a>,
     out_of_scope: OutOfScopeSection<'a>,
     sampling: SamplingSection,
+}
+
+/// `coverage.columns_not_examined`: columns that could hold personal data
+/// but were not examined, in scanned files, counted once per file.
+#[derive(Serialize)]
+struct ColumnsNotExaminedSection<'a> {
+    total: u64,
+    files: u64,
+    tables: u64,
+    by_reason: BTreeMap<&'static str, u64>,
+    examples: Vec<NotExaminedExample<'a>>,
+    examples_truncated: bool,
+}
+
+#[derive(Serialize)]
+struct NotExaminedExample<'a> {
+    table: &'a str,
+    column: &'a str,
+    reason: &'static str,
+}
+
+/// A table's columns not examined.
+#[derive(Serialize)]
+struct TableNotExamined<'a> {
+    total: u64,
+    files: u64,
+    by_reason: BTreeMap<&'static str, u64>,
+    examples: Vec<TableNotExaminedExample<'a>>,
+}
+
+#[derive(Serialize)]
+struct TableNotExaminedExample<'a> {
+    column: &'a str,
+    reason: &'static str,
 }
 
 /// `coverage.out_of_scope`: listed objects content scanning did not read.
@@ -388,7 +435,12 @@ struct SamplingSection {
 }
 
 impl<'a> CoverageSection<'a> {
-    fn new(coverage: Coverage, scope: &'a OutOfScope) -> Self {
+    fn new(
+        coverage: Coverage,
+        scope: &'a OutOfScope,
+        content: &ContentSummary,
+        inventory: &'a PiiInventory,
+    ) -> Self {
         let (listed, other) = scope.by_extension();
         Self {
             files_eligible: coverage.files_eligible,
@@ -396,6 +448,22 @@ impl<'a> CoverageSection<'a> {
             not_scanned_suppressed: coverage.not_scanned_suppressed,
             not_scanned_unsuppressed: coverage.not_scanned_unsuppressed,
             percent: coverage.percent,
+            columns_not_examined: ColumnsNotExaminedSection {
+                total: content.not_examined_total(),
+                files: content.files_with_columns_not_examined,
+                tables: inventory.summary().tables_with_columns_not_examined,
+                by_reason: not_examined_by_reason(|reason| content.not_examined(reason)),
+                examples: inventory
+                    .not_examined_examples()
+                    .iter()
+                    .map(|at| NotExaminedExample {
+                        table: &at.table,
+                        column: &at.column.column,
+                        reason: at.column.reason.code(),
+                    })
+                    .collect(),
+                examples_truncated: inventory.not_examined_examples_truncated(),
+            },
             out_of_scope: OutOfScopeSection {
                 objects: scope.objects(),
                 by_extension: listed
@@ -471,10 +539,15 @@ struct InventoryTable<'a> {
     oldest_file: Option<String>,
     newest_file: Option<String>,
     columns: Vec<InventoryColumn<'a>>,
+    columns_not_examined: TableNotExamined<'a>,
 }
 
 impl<'a> InventoryTable<'a> {
-    fn from_table(table: &'a Table, suppressions: &'a Outcome) -> Self {
+    fn from_table(
+        table: &'a Table,
+        inventory: &'a PiiInventory,
+        suppressions: &'a Outcome,
+    ) -> Self {
         Self {
             table: table.name(),
             status: table.status().code(),
@@ -499,6 +572,18 @@ impl<'a> InventoryTable<'a> {
                 .iter()
                 .map(|entry| InventoryColumn::from_entry(entry, suppressions))
                 .collect(),
+            columns_not_examined: TableNotExamined {
+                total: table.not_examined_total(),
+                files: table.files_with_columns_not_examined(),
+                by_reason: not_examined_by_reason(|reason| table.not_examined(reason)),
+                examples: inventory
+                    .not_examined_in(table.name())
+                    .map(|example| TableNotExaminedExample {
+                        column: &example.column,
+                        reason: example.reason.code(),
+                    })
+                    .collect(),
+            },
         }
     }
 }
@@ -527,6 +612,7 @@ struct InventorySummarySection {
     documented: u64,
     tables_not_fully_scanned: u64,
     tables_not_fully_scanned_documented: u64,
+    tables_with_columns_not_examined: u64,
 }
 
 impl From<InventorySummary> for InventorySummarySection {
@@ -541,6 +627,7 @@ impl From<InventorySummary> for InventorySummarySection {
             documented: summary.documented,
             tables_not_fully_scanned: summary.tables_not_fully_scanned,
             tables_not_fully_scanned_documented: summary.tables_not_fully_scanned_documented,
+            tables_with_columns_not_examined: summary.tables_with_columns_not_examined,
         }
     }
 }
@@ -562,7 +649,7 @@ impl<'a> PiiInventorySection<'a> {
             tables: inventory
                 .tables()
                 .iter()
-                .map(|table| InventoryTable::from_table(table, suppressions))
+                .map(|table| InventoryTable::from_table(table, inventory, suppressions))
                 .collect(),
             truncated: inventory.truncated(),
             left_out: LeftOut {
@@ -730,10 +817,17 @@ fn build<'a>(info: &'a super::ScanInfo, aggregates: &'a Aggregates) -> Summary<'
         inventory: inventory_section(aggregates),
         findings: findings_section(aggregates),
         content: aggregates.content().map(ContentSection::from_summary),
-        coverage: aggregates
-            .coverage()
-            .zip(aggregates.out_of_scope())
-            .map(|(coverage, scope)| CoverageSection::new(coverage, scope)),
+        coverage: match (
+            aggregates.coverage(),
+            aggregates.out_of_scope(),
+            aggregates.content(),
+            aggregates.pii_inventory(),
+        ) {
+            (Some(coverage), Some(scope), Some(content), Some(inventory)) => {
+                Some(CoverageSection::new(coverage, scope, content, inventory))
+            }
+            _ => None,
+        },
         pii_inventory: aggregates
             .pii_inventory()
             .map(|inventory| PiiInventorySection::from_inventory(inventory, &info.suppressions)),
@@ -1144,6 +1238,22 @@ mod tests {
                 "not_scanned_suppressed": 1,
                 "not_scanned_unsuppressed": 0,
                 "percent": 75.0,
+                // events.parquet: a phone stored as a double.
+                "columns_not_examined": {
+                    "total": 1,
+                    "files": 1,
+                    "tables": 1,
+                    "by_reason": {
+                        "unsupported-type": 1,
+                        "page-too-large": 0,
+                        "unreadable": 0,
+                        "unsupported-codec": 0
+                    },
+                    "examples": [
+                        { "table": "", "column": "caller.phone", "reason": "unsupported-type" }
+                    ],
+                    "examples_truncated": false
+                },
                 // id_rsa, old/dataset.bin, unknown/object.dat and
                 // docs/examples/id_rsa have no Parquet extension and are
                 // sniffed; the folder marker and placeholder are empty.
@@ -1194,7 +1304,21 @@ mod tests {
             .collect();
         assert_eq!(
             statuses,
-            ["no_pii_in_scanned_files", "pii_found", "not_scanned"]
+            ["columns_not_examined", "pii_found", "not_scanned"]
+        );
+        assert_eq!(
+            inventory.pointer("/tables/0/columns_not_examined"),
+            Some(&serde_json::json!({
+                "total": 1,
+                "files": 1,
+                "by_reason": {
+                    "unsupported-type": 1,
+                    "page-too-large": 0,
+                    "unreadable": 0,
+                    "unsupported-codec": 0
+                },
+                "examples": [{ "column": "caller.phone", "reason": "unsupported-type" }]
+            }))
         );
         assert_eq!(
             inventory.get("summary"),
@@ -1207,7 +1331,8 @@ mod tests {
                 "undocumented_possible": 0,
                 "documented": 1,
                 "tables_not_fully_scanned": 1,
-                "tables_not_fully_scanned_documented": 1
+                "tables_not_fully_scanned_documented": 1,
+                "tables_with_columns_not_examined": 1
             }))
         );
         assert_eq!(

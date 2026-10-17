@@ -4,9 +4,11 @@
 //! addition.
 
 use crate::content::{FileOutcome, FileScan};
-use crate::model::NotScannedReason;
+use crate::model::{NotExaminedReason, NotScannedReason};
 
 const NUM_REASONS: usize = NotScannedReason::ALL.len();
+
+const NUM_NOT_EXAMINED: usize = NotExaminedReason::ALL.len();
 
 /// Content-scanning totals for one run. Present in [`super::Aggregates`]
 /// only when `--pii` was given.
@@ -38,6 +40,11 @@ pub struct ContentSummary {
     pub skipped_unreadable: u64,
     /// Columns skipped because of a codec that cannot be decoded safely.
     pub skipped_unsupported_codec: u64,
+    /// Columns that could hold personal data but were not examined, in
+    /// scanned files, per reason (indexed by [`NotExaminedReason::index`]).
+    not_examined: [u64; NUM_NOT_EXAMINED],
+    /// Scanned files with at least one column not examined.
+    pub files_with_columns_not_examined: u64,
     /// Bytes read from S3 for content scanning.
     pub bytes_read: u64,
     /// `GetObject` requests made for content scanning, sniffs included.
@@ -75,6 +82,16 @@ impl ContentSummary {
             }
         }
         let stats = scan.stats;
+        if matches!(
+            scan.outcome,
+            FileOutcome::ScannedWhole | FileOutcome::ScannedPartially
+        ) && stats.not_examined_total() > 0
+        {
+            for (count, n) in self.not_examined.iter_mut().zip(stats.not_examined) {
+                add(count, n);
+            }
+            add(&mut self.files_with_columns_not_examined, 1);
+        }
         add(&mut self.columns_examined, stats.columns_examined);
         add(&mut self.skipped_repeated, stats.skipped_repeated);
         add(
@@ -126,6 +143,13 @@ impl ContentSummary {
             &mut self.skipped_unsupported_codec,
             other.skipped_unsupported_codec,
         );
+        for (count, n) in self.not_examined.iter_mut().zip(other.not_examined) {
+            add(count, n);
+        }
+        add(
+            &mut self.files_with_columns_not_examined,
+            other.files_with_columns_not_examined,
+        );
         add(&mut self.bytes_read, other.bytes_read);
         add(&mut self.sniffed, other.sniffed);
         add(&mut self.get_requests, other.get_requests);
@@ -147,6 +171,22 @@ impl ContentSummary {
             .copied()
             .unwrap_or(0);
         self.not_scanned(reason).saturating_sub(suppressed)
+    }
+
+    /// Columns not examined for `reason` in scanned files, counted once
+    /// per file.
+    #[must_use]
+    pub fn not_examined(&self, reason: NotExaminedReason) -> u64 {
+        self.not_examined.get(reason.index()).copied().unwrap_or(0)
+    }
+
+    /// Columns not examined in scanned files, for any reason, counted
+    /// once per file.
+    #[must_use]
+    pub fn not_examined_total(&self) -> u64 {
+        self.not_examined
+            .iter()
+            .fold(0, |total, &n| total.saturating_add(n))
     }
 
     /// Files not scanned, for any reason.
@@ -230,6 +270,7 @@ mod tests {
         FileScan {
             outcome,
             columns: Vec::new(),
+            not_examined: Vec::new(),
             stats: FileStats {
                 columns_examined: 3,
                 skipped_repeated: 1,

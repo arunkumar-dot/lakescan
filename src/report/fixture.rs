@@ -11,8 +11,8 @@ use crate::aggregate::Aggregates;
 use crate::content::{ColumnFinding, FileOutcome, FileScan, FileStats};
 use crate::content::{Scope, Sniff};
 use crate::model::{
-    ColumnDetail, Confidence, Evidence, Finding, NotScannedReason, ObjectMeta, PiiType, RuleId,
-    StorageClass,
+    ColumnDetail, Confidence, Evidence, Finding, NotExamined, NotExaminedReason, NotScannedReason,
+    ObjectMeta, PiiType, RuleId, StorageClass,
 };
 use crate::rules::{self, EvalContext};
 use crate::suppress::{Config, Date, Fingerprint, Outcome, Suppressor};
@@ -130,7 +130,8 @@ fn column(pii: PiiType, column: &str, confidence: Confidence, evidence: Evidence
 
 /// What content scanning made of each fixture Parquet file: emails and
 /// names in both customer partitions, phones in one, an unreadable orders
-/// file, and an events file with nothing in it.
+/// file, and an events file with no PII found, but a phone column stored
+/// as a double that could not be examined.
 fn scan_of(key: &str) -> FileScan {
     let emails = column(
         PiiType::Email,
@@ -173,10 +174,32 @@ fn scan_of(key: &str) -> FileScan {
         ),
         _ => (FileOutcome::ScannedWhole, Vec::new()),
     };
+    let (not_examined, stats) = if key == "events.parquet" {
+        let mut stats = FileStats {
+            skipped_unsupported_type: 1,
+            ..FileStats::default()
+        };
+        if let Some(count) = stats
+            .not_examined
+            .get_mut(NotExaminedReason::UnsupportedType.index())
+        {
+            *count = 1;
+        }
+        (
+            vec![NotExamined::new(
+                "caller.phone",
+                NotExaminedReason::UnsupportedType,
+            )],
+            stats,
+        )
+    } else {
+        (Vec::new(), FileStats::default())
+    };
     FileScan {
         outcome,
         columns,
-        stats: FileStats::default(),
+        not_examined,
+        stats,
     }
 }
 
@@ -187,6 +210,7 @@ fn sniffed_not_parquet() -> FileScan {
     FileScan {
         outcome: FileOutcome::SniffedNotParquet,
         columns: Vec::new(),
+        not_examined: Vec::new(),
         stats: FileStats {
             bytes_read: 8,
             get_requests: 1,
@@ -325,6 +349,7 @@ pub(super) fn crowded() -> Aggregates {
                     sampled: 40,
                 },
             )],
+            not_examined: Vec::new(),
             stats: FileStats::default(),
         };
         for finding in scan.findings(&object) {

@@ -14,12 +14,13 @@
 //! objects, which is exactly why its bound is explicit and checked.
 //!
 //! [`Aggregates::MAX_BYTES`] is a compile-time-checked sum of every summary's
-//! own `MAX_BYTES`: **17,672,176 bytes (~16.9 MiB)** as of M10, asserted
+//! own `MAX_BYTES`: **18,125,704 bytes (~17.3 MiB)** as of M12, asserted
 //! below to be no more than 18 MiB. Nearly all of it is the
-//! [`PiiInventory`] at its caps (17,399,872 bytes: 4,096 tables, 16,384
-//! entries, with 1 KiB names and keys and 256-byte column paths);
+//! [`PiiInventory`] at its caps (17,849,440 bytes: 4,096 tables, 16,384
+//! entries, with 1 KiB names and keys and 256-byte column paths, and 64
+//! not-examined examples);
 //! everything else (15 rules' samples, the fixed-size [`ContentSummary`],
-//! 16 KiB of `Hll` registers) is 272,304 bytes. The real total is far smaller than that ceiling
+//! 16 KiB of `Hll` registers) is 276,264 bytes. The real total is far smaller than that ceiling
 //! unless a lake really has thousands of tables. Every summary here is mergeable and
 //! order-independent: observing the same objects and findings in any order,
 //! or splitting them across any number of [`Aggregates`] and folding the
@@ -101,7 +102,7 @@ pub struct Aggregates {
 
 impl Aggregates {
     /// The combined worst-case size of every summary this struct holds:
-    /// the plain sum of each summary type's own `MAX_BYTES`. 17,672,176
+    /// the plain sum of each summary type's own `MAX_BYTES`. 18,125,704
     /// bytes as of this milestone (see this module's doc); checked below
     /// to be within the 18 MiB module budget.
     pub const MAX_BYTES: usize = Inventory::MAX_BYTES
@@ -159,6 +160,16 @@ impl Aggregates {
         }
         self.pii
             .observe_file(&object.key, scan.outcome, suppressed, object.last_modified);
+        if matches!(
+            scan.outcome,
+            FileOutcome::ScannedWhole | FileOutcome::ScannedPartially
+        ) {
+            self.pii.observe_not_examined(
+                &object.key,
+                &scan.stats.not_examined,
+                &scan.not_examined,
+            );
+        }
     }
 
     /// Records one listed object content scanning does not read: its
@@ -640,6 +651,7 @@ mod tests {
                 let scan = FileScan {
                     outcome,
                     columns,
+                    not_examined: Vec::new(),
                     stats: FileStats::default(),
                 };
                 let suppression =

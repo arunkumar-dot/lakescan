@@ -45,7 +45,7 @@ CONTENT
     read partially:    1
     not scanned:       1 (unreadable=1)
   columns examined:   0
-  columns skipped:    0 (repeated=0, unsupported-type=0, page-too-large=0, unreadable=0, unsupported-codec=0)
+  columns skipped:    1 (repeated=0, unsupported-type=1, page-too-large=0, unreadable=0, unsupported-codec=0)
   bytes read:         32 (32 B)
   GET requests:       4
   sniffed:            4 (objects without a Parquet extension; one 8-byte GET each)
@@ -55,15 +55,18 @@ COVERAGE
   scanned:        3 (75.0%)
   not scanned:    1 documented, 0 undocumented
   inspection:     sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way
+  columns not examined: 1 in 1 file of 1 table (unsupported-type=1; PII unknown in them)
   Not in scope for --pii: 1 .csv, 1 .jpg, 1 .tar (LakeScan reads Parquet content only)
   sniffed, not Parquet: 4
   empty objects and folder markers: 2
 
 PII INVENTORY
-  1 table with PII, 3 PII columns: 2 undocumented (1 confirmed, 1 likely, 0 possible), 1 documented. Action needed on the undocumented. 1 table with files not scanned (1 documented).
+  1 table with PII, 3 PII columns: 2 undocumented (1 confirmed, 1 likely, 0 possible), 1 documented. Action needed on the undocumented. 1 table with files not scanned (1 documented), 1 with columns not examined.
   Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
   (bucket root)  files: 1 scanned, 0 not scanned; files dated 2023-11-14 to 2023-11-14
-    No structured PII detected in sampled data from 1 file
+    No structured PII detected in the columns examined from 1 file; PII unknown in the columns not examined
+    columns not examined: 1 in 1 file (unsupported-type=1)
+      caller.phone  unsupported-type
   warehouse/customers  files: 2 scanned, 0 not scanned; files dated 2023-11-01 to 2023-11-14
     example: warehouse/customers/dt=2023-11-01/part-0.parquet
     contact.phone  pii-phone  likely  evidence=values  1 file likely  UNDOCUMENTED

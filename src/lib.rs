@@ -54,7 +54,7 @@
 //! the headers before anything is allocated), the parsed footer, and every
 //! column's sample are held under permits from one byte-counting semaphore
 //! of that size; see `content::MemoryBudget`. One file never needs more
-//! than [`content::file_need`] (~103 MiB at the default
+//! than [`content::file_need`] (~108 MiB at the default
 //! `--pii-whole-file-max`, ~132 MiB at 64 MiB), and a smaller budget is a
 //! usage error. The overhead outside the budget, per in-flight file: its
 //! key, counts and findings (a few KiB), up to 12,288 first-page locations

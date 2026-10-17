@@ -4,6 +4,57 @@ All notable changes to LakeScan. Versions follow
 [Semantic Versioning](https://semver.org/); the public contracts are the
 exit codes, the rule codes and the JSON summary's `schema_version`.
 
+## [Unreleased]
+
+Detection fixes from real public datasets (M12; see
+[docs/experiments/real-data.md](docs/experiments/real-data.md)). Exit
+codes and rule codes are unchanged; the JSON summary gains fields and one
+table status, all additive, so `schema_version` stays 1.
+
+### Detection
+
+- Person-name hints: whole-name parts (`FIRST`, `LAST`, `MIDDLE`, `MAIDEN`,
+  `family`, `given`) and name words (`surname`, `forename`, `fname`,
+  `lname`) are strong; `name` counts only when a name part or a person
+  noun qualifies it (`nameFirst`, `customer_display_name`). A bare `name`
+  and names of things (`Short Name`, `Indicator Name`, `drug_name`,
+  `organization_name`) no longer hint anything.
+- Date-of-birth hints: `bdate`, `bday`, `birth_dt` and `date_birth` are
+  strong; a count, rate or flag of births (`multipleBirthInteger`,
+  `birth_rate`, `births`) no longer hints.
+- Phones: North American numbers (`(201) 555-0123`), UK and EU national
+  numbers with a trunk `0`, and `00`-prefixed international numbers, when
+  written with separators. A phone column whose name isn't about a person
+  is `confirmed` only at a 95% match rate, else `likely`: organisations
+  have phone numbers too. A bare digit run (no `+`, no separators, and
+  every integer column) counts as a phone only under a name with a phone
+  or contact word (`phone`, `mobile`, `cell`, `tel`, `contact`, `msisdn`):
+  identifiers such as US NPI numbers look like Indian mobiles. An unnamed
+  column of bare mobile numbers is therefore no longer reported.
+- Repeated (list and map) columns are read, and named for their hints by
+  the field behind the wrapper (`telecom.list.element.value` is `value`).
+  A repeated page may declare at most 131,072 values; one file now needs
+  at most ~108 MiB of the memory budget (was ~103 MiB).
+- Cleaning drops emails at `example.com`, `example.org`, `example.net` and
+  `.test` (test accounts), masked values (`****1234`) and the sentinel
+  dates `1900-01-01` and `1970-01-01`. A column with no value left after
+  cleaning, or a date column whose statistics say it is all null, is never
+  reported, even on its name.
+
+### Coverage honesty
+
+- Columns that could hold personal data but were not examined (a string or
+  integer column skipped for any reason, or a float, decimal or time
+  column named like PII) are recorded per table and in COVERAGE, in text,
+  HTML, JSON and CSV. A table with no PII found and such columns has the
+  new status `columns_not_examined`, never `no_pii_in_scanned_files`. They
+  are reported only: the exit code is unchanged.
+
+### Fixtures
+
+- The committed fixtures' emails moved to the reserved `.example`
+  top-level domain, which LakeScan keeps; every other value is unchanged.
+
 ## [0.1.0]
 
 The first release: an S3 bucket audit from the object listing, and, with

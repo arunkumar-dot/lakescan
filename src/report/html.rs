@@ -24,15 +24,15 @@ use std::io::Write;
 use super::escape::is_escaped;
 use super::rfc3339::format_rfc3339;
 use super::text::{
-    counted, dates_line, files, grouped, no_pii_line, out_of_scope_line, undocumented_counts,
-    undocumented_split,
+    counted, dates_line, files, grouped, no_pii_line, not_examined_heading, not_examined_reasons,
+    not_examined_status_line, out_of_scope_line, undocumented_counts, undocumented_split,
 };
 use super::{SAMPLING_METHOD, ScanInfo, TOOL_NAME, TOOL_VERSION, expiry_of, status_of};
 use crate::aggregate::{
     Aggregates, MAX_ENTRIES, MAX_TABLES, PiiInventory, SampleDetail, Status, Table, TableStatus,
 };
 use crate::error::{ExitCode, LakeScanError};
-use crate::model::{NotScannedReason, RuleId, Severity};
+use crate::model::{MAX_NOT_EXAMINED_EXAMPLES, NotScannedReason, RuleId, Severity};
 
 macro_rules! w {
     ($out:expr, $($arg:tt)*) => {
@@ -325,7 +325,12 @@ fn write_truncation<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<()
 /// What was read and how: coverage, sampled inspection, and what was out
 /// of scope.
 fn write_coverage<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
-    let (Some(coverage), Some(scope)) = (aggregates.coverage(), aggregates.out_of_scope()) else {
+    let (Some(coverage), Some(scope), Some(content), Some(inventory)) = (
+        aggregates.coverage(),
+        aggregates.out_of_scope(),
+        aggregates.content(),
+        aggregates.pii_inventory(),
+    ) else {
         return Ok(());
     };
     wl!(out, "<section id=\"coverage\">")?;
@@ -344,6 +349,26 @@ fn write_coverage<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), 
         "<li>Inspection is {SAMPLING_METHOD}. No result proves a column holds no personal \
          data.</li>"
     )?;
+    let total = content.not_examined_total();
+    w!(
+        out,
+        "<li>Columns not examined: {} in {} of {}",
+        grouped(total),
+        files(content.files_with_columns_not_examined),
+        counted(
+            inventory.summary().tables_with_columns_not_examined,
+            "table",
+            "tables"
+        )
+    )?;
+    if total > 0 {
+        w!(
+            out,
+            " (<code>{}</code>): <span class=\"unknown\">PII unknown in them</span>",
+            not_examined_reasons(|reason| content.not_examined(reason))
+        )?;
+    }
+    wl!(out, ".</li>")?;
     w!(out, "<li>")?;
     match out_of_scope_line(scope) {
         Some(line) => write_text(out, &line)?,
@@ -519,12 +544,13 @@ fn write_inventory<W: Write>(
     wl!(
         out,
         "<p>{} with PII, {}: {}, {} documented.{action} {} with files not \
-         scanned{gaps}.</p>",
+         scanned{gaps}, {} with columns not examined.</p>",
         counted(summary.tables_with_pii, "table", "tables"),
         counted(summary.pii_columns, "PII column", "PII columns"),
         undocumented_split(&summary),
         summary.documented,
         counted(summary.tables_not_fully_scanned, "table", "tables"),
+        summary.tables_with_columns_not_examined,
     )?;
     wl!(
         out,
@@ -555,6 +581,11 @@ fn write_inventory<W: Write>(
         match table.status() {
             TableStatus::PiiFound => write_entries(out, info, table)?,
             TableStatus::NoPiiInScannedFiles => wl!(out, "<p>{}.</p>", no_pii_line(table))?,
+            TableStatus::ColumnsNotExamined => wl!(
+                out,
+                "<p><span class=\"unknown\">{}.</span></p>",
+                not_examined_status_line(table)
+            )?,
             TableStatus::NotScanned => {
                 wl!(
                     out,
@@ -562,6 +593,23 @@ fn write_inventory<W: Write>(
                 )?;
             }
         }
+        if let Some(heading) = not_examined_heading(table) {
+            wl!(out, "<p class=\"not-examined\">{heading}:</p>")?;
+            wl!(out, "<ul class=\"not-examined\">")?;
+            for example in inventory.not_examined_in(table.name()) {
+                w!(out, "<li><span class=\"key\">")?;
+                write_text(out, &example.column)?;
+                wl!(out, "</span> (<code>{}</code>)</li>", example.reason.code())?;
+            }
+            wl!(out, "</ul>")?;
+        }
+    }
+    if inventory.not_examined_examples_truncated() {
+        wl!(
+            out,
+            "<p class=\"note\">Columns not examined: only the first {MAX_NOT_EXAMINED_EXAMPLES} \
+             are listed (by table, column and reason); the counts include every one.</p>"
+        )?;
     }
     if inventory.truncated() {
         wl!(

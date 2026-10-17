@@ -9,7 +9,10 @@ use super::testing::{
     Layout, MemoryReader, Values, aadhaars, digests, emails, mobiles, parquet_file,
 };
 use super::{FileOutcome, FileScan, PAGE_CAP, is_eligible, scan_file};
-use crate::model::{Confidence, Evidence, NotScannedReason, ObjectMeta, PiiType, StorageClass};
+use crate::model::{
+    Confidence, Evidence, NotExamined, NotExaminedReason, NotScannedReason, ObjectMeta, PiiType,
+    StorageClass,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -128,10 +131,14 @@ async fn a_small_file_is_read_whole_in_one_request() -> TestResult {
     assert_eq!(reader.requests(), 1);
     assert_eq!(scan.stats.get_requests, 1);
     assert_eq!(scan.stats.bytes_read, u64::try_from(size)?);
-    // 6 candidate columns (dob is checked by name), repeated and double skipped.
-    assert_eq!(scan.stats.columns_examined, 6);
-    assert_eq!(scan.stats.skipped_repeated, 1);
+    // 7 candidate columns (dob is checked by name; the repeated column is
+    // read too), the double skipped. Nothing that could hold personal data
+    // went unexamined: the double's name hints nothing.
+    assert_eq!(scan.stats.columns_examined, 7);
+    assert_eq!(scan.stats.skipped_repeated, 0);
     assert_eq!(scan.stats.skipped_unsupported_type, 1);
+    assert_eq!(scan.stats.not_examined_total(), 0);
+    assert_eq!(scan.not_examined, Vec::<NotExamined>::new());
     Ok(())
 }
 
@@ -268,7 +275,7 @@ async fn a_dominant_default_value_is_dropped_before_matching() -> TestResult {
     let values: Vec<Option<String>> = (0..100)
         .map(|i| {
             Some(if i < 70 {
-                "noreply@example.com".to_owned()
+                "noreply@mail.example".to_owned()
             } else {
                 format!("see ticket {i}")
             })
@@ -425,7 +432,7 @@ async fn findings_carry_the_column_and_never_a_value() -> TestResult {
     let meta = object("t.parquet", 1);
     let rendered = format!("{:?}", scan.findings(&meta).collect::<Vec<_>>());
     assert!(rendered.contains("mobile_no"));
-    for value in ["person.1@example.org", "9876000001"] {
+    for value in ["person.1@mail.example", "9876000001"] {
         assert!(!rendered.contains(value), "{value} leaked: {rendered}");
     }
     Ok(())
@@ -481,7 +488,12 @@ async fn every_writer_fixture_is_classified_by_both_read_paths() -> TestResult {
         assert_eq!(verdicts(&whole), expected, "{writer}, whole");
         assert_eq!(verdicts(&partial), expected, "{writer}, partial");
         assert_eq!(verdicts(&apart), expected, "{writer}, partial, gap 0");
-        assert_eq!(whole.stats.skipped_repeated, 1, "{writer}: tags");
+        // `tags`, a list of strings, is read on both paths (it holds no
+        // personal data, so it is examined and not reported).
+        for read in [&whole, &partial, &apart] {
+            assert_eq!(read.stats.skipped_repeated, 0, "{writer}: tags");
+            assert_eq!(read.stats.not_examined_total(), 0, "{writer}");
+        }
         // Uncoalesced, a partial read reads less than the file. Coalesced,
         // on files this small (1-2 MB, gaps under 1 MiB), it may read
         // nearly all of it, in fewer requests: the trade-off
@@ -989,5 +1001,214 @@ async fn a_file_left_waiting_for_the_budget_is_budget_timeout() -> TestResult {
     assert_eq!(reader.requests(), 0);
     drop(held);
     assert_eq!(budget.held(), 0);
+    Ok(())
+}
+
+/// `n` rows of lists of 0 to 3 values from `value(i)`.
+fn lists(n: usize, value: impl Fn(usize) -> String) -> Vec<Vec<String>> {
+    (0..n)
+        .map(|row| (0..row % 4).map(|k| value(row * 4 + k)).collect())
+        .collect()
+}
+
+/// A row id, so a file has a plain column next to the repeated ones.
+fn ids(n: usize) -> Values {
+    Values::Int64((0..n).map(|i| i64::try_from(i).ok()).collect())
+}
+
+/// Repeated columns, as FHIR stores contacts and names (the experiment's
+/// Synthea FHIR practitioners and patients): a list of emails, a list of
+/// structs with a phone `value`, and one with a `family` name, are read on
+/// both paths, and named for their hint by the leaf behind the wrappers.
+#[tokio::test]
+async fn repeated_columns_are_read_and_named_by_their_leaf() -> TestResult {
+    let n = 400;
+    let columns = vec![
+        ("id", ids(n)),
+        (
+            "contact_emails",
+            Values::List(lists(n, |i| format!("person.{i}@mail.example"))),
+        ),
+        (
+            "telecom",
+            Values::ListOfStruct("value", lists(n, |i| format!("(201) 555-01{:02}", i % 100))),
+        ),
+        (
+            "name",
+            Values::ListOfStruct("family", lists(n, |i| format!("Family{i}"))),
+        ),
+        ("tags", Values::List(lists(n, |i| format!("tag {}", i % 7)))),
+    ];
+    let expected = vec![
+        (
+            "contact_emails.list.element".to_owned(),
+            PiiType::Email,
+            Confidence::Confirmed,
+        ),
+        (
+            "telecom.list.element.value".to_owned(),
+            PiiType::Phone,
+            Confidence::Confirmed,
+        ),
+        (
+            "name.list.element.family".to_owned(),
+            PiiType::PersonName,
+            Confidence::Likely,
+        ),
+    ];
+    for layout in [
+        Layout::default(),
+        Layout {
+            row_group_rows: 100,
+            ..Layout::default()
+        },
+        Layout {
+            dictionary: false,
+            v2: true,
+            ..Layout::default()
+        },
+    ] {
+        let body = parquet_file(&columns, layout)?;
+        for whole_file_max in [super::DEFAULT_WHOLE_FILE_MAX, 0] {
+            let (scan, _) = scan("fhir.parquet", body.clone(), whole_file_max).await;
+            assert_eq!(verdicts(&scan), expected, "{layout:?} {whole_file_max}");
+            assert_eq!(scan.stats.columns_examined, 5);
+            assert_eq!(scan.stats.skipped_repeated, 0);
+            assert_eq!(scan.not_examined, Vec::<NotExamined>::new());
+        }
+    }
+    Ok(())
+}
+
+/// A repeated column whose first page declares more values than the
+/// repeated-page cap is not examined, and says so; the rest of the file
+/// is scanned.
+#[tokio::test]
+async fn a_repeated_page_over_the_value_cap_is_not_examined() -> TestResult {
+    let many = usize::try_from(super::MAX_REPEATED_VALUES)? + 1;
+    let mut big = vec![
+        (0..many)
+            .map(|i| format!("v{}", i % 50))
+            .collect::<Vec<_>>(),
+    ];
+    big.extend((1..40).map(|_| Vec::new()));
+    let columns = vec![
+        ("email", Values::Text(emails(40))),
+        ("tags", Values::List(big)),
+    ];
+    let layout = Layout {
+        page_bytes: 64 * 1024 * 1024,
+        ..Layout::default()
+    };
+    let body = parquet_file(&columns, layout)?;
+    for whole_file_max in [super::DEFAULT_WHOLE_FILE_MAX, 0] {
+        let (scan, _) = scan("t.parquet", body.clone(), whole_file_max).await;
+        assert!(matches!(
+            scan.outcome,
+            FileOutcome::ScannedWhole | FileOutcome::ScannedPartially
+        ));
+        assert_eq!(
+            verdicts(&scan),
+            vec![("email".to_owned(), PiiType::Email, Confidence::Confirmed)]
+        );
+        assert_eq!(scan.stats.skipped_page_too_large, 1);
+        assert_eq!(
+            scan.not_examined,
+            vec![NotExamined::new(
+                "tags.list.element",
+                NotExaminedReason::PageTooLarge
+            )]
+        );
+        assert_eq!(scan.stats.not_examined_total(), 1);
+    }
+    Ok(())
+}
+
+/// Columns of a type detection does not read are not examined when their
+/// name hints personal data (a phone stored as a double), but not when it
+/// hints nothing (`amount`) or the type cannot hold any (a boolean).
+#[tokio::test]
+async fn an_unread_type_is_not_examined_only_if_its_name_hints_pii() -> TestResult {
+    let n = 50;
+    let columns = vec![
+        ("email", Values::Text(emails(n))),
+        ("mobile_phone", Values::Double(vec![9.876_543_21e9; n])),
+        ("amount", Values::Double(vec![1.5; n])),
+        ("email_verified", Values::Bool(vec![true; n])),
+        ("multipleBirthBoolean", Values::Bool(vec![false; n])),
+    ];
+    let body = parquet_file(&columns, Layout::default())?;
+    let (scan, _) = scan("t.parquet", body, super::DEFAULT_WHOLE_FILE_MAX).await;
+    assert_eq!(scan.stats.skipped_unsupported_type, 4);
+    assert_eq!(
+        scan.not_examined,
+        vec![NotExamined::new(
+            "mobile_phone",
+            NotExaminedReason::UnsupportedType
+        )]
+    );
+    Ok(())
+}
+
+/// The experiment's Synthea `payers.PHONE`: named a phone, every value
+/// null. Nothing is reported, and neither is a date of birth column whose
+/// statistics say it is all null; one with dates is.
+#[tokio::test]
+async fn an_all_null_column_is_never_reported() -> TestResult {
+    let n = 200;
+    let columns = vec![
+        ("PHONE", Values::Text(vec![None; n])),
+        (
+            "customer_email",
+            Values::Text(vec![Some("N/A".to_owned()); n]),
+        ),
+        ("dob", Values::Date(vec![None; n])),
+        ("birth_date", Values::Date(vec![Some(7000); n])),
+    ];
+    let body = parquet_file(&columns, Layout::default())?;
+    for whole_file_max in [super::DEFAULT_WHOLE_FILE_MAX, 0] {
+        let (scan, _) = scan("payers.parquet", body.clone(), whole_file_max).await;
+        assert_eq!(
+            verdicts(&scan),
+            vec![(
+                "birth_date".to_owned(),
+                PiiType::DateOfBirth,
+                Confidence::Likely
+            )]
+        );
+    }
+    Ok(())
+}
+
+/// The experiment's FHIR practitioners: `identifier.list.element.value`
+/// holds US NPI numbers, bare 10-digit runs starting with 9, which the
+/// Indian-mobile rule accepts. Without a phone or contact word in the
+/// name they are not phones, so nothing is reported; the same values under
+/// `mobile_no` are confirmed, as the Indian fixtures' are. The cost: an
+/// unnamed column of bare mobile numbers (`ref_no`) is not reported either.
+#[tokio::test]
+async fn bare_digit_identifiers_are_not_phones_without_a_phone_name() -> TestResult {
+    let n = 278;
+    let npis = |i: usize| format!("99999{i:05}");
+    let columns = vec![
+        (
+            "identifier",
+            Values::ListOfStruct("value", (0..n).map(|i| vec![npis(i)]).collect()),
+        ),
+        ("mobile_no", Values::Int64(mobiles(n))),
+        ("ref_no", Values::Int64(mobiles(n))),
+    ];
+    let body = parquet_file(&columns, Layout::default())?;
+    for whole_file_max in [super::DEFAULT_WHOLE_FILE_MAX, 0] {
+        let (scan, _) = scan("practitioner.parquet", body.clone(), whole_file_max).await;
+        assert_eq!(
+            verdicts(&scan),
+            vec![(
+                "mobile_no".to_owned(),
+                PiiType::Phone,
+                Confidence::Confirmed
+            )]
+        );
+    }
     Ok(())
 }

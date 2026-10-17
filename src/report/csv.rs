@@ -1,5 +1,8 @@
 //! The PII inventory as CSV (`--inventory`): one row per `(table, column,
-//! rule)`, under a header row.
+//! rule)`, under a header row, then, per table, one `NOT_EXAMINED` row per
+//! column that could hold personal data but was not examined (of the
+//! inventory's examples), with the reason in the last column,
+//! `not_examined_reason` (empty on a PII row).
 //!
 //! RFC 4180, written by hand: fields separated by commas, records ended by
 //! CRLF, and a field quoted (with any `"` doubled) when it holds a comma,
@@ -27,7 +30,7 @@ use crate::error::LakeScanError;
 use crate::suppress::Outcome;
 
 /// The header row, in column order.
-pub(super) const HEADER: [&str; 15] = [
+pub(super) const HEADER: [&str; 16] = [
     "table",
     "column",
     "rule",
@@ -43,6 +46,7 @@ pub(super) const HEADER: [&str; 15] = [
     "oldest_file",
     "newest_file",
     "expires",
+    "not_examined_reason",
 ];
 
 /// `field`, escaped and made safe to open in a spreadsheet (see this
@@ -93,6 +97,16 @@ pub(super) fn write<W: Write>(
         return Ok(());
     };
     for table in inventory.tables() {
+        let dates = (
+            table
+                .file_dates()
+                .map(|(oldest, _)| format_rfc3339(oldest))
+                .unwrap_or_default(),
+            table
+                .file_dates()
+                .map(|(_, newest)| format_rfc3339(newest))
+                .unwrap_or_default(),
+        );
         for entry in table.entries() {
             let (status, reason) = status_of(entry.status(), suppressions);
             let record = [
@@ -108,17 +122,34 @@ pub(super) fn write<W: Write>(
                 status.to_owned(),
                 reason.unwrap_or_default().to_owned(),
                 table.example_key().unwrap_or_default().to_owned(),
-                table
-                    .file_dates()
-                    .map(|(oldest, _)| format_rfc3339(oldest))
-                    .unwrap_or_default(),
-                table
-                    .file_dates()
-                    .map(|(_, newest)| format_rfc3339(newest))
-                    .unwrap_or_default(),
+                dates.0.clone(),
+                dates.1.clone(),
                 expiry_of(entry.status(), suppressions)
                     .map(|date| date.to_string())
                     .unwrap_or_default(),
+                String::new(),
+            ];
+            write_record(out, &record).map_err(LakeScanError::Report)?;
+        }
+        // No rule, confidence or counts: nothing was read to have any.
+        for example in inventory.not_examined_in(table.name()) {
+            let record = [
+                table.name(),
+                &example.column,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "NOT_EXAMINED",
+                "",
+                table.example_key().unwrap_or_default(),
+                &dates.0,
+                &dates.1,
+                "",
+                example.reason.code(),
             ];
             write_record(out, &record).map_err(LakeScanError::Report)?;
         }

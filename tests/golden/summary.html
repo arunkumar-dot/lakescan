@@ -83,13 +83,14 @@ footer { margin-top: 2.5rem; padding-top: .75rem; border-top: 1px solid var(--li
 <ul>
 <li>3 of 4 Parquet files scanned; 1 not scanned (1 documented).</li>
 <li>Inspection is sampled: the dictionary and first data page of each column in up to 3 row groups, at most 2,000 values per column per row group; files read whole are downloaded whole but sampled the same way. No result proves a column holds no personal data.</li>
+<li>Columns not examined: 1 in 1 file of 1 table (<code>unsupported-type=1</code>): <span class="unknown">PII unknown in them</span>.</li>
 <li>Not in scope for --pii: 1 .csv, 1 .jpg, 1 .tar (LakeScan reads Parquet content only).</li>
 <li>Sniffed and not Parquet: 4. Empty objects and folder markers: 2.</li>
 </ul>
 </section>
 <section id="inventory">
 <h2>PII inventory</h2>
-<p>1 table with PII, 3 PII columns: 2 undocumented (1 confirmed, 1 likely, 0 possible), 1 documented. Action needed on the undocumented. 1 table with files not scanned (1 documented).</p>
+<p>1 table with PII, 3 PII columns: 2 undocumented (1 confirmed, 1 likely, 0 possible), 1 documented. Action needed on the undocumented. 1 table with files not scanned (1 documented), 1 with columns not examined.</p>
 <p class="note">Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.</p>
 <div class="filters" role="group" aria-label="Show PII columns" hidden>
 <button type="button" data-filter="all" aria-pressed="true">All</button>
@@ -99,7 +100,11 @@ footer { margin-top: 2.5rem; padding-top: .75rem; border-top: 1px solid var(--li
 </div>
 <h3 class="key">(bucket root)</h3>
 <p class="note">1 file scanned, 0 not scanned; files dated 2023-11-14 to 2023-11-14</p>
-<p>No structured PII detected in sampled data from 1 file.</p>
+<p><span class="unknown">No structured PII detected in the columns examined from 1 file; PII unknown in the columns not examined.</span></p>
+<p class="not-examined">columns not examined: 1 in 1 file (unsupported-type=1):</p>
+<ul class="not-examined">
+<li><span class="key">caller.phone</span> (<code>unsupported-type</code>)</li>
+</ul>
 <h3 class="key">warehouse/customers</h3>
 <p class="note">2 files scanned, 0 not scanned; files dated 2023-11-01 to 2023-11-14. Example: <span class="key">warehouse/customers/dt=2023-11-01/part-0.parquet</span></p>
 <table>

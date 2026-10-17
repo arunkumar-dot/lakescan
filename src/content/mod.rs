@@ -32,13 +32,16 @@
 //! sizes it declares, released when the buffers are dropped; see `budget`
 //! for how that stays deadlock-free. [`file_need`] is the most one file can
 //! hold under the caps: a whole read (the file, its metadata, one decode
-//! of two pages at [`PAGE_CAP`] plus a dictionary's slots, and one
+//! of two pages at [`PAGE_CAP`] plus a dictionary's slots and a repeated
+//! page's levels and value slots (at most [`MAX_REPEATED_VALUES`]), and one
 //! column's samples), or a partial one (metadata up to [`FOOTER_CAP`], plus
 //! the larger of opening and sampling: prefetched ranges, one decode, and
-//! a batch of columns' samples). 108,474,240 bytes (~103 MiB) at the default whole-file
+//! a batch of columns' samples). 113,192,832 bytes (~108 MiB) at the default whole-file
 //! maximum. A budget below it is a usage error. Outside the budget, each
-//! in-flight file holds only its key, counts and findings (a few
-//! kilobytes) and up to 12,288 page locations (~0.8 MiB at most); its
+//! in-flight file holds only its key, counts, findings and up to
+//! [`MAX_NOT_EXAMINED_EXAMPLES`](crate::model::MAX_NOT_EXAMINED_EXAMPLES)
+//! not-examined column paths (a few kilobytes) and up to 12,288 page
+//! locations (~0.8 MiB at most); its
 //! metadata and its per-column scan records (at most [`MAX_COLUMNS`]
 //! columns, or the file is `too-many-columns`) are under permits. None of
 //! it depends on what a
@@ -59,13 +62,14 @@ pub use budget::{
 };
 pub use fetch::{FetchError, ObjectReader, S3ObjectReader};
 pub use read::{
-    COALESCE_MAX, DEFAULT_COALESCE_GAP, FOOTER_CAP, MAX_COLUMNS, MAX_ROW_GROUPS,
-    MAX_VALUES_PER_ROW_GROUP, PAGE_CAP, TAIL_BYTES, file_need,
+    COALESCE_MAX, DEFAULT_COALESCE_GAP, FOOTER_CAP, MAX_COLUMNS, MAX_REPEATED_VALUES,
+    MAX_ROW_GROUPS, MAX_VALUES_PER_ROW_GROUP, PAGE_CAP, TAIL_BYTES, file_need,
 };
 pub use sim::{Latency, SimStore};
 
 use crate::model::{
-    ColumnDetail, Detail, Finding, NotScannedReason, ObjectMeta, PiiType, RuleId, Severity,
+    ColumnDetail, Detail, Finding, NotExamined, NotExaminedReason, NotScannedReason, ObjectMeta,
+    PiiType, RuleId, Severity,
 };
 
 /// The default `--pii-whole-file-max`: objects at or below this size are
@@ -295,7 +299,9 @@ pub enum FileOutcome {
 pub struct FileStats {
     /// Candidate columns sampled and classified.
     pub columns_examined: u64,
-    /// Repeated (list or map) columns, never read.
+    /// Repeated (list or map) columns, never read. Always 0 since M12,
+    /// which reads repeated string and integer columns; kept so the
+    /// summary's fields stay the same.
     pub skipped_repeated: u64,
     /// Columns of a type detection does not cover (booleans, floats,
     /// decimals, times).
@@ -313,6 +319,21 @@ pub struct FileStats {
     pub get_requests: u64,
     /// 1 if the object was sniffed for the Parquet magic, else 0.
     pub sniffed: u64,
+    /// Columns that could hold personal data but were not examined, per
+    /// reason, indexed by [`NotExaminedReason::index`]: string and integer
+    /// columns skipped for any reason, and columns of an unsupported type
+    /// whose name hints personal data. A subset of the skipped counts.
+    pub not_examined: [u64; NotExaminedReason::ALL.len()],
+}
+
+impl FileStats {
+    /// Columns not examined, for any reason.
+    #[must_use]
+    pub fn not_examined_total(&self) -> u64 {
+        self.not_examined
+            .iter()
+            .fold(0, |total, &n| total.saturating_add(n))
+    }
 }
 
 /// One column's PII verdict.
@@ -331,6 +352,10 @@ pub struct FileScan {
     pub outcome: FileOutcome,
     /// One verdict per column found to hold PII.
     pub columns: Vec<ColumnFinding>,
+    /// Columns that could hold personal data but were not examined: the
+    /// smallest [`crate::model::MAX_NOT_EXAMINED_EXAMPLES`], by path then
+    /// reason. [`FileStats::not_examined`] counts them all.
+    pub not_examined: Vec<NotExamined>,
     /// Counts for the content summary.
     pub stats: FileStats,
 }
@@ -402,12 +427,18 @@ pub async fn scan_file<R: ObjectReader>(
                 FileOutcome::ScannedPartially
             },
             columns: scanned.findings,
+            not_examined: scanned.not_examined,
             stats,
         },
+        // A file not scanned has no columns of its own to report.
         Err(reason) => FileScan {
             outcome: FileOutcome::NotScanned(reason),
             columns: Vec::new(),
-            stats,
+            not_examined: Vec::new(),
+            stats: FileStats {
+                not_examined: [0; NotExaminedReason::ALL.len()],
+                ..stats
+            },
         },
     }
 }
@@ -429,6 +460,7 @@ pub async fn sniff_and_scan<R: ObjectReader>(
     let not = |outcome, stats| FileScan {
         outcome,
         columns: Vec::new(),
+        not_examined: Vec::new(),
         stats,
     };
     let mut stats = FileStats {

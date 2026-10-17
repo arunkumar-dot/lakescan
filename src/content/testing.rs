@@ -3,7 +3,7 @@
 //! unit tests build exactly the files they need.
 
 use parquet::basic::{LogicalType, Repetition, Type as Physical};
-use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
+use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
 use parquet::errors::ParquetError;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::file::writer::SerializedFileWriter;
@@ -26,12 +26,58 @@ pub(crate) enum Values {
     Double(Vec<f64>),
     /// `repeated binary (STRING)`, one element per row.
     RepeatedText(Vec<String>),
+    /// `required boolean`.
+    Bool(Vec<bool>),
+    /// A standard three-level `LIST` of `optional binary (STRING)`
+    /// (`<name>.list.element`), one list per row.
+    List(Vec<Vec<String>>),
+    /// A standard three-level `LIST` of structs with one `optional binary
+    /// (STRING)` field (`<name>.list.element.<field>`), one list per row.
+    ListOfStruct(&'static str, Vec<Vec<String>>),
+}
+
+/// A string leaf.
+fn string_leaf(name: &str, repetition: Repetition) -> parquet::errors::Result<Arc<Type>> {
+    Ok(Arc::new(
+        Type::primitive_type_builder(name, Physical::BYTE_ARRAY)
+            .with_repetition(repetition)
+            .with_logical_type(Some(LogicalType::String))
+            .build()?,
+    ))
+}
+
+/// `optional group <name> (LIST) { repeated group list { <element> } }`.
+fn list_of(name: &str, element: Arc<Type>) -> parquet::errors::Result<Arc<Type>> {
+    let list = Type::group_type_builder("list")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(vec![element])
+        .build()?;
+    Ok(Arc::new(
+        Type::group_type_builder(name)
+            .with_repetition(Repetition::OPTIONAL)
+            .with_logical_type(Some(LogicalType::List))
+            .with_fields(vec![Arc::new(list)])
+            .build()?,
+    ))
 }
 
 impl Values {
     /// The column's schema type, built rather than parsed from text, so a
     /// name may hold any character (hostile-name tests rely on that).
     fn schema_type(&self, name: &str) -> parquet::errors::Result<Arc<Type>> {
+        match self {
+            Self::List(_) => {
+                return list_of(name, string_leaf("element", Repetition::OPTIONAL)?);
+            }
+            Self::ListOfStruct(field, _) => {
+                let element = Type::group_type_builder("element")
+                    .with_repetition(Repetition::OPTIONAL)
+                    .with_fields(vec![string_leaf(field, Repetition::OPTIONAL)?])
+                    .build()?;
+                return list_of(name, Arc::new(element));
+            }
+            _ => {}
+        }
         let (physical, repetition, logical) = match self {
             Self::Text(_) => (
                 Physical::BYTE_ARRAY,
@@ -50,6 +96,10 @@ impl Values {
                 Repetition::REPEATED,
                 Some(LogicalType::String),
             ),
+            Self::Bool(_) => (Physical::BOOLEAN, Repetition::REQUIRED, None),
+            Self::List(_) | Self::ListOfStruct(..) => {
+                return Err(ParquetError::General("built above".to_owned()));
+            }
         };
         Ok(Arc::new(
             Type::primitive_type_builder(name, physical)
@@ -66,8 +116,30 @@ impl Values {
             Self::Date(v) => v.len(),
             Self::Double(v) => v.len(),
             Self::RepeatedText(v) => v.len(),
+            Self::Bool(v) => v.len(),
+            Self::List(v) | Self::ListOfStruct(_, v) => v.len(),
         }
     }
+}
+
+/// The values and levels of lists of strings whose element is defined at
+/// `defined` (3 for a list of strings, 4 for a list of one-field structs):
+/// an empty list is defined at 1 (the list, no element), each element
+/// repeats at 1 after the first.
+fn list_levels(lists: &[Vec<String>], defined: i16) -> (Vec<ByteArray>, Vec<i16>, Vec<i16>) {
+    let (mut values, mut definitions, mut repetitions) = (Vec::new(), Vec::new(), Vec::new());
+    for list in lists {
+        if list.is_empty() {
+            definitions.push(1);
+            repetitions.push(0);
+        }
+        for (at, value) in list.iter().enumerate() {
+            values.push(ByteArray::from(value.as_str()));
+            definitions.push(defined);
+            repetitions.push(i16::from(at > 0));
+        }
+    }
+    (values, definitions, repetitions)
 }
 
 /// How the test file is written.
@@ -105,6 +177,73 @@ fn optional<T: Clone>(values: &[Option<T>]) -> (Vec<T>, Vec<i16>) {
     let present = values.iter().flatten().cloned().collect();
     let levels = values.iter().map(|v| i16::from(v.is_some())).collect();
     (present, levels)
+}
+
+/// Writes rows `from..to` of `values` to `column`.
+fn write_column(
+    column: &mut parquet::file::writer::SerializedColumnWriter<'_>,
+    values: &Values,
+    from: usize,
+    to: usize,
+) -> parquet::errors::Result<()> {
+    match values {
+        Values::Text(all) => {
+            let (present, levels) = optional(&split(all, from, to));
+            let present: Vec<ByteArray> = present
+                .into_iter()
+                .map(|s| ByteArray::from(s.as_str()))
+                .collect();
+            column
+                .typed::<ByteArrayType>()
+                .write_batch(&present, Some(&levels), None)?;
+        }
+        Values::Int64(all) => {
+            let (present, levels) = optional(&split(all, from, to));
+            column
+                .typed::<Int64Type>()
+                .write_batch(&present, Some(&levels), None)?;
+        }
+        Values::Date(all) => {
+            let (present, levels) = optional(&split(all, from, to));
+            column
+                .typed::<Int32Type>()
+                .write_batch(&present, Some(&levels), None)?;
+        }
+        Values::Double(all) => {
+            column
+                .typed::<DoubleType>()
+                .write_batch(&split(all, from, to), None, None)?;
+        }
+        Values::Bool(all) => {
+            column
+                .typed::<BoolType>()
+                .write_batch(&split(all, from, to), None, None)?;
+        }
+        Values::List(all) | Values::ListOfStruct(_, all) => {
+            let defined = if matches!(values, Values::List(_)) {
+                3
+            } else {
+                4
+            };
+            let (present, definitions, repetitions) = list_levels(&split(all, from, to), defined);
+            column.typed::<ByteArrayType>().write_batch(
+                &present,
+                Some(&definitions),
+                Some(&repetitions),
+            )?;
+        }
+        Values::RepeatedText(all) => {
+            let part = split(all, from, to);
+            let present: Vec<ByteArray> =
+                part.iter().map(|s| ByteArray::from(s.as_str())).collect();
+            let ones = vec![1_i16; present.len()];
+            let zeros = vec![0_i16; present.len()];
+            column
+                .typed::<ByteArrayType>()
+                .write_batch(&present, Some(&ones), Some(&zeros))?;
+        }
+    }
+    Ok(())
 }
 
 /// Writes `columns` (all the same length, at least one row) as a Parquet
@@ -148,47 +287,7 @@ pub(crate) fn parquet_file(
             let Some(mut column) = group.next_column()? else {
                 return Err(ParquetError::General("missing column".to_owned()));
             };
-            match values {
-                Values::Text(all) => {
-                    let (present, levels) = optional(&split(all, from, to));
-                    let present: Vec<ByteArray> = present
-                        .into_iter()
-                        .map(|s| ByteArray::from(s.as_str()))
-                        .collect();
-                    column
-                        .typed::<ByteArrayType>()
-                        .write_batch(&present, Some(&levels), None)?;
-                }
-                Values::Int64(all) => {
-                    let (present, levels) = optional(&split(all, from, to));
-                    column
-                        .typed::<Int64Type>()
-                        .write_batch(&present, Some(&levels), None)?;
-                }
-                Values::Date(all) => {
-                    let (present, levels) = optional(&split(all, from, to));
-                    column
-                        .typed::<Int32Type>()
-                        .write_batch(&present, Some(&levels), None)?;
-                }
-                Values::Double(all) => {
-                    column
-                        .typed::<DoubleType>()
-                        .write_batch(&split(all, from, to), None, None)?;
-                }
-                Values::RepeatedText(all) => {
-                    let part = split(all, from, to);
-                    let present: Vec<ByteArray> =
-                        part.iter().map(|s| ByteArray::from(s.as_str())).collect();
-                    let ones = vec![1_i16; present.len()];
-                    let zeros = vec![0_i16; present.len()];
-                    column.typed::<ByteArrayType>().write_batch(
-                        &present,
-                        Some(&ones),
-                        Some(&zeros),
-                    )?;
-                }
-            }
+            write_column(&mut column, values, from, to)?;
             column.close()?;
         }
         group.close()?;
@@ -200,16 +299,17 @@ pub(crate) fn parquet_file(
     writer.into_inner()
 }
 
-/// Reserved email domains (RFC 2606 and RFC 6761): no test address can
-/// belong to anyone.
+/// Domains under the reserved `.example` top-level domain (RFC 2606): no
+/// test address can belong to anyone, and `clean` keeps them (it drops
+/// `example.com`, `.org`, `.net` and `.test` as test accounts).
 const EMAIL_DOMAINS: [&str; 7] = [
-    "example.com",
-    "example.org",
-    "example.net",
-    "mail.test",
-    "acme.test",
-    "shop.test",
-    "corp.test",
+    "mail.example",
+    "acme.example",
+    "fintech.example",
+    "shop.example",
+    "corp.example",
+    "bank.example",
+    "post.example",
 ];
 
 /// `n` distinct, valid email addresses, on reserved domains only.
@@ -217,7 +317,7 @@ pub(crate) fn emails(n: usize) -> Vec<Option<String>> {
     (0..n)
         .map(|i| {
             let domain = EMAIL_DOMAINS.get(i % EMAIL_DOMAINS.len()).copied();
-            Some(format!("person.{i}@{}", domain.unwrap_or("example.com")))
+            Some(format!("person.{i}@{}", domain.unwrap_or("mail.example")))
         })
         .collect()
 }

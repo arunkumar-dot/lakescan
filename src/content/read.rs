@@ -31,6 +31,21 @@
 //! then handed to `parquet` as an uncompressed chunk. LZO is skipped as an
 //! unsupported codec.
 //!
+//! **Repeated columns.** The leaves of lists and maps (`tags`, a list of
+//! strings; `telecom.list.element.value`, a field of a list of structs)
+//! are read like any other column, with their repetition levels, and named
+//! for their hint by the last path segment that is not a list or map
+//! wrapper (see [`hint_name`]). For one, a level and a value slot are held
+//! per declared value, not per row, so its first data page may declare at
+//! most [`MAX_REPEATED_VALUES`] values; a larger one is page-too-large.
+//!
+//! **Columns not examined.** A string or integer column that was skipped
+//! (page too large, unreadable, unsupported codec), and a column of a type
+//! detection does not read (a float, a decimal, a time; not a boolean)
+//! whose name hints personal data, are recorded as *not examined*, so a
+//! table whose personal-data columns could not be checked never reads as
+//! clean.
+//!
 //! **Files with nothing examined.** A file whose value-bearing candidate
 //! columns (strings and integers) were all skipped is `no-column-examined`:
 //! not scanned, so a lake of such files cannot pass silently.
@@ -49,8 +64,8 @@ use std::sync::Arc;
 use aws_sdk_s3::primitives::AggregatedBytes;
 use parquet::basic::{Compression, ConvertedType, LogicalType, Type as Physical};
 use parquet::column::page::{Page, PageMetadata, PageReader};
-use parquet::column::reader::{ColumnReader, get_column_reader};
-use parquet::data_type::{ByteArray, FixedLenByteArray};
+use parquet::column::reader::{ColumnReader, ColumnReaderImpl, get_column_reader};
+use parquet::data_type::{ByteArray, DataType, FixedLenByteArray};
 use parquet::errors::Result as ParquetResult;
 use parquet::file::metadata::{
     ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
@@ -60,16 +75,18 @@ use parquet::file::page_index::offset_index::PageLocation;
 use parquet::file::properties::ReaderProperties;
 use parquet::file::reader::ChunkReader;
 use parquet::file::serialized_reader::SerializedPageReader;
-use parquet::schema::types::{ColumnDescPtr, ColumnDescriptor};
+use parquet::schema::types::{ColumnDescPtr, ColumnDescriptor, Type as SchemaType};
 
 use super::budget::{FileBudget, Permit, Refused};
-use super::classify::{Evidence, Kind, classify};
+use super::classify::{Evidence, Kind, Named, classify};
 use super::clean::{clean, drop_dominant};
 use super::fetch::{FetchError, ObjectReader};
 use super::header;
-use super::names;
+use super::names::{self, Hint};
 use super::{ColumnFinding, FileStats};
-use crate::model::{ColumnDetail, NotScannedReason};
+use crate::model::{
+    ColumnDetail, NotExamined, NotExaminedReason, NotScannedReason, offer_not_examined,
+};
 
 /// The tail read that opens a partially read file.
 pub const TAIL_BYTES: u64 = 64 * 1024;
@@ -124,9 +141,20 @@ const PREFETCH_CAP: u64 = WINDOW_LIMIT;
 const COLUMN_BATCH: usize = 8;
 /// The most bytes one dictionary slot takes in `parquet`.
 const DICTIONARY_SLOT_BYTES: u64 = 32;
+/// The most values the first data page of a repeated column may declare.
+/// A flat column's levels and values are decoded [`BATCH`] at a time, but a
+/// repeated column's whole page of levels is decoded at once, so this
+/// bounds the levels and value slots one decode holds.
+pub const MAX_REPEATED_VALUES: u64 = 128 * 1024;
+/// What one declared value of a repeated column's page holds while
+/// decoding: a value slot (at most a `ByteArray`) and a definition and a
+/// repetition level.
+const REPEATED_SLOT_BYTES: u64 = size_of::<ByteArray>() as u64 + 2 * size_of::<i16>() as u64;
 /// The most a decode can allocate under the caps: two pages at the page
-/// cap and a dictionary's slots.
-const DECODE_MAX: u64 = 2 * PAGE_CAP + MAX_DICTIONARY_VALUES * DICTIONARY_SLOT_BYTES;
+/// cap, a dictionary's slots, and a repeated page's levels and slots.
+const DECODE_MAX: u64 = 2 * PAGE_CAP
+    + MAX_DICTIONARY_VALUES * DICTIONARY_SLOT_BYTES
+    + MAX_REPEATED_VALUES * REPEATED_SLOT_BYTES;
 /// The most one column's sample from one row group takes: up to
 /// `MAX_VALUES_PER_ROW_GROUP + BATCH` (3,024) values before the cut, each
 /// at most `clean::MAX_VALUE_BYTES` (257) plus a `String` (24 bytes).
@@ -242,6 +270,8 @@ struct Checked<B> {
 pub(super) struct Scanned {
     /// One verdict per column found to hold PII.
     pub(super) findings: Vec<ColumnFinding>,
+    /// The smallest columns not examined (see [`FileStats::not_examined`]).
+    pub(super) not_examined: Vec<NotExamined>,
     /// Whether the file had string or integer columns to read, and none of
     /// them could be read.
     pub(super) nothing_examined: bool,
@@ -252,6 +282,9 @@ struct Candidate {
     index: usize,
     descr: ColumnDescPtr,
     kind: Kind,
+    /// What its name hints, and what else it says (see [`hint_name`]).
+    hint: Option<Hint>,
+    named: Named,
     values: Vec<String>,
     permits: Vec<Permit>,
     evidence: Evidence,
@@ -260,11 +293,16 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn new(index: usize, descr: ColumnDescPtr, kind: Kind) -> Self {
+    fn new(index: usize, descr: ColumnDescPtr, kind: Kind, name: &str) -> Self {
         Self {
             index,
             descr,
             kind,
+            hint: names::hint(name),
+            named: Named {
+                person: names::about_person(name),
+                phone: names::phone_named(name),
+            },
             values: Vec::new(),
             permits: Vec::new(),
             evidence: Evidence::default(),
@@ -628,22 +666,9 @@ impl<R: ObjectReader, B: Window> Session<R, B> {
         metadata: &ParquetMetaData,
         opened: &Opened<B>,
     ) -> Result<Scanned, NotScannedReason> {
-        let schema = metadata.file_metadata().schema_descr();
         let order = row_group_order(metadata.num_row_groups());
-        let mut candidates = Vec::new();
-        for index in 0..schema.num_columns() {
-            let descr = schema.column(index);
-            if descr.max_rep_level() > 0 {
-                self.stats.skipped_repeated = self.stats.skipped_repeated.saturating_add(1);
-                continue;
-            }
-            let Some(kind) = kind_of(&descr) else {
-                self.stats.skipped_unsupported_type =
-                    self.stats.skipped_unsupported_type.saturating_add(1);
-                continue;
-            };
-            candidates.push(Candidate::new(index, descr, kind));
-        }
+        let mut not_examined = Vec::new();
+        let mut candidates = self.candidates(metadata, &mut not_examined);
 
         let batch = match opened {
             Opened::Whole(_) => 1,
@@ -699,6 +724,14 @@ impl<R: ObjectReader, B: Window> Session<R, B> {
                     None => &mut self.stats.columns_examined,
                 };
                 *count = count.saturating_add(1);
+                if let Some(skip) = candidate.skipped {
+                    let reason = match skip {
+                        Skip::PageTooLarge => NotExaminedReason::PageTooLarge,
+                        Skip::UnsupportedCodec => NotExaminedReason::UnsupportedCodec,
+                        Skip::Unreadable => NotExaminedReason::Unreadable,
+                    };
+                    self.not_examined(&mut not_examined, &candidate.descr, reason);
+                }
                 if candidate.kind != Kind::Temporal {
                     to_read += 1;
                 }
@@ -710,9 +743,18 @@ impl<R: ObjectReader, B: Window> Session<R, B> {
                 }
                 if candidate.kind != Kind::Temporal {
                     read += 1;
+                } else if all_null(metadata, &order, candidate.index) {
+                    // A date column whose statistics say every sampled row
+                    // group is null: nothing to report, as for a read
+                    // column with no value left after cleaning.
+                    continue;
                 }
-                let hint = names::hint(candidate.descr.name());
-                if let Some(verdict) = classify(&candidate.evidence, hint, candidate.kind) {
+                if let Some(verdict) = classify(
+                    &candidate.evidence,
+                    candidate.hint,
+                    candidate.kind,
+                    candidate.named,
+                ) {
                     findings.push(ColumnFinding {
                         pii: verdict.pii,
                         detail: ColumnDetail::new(
@@ -726,8 +768,52 @@ impl<R: ObjectReader, B: Window> Session<R, B> {
         }
         Ok(Scanned {
             findings,
+            not_examined,
             nothing_examined: to_read > 0 && read == 0,
         })
+    }
+
+    /// The columns of `metadata`'s schema whose values (or, for dates,
+    /// names) are checked, each named for its hint (see [`hint_name`]).
+    /// The rest are skipped as of an unsupported type, and those whose
+    /// name hints personal data are recorded in `not_examined`.
+    fn candidates(
+        &mut self,
+        metadata: &ParquetMetaData,
+        not_examined: &mut Vec<NotExamined>,
+    ) -> Vec<Candidate> {
+        let schema = metadata.file_metadata().schema_descr();
+        let mut candidates = Vec::new();
+        for index in 0..schema.num_columns() {
+            let descr = schema.column(index);
+            let name = hint_name(schema.root_schema(), &descr);
+            let Some(kind) = kind_of(&descr) else {
+                self.stats.skipped_unsupported_type =
+                    self.stats.skipped_unsupported_type.saturating_add(1);
+                // A float or decimal can hold a phone or card number, and a
+                // time a birth date: not a boolean.
+                if descr.physical_type() != Physical::BOOLEAN && names::hint(name).is_some() {
+                    self.not_examined(not_examined, &descr, NotExaminedReason::UnsupportedType);
+                }
+                continue;
+            };
+            candidates.push(Candidate::new(index, descr, kind, name));
+        }
+        candidates
+    }
+
+    /// Counts column `descr` as not examined for `reason`, and offers it to
+    /// the file's examples.
+    fn not_examined(
+        &mut self,
+        examples: &mut Vec<NotExamined>,
+        descr: &ColumnDescriptor,
+        reason: NotExaminedReason,
+    ) {
+        if let Some(count) = self.stats.not_examined.get_mut(reason.index()) {
+            *count = count.saturating_add(1);
+        }
+        offer_not_examined(examples, &NotExamined::new(&descr.path().string(), reason));
     }
 
     /// Samples column `index` of `row_group` from a file read whole: its
@@ -763,7 +849,7 @@ impl<R: ObjectReader, B: Window> Session<R, B> {
         else {
             return Ok(ColumnRead::Unreadable);
         };
-        match plan_pages(bytes, len, min_value_bytes(descr)) {
+        match plan_pages(bytes, len, min_value_bytes(descr), repeated(descr)) {
             Plan::Ready {
                 offset,
                 len: page_len,
@@ -959,7 +1045,12 @@ impl<R: ObjectReader, B: Window> Session<R, B> {
         };
         let window = request.end - request.start;
         Ok(
-            match plan_pages(bytes, request.chunk_len, min_value_bytes(descr)) {
+            match plan_pages(
+                bytes,
+                request.chunk_len,
+                min_value_bytes(descr),
+                repeated(descr),
+            ) {
                 Plan::Ready {
                     offset,
                     len,
@@ -1197,13 +1288,15 @@ enum Plan {
         offset: u64,
         len: u64,
         /// What decoding allocates for the pages: their declared
-        /// uncompressed sizes, and a dictionary's slots.
+        /// uncompressed sizes, a dictionary's slots, and for a repeated
+        /// column, its levels and value slots.
         decode_bytes: u64,
     },
     /// More bytes are needed: the chunk's first `n`.
     NeedMore(u64),
-    /// A page declares more than [`PAGE_CAP`], or a dictionary more than
-    /// [`MAX_DICTIONARY_VALUES`].
+    /// A page declares more than [`PAGE_CAP`], a dictionary more than
+    /// [`MAX_DICTIONARY_VALUES`], or a repeated column's data page more
+    /// than [`MAX_REPEATED_VALUES`].
     TooLarge,
     /// Not a valid page sequence.
     Invalid,
@@ -1212,8 +1305,9 @@ enum Plan {
 /// Walks the page headers at the start of a column chunk (`bytes`, the
 /// chunk's first bytes; `chunk_len`, its full length) up to the first data
 /// page, checking every declared size before anything is allocated for
-/// it: an optional dictionary page, then a data page.
-fn plan_pages(bytes: &[u8], chunk_len: u64, min_value_bytes: u64) -> Plan {
+/// it: an optional dictionary page, then a data page, which for a
+/// `repeated` column must declare at most [`MAX_REPEATED_VALUES`] values.
+fn plan_pages(bytes: &[u8], chunk_len: u64, min_value_bytes: u64, repeated: bool) -> Plan {
     let held = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let mut pos: u64 = 0;
     let mut first = true;
@@ -1254,13 +1348,21 @@ fn plan_pages(bytes: &[u8], chunk_len: u64, min_value_bytes: u64) -> Plan {
                 first = false;
             }
             header::DATA_PAGE | header::DATA_PAGE_V2 => {
+                if repeated && page.data_values > MAX_REPEATED_VALUES {
+                    return Plan::TooLarge;
+                }
+                let levels = if repeated {
+                    page.data_values * REPEATED_SLOT_BYTES
+                } else {
+                    0
+                };
                 return if end > held {
                     Plan::NeedMore(end)
                 } else {
                     Plan::Ready {
                         offset: pos,
                         len: end - pos,
-                        decode_bytes: dictionary_bytes + page.uncompressed,
+                        decode_bytes: dictionary_bytes + page.uncompressed + levels,
                     }
                 };
             }
@@ -1440,69 +1542,147 @@ fn decode<B: Window>(
         done: false,
     };
     let mut out = Vec::new();
-    let keep = |out: &mut Vec<String>, raw: &str| {
-        if let Some(value) = clean(raw) {
-            out.push(value.to_owned());
-        }
-    };
-    let mut definitions: Vec<i16> = Vec::new();
+    let repeated = repeated(descr);
+    let text = |value: &[u8]| String::from_utf8_lossy(value).into_owned();
     match get_column_reader(Arc::clone(descr), Box::new(pages)) {
-        ColumnReader::ByteArrayColumnReader(mut reader) => loop {
-            let mut batch: Vec<ByteArray> = Vec::new();
-            definitions.clear();
-            let (records, _, _) =
-                reader.read_records(BATCH, Some(&mut definitions), None, &mut batch)?;
-            for value in &batch {
-                keep(&mut out, &String::from_utf8_lossy(value.data()));
-            }
-            if records == 0 || full(&out) {
-                break;
-            }
-        },
-        ColumnReader::FixedLenByteArrayColumnReader(mut reader) => loop {
-            let mut batch: Vec<FixedLenByteArray> = Vec::new();
-            definitions.clear();
-            let (records, _, _) =
-                reader.read_records(BATCH, Some(&mut definitions), None, &mut batch)?;
-            for value in &batch {
-                keep(&mut out, &String::from_utf8_lossy(value.data()));
-            }
-            if records == 0 || full(&out) {
-                break;
-            }
-        },
-        ColumnReader::Int32ColumnReader(mut reader) => loop {
-            let mut batch: Vec<i32> = Vec::new();
-            definitions.clear();
-            let (records, _, _) =
-                reader.read_records(BATCH, Some(&mut definitions), None, &mut batch)?;
-            for value in &batch {
-                keep(&mut out, &value.to_string());
-            }
-            if records == 0 || full(&out) {
-                break;
-            }
-        },
-        ColumnReader::Int64ColumnReader(mut reader) => loop {
-            let mut batch: Vec<i64> = Vec::new();
-            definitions.clear();
-            let (records, _, _) =
-                reader.read_records(BATCH, Some(&mut definitions), None, &mut batch)?;
-            for value in &batch {
-                keep(&mut out, &value.to_string());
-            }
-            if records == 0 || full(&out) {
-                break;
-            }
-        },
+        ColumnReader::ByteArrayColumnReader(reader) => {
+            read_values(reader, repeated, &mut out, |v: &ByteArray| text(v.data()))?;
+        }
+        ColumnReader::FixedLenByteArrayColumnReader(reader) => {
+            read_values(reader, repeated, &mut out, |v: &FixedLenByteArray| {
+                text(v.data())
+            })?;
+        }
+        ColumnReader::Int32ColumnReader(reader) => {
+            read_values(reader, repeated, &mut out, i32::to_string)?;
+        }
+        ColumnReader::Int64ColumnReader(reader) => {
+            read_values(reader, repeated, &mut out, i64::to_string)?;
+        }
         _ => {}
     }
     out.truncate(MAX_VALUES_PER_ROW_GROUP);
     Ok(out)
 }
 
+/// Reads the page `column` was given, [`BATCH`] rows at a time, adding
+/// each value `render`ed and cleaned to `out` until it holds
+/// [`MAX_VALUES_PER_ROW_GROUP`]. A `repeated` column's levels are read too:
+/// `parquet` needs them to find rows.
+fn read_values<T: DataType>(
+    mut column: ColumnReaderImpl<T>,
+    repeated: bool,
+    out: &mut Vec<String>,
+    render: impl Fn(&T::T) -> String,
+) -> ParquetResult<()> {
+    let mut definitions: Vec<i16> = Vec::new();
+    let mut repetitions: Option<Vec<i16>> = repeated.then(Vec::new);
+    loop {
+        let mut batch: Vec<T::T> = Vec::new();
+        definitions.clear();
+        if let Some(levels) = repetitions.as_mut() {
+            levels.clear();
+        }
+        let (records, _, _) = column.read_records(
+            BATCH,
+            Some(&mut definitions),
+            repetitions.as_mut(),
+            &mut batch,
+        )?;
+        for value in batch
+            .iter()
+            .take(MAX_VALUES_PER_ROW_GROUP.saturating_sub(out.len()))
+        {
+            if let Some(value) = clean(&render(value)) {
+                out.push(value.to_owned());
+            }
+        }
+        if records == 0 || full(out) {
+            return Ok(());
+        }
+    }
+}
+
 fn full(values: &[String]) -> bool {
     values.len() >= MAX_VALUES_PER_ROW_GROUP
+}
+
+/// Whether `descr` is a repeated column: a leaf of a list or a map.
+fn repeated(descr: &ColumnDescriptor) -> bool {
+    descr.max_rep_level() > 0
+}
+
+/// The name column `descr`'s hint is read from: the last segment of its
+/// path that is not a list or map wrapper. `tags.list.element` is `tags`,
+/// `name.list.element.given.list.element` is `given`, and
+/// `attrs.key_value.value` is `attrs`. Walks `root` (the file's schema)
+/// along the path: under a `LIST` group, its repeated child is a wrapper,
+/// and so is that child's only field in the standard three-level form
+/// (`list`, `element`; not the legacy `array` or `<name>_tuple`); under a
+/// `MAP` group, its `key_value` group and the `key` and `value` in it are.
+/// A plain column's name is its own (`descr.name()`).
+fn hint_name<'a>(root: &'a SchemaType, descr: &ColumnDescriptor) -> &'a str {
+    let mut node = root;
+    let mut name = "";
+    let mut wrappers = 0_usize;
+    for part in descr.path().parts() {
+        if !node.is_group() {
+            break;
+        }
+        let Some(child) = node.get_fields().iter().find(|field| field.name() == part) else {
+            break;
+        };
+        node = child;
+        if wrappers > 0 {
+            wrappers -= 1;
+        } else {
+            name = node.name();
+        }
+        if node.is_group() {
+            let info = node.get_basic_info();
+            let list = matches!(info.logical_type_ref(), Some(LogicalType::List))
+                || info.converted_type() == ConvertedType::LIST;
+            let map = matches!(info.logical_type_ref(), Some(LogicalType::Map))
+                || matches!(
+                    info.converted_type(),
+                    ConvertedType::MAP | ConvertedType::MAP_KEY_VALUE
+                );
+            if map {
+                wrappers = 2;
+            } else if list {
+                let three_level = match node.get_fields() {
+                    [child] => {
+                        child.is_group()
+                            && child.get_fields().len() == 1
+                            && child.name() != "array"
+                            && !child.name().ends_with("_tuple")
+                    }
+                    _ => false,
+                };
+                wrappers = if three_level { 2 } else { 1 };
+            }
+        }
+    }
+    name
+}
+
+/// Whether column `index` is all null in every row group of `order`, by
+/// its chunks' statistics: `false` when any is missing.
+fn all_null(metadata: &ParquetMetaData, order: &[usize], index: usize) -> bool {
+    !order.is_empty()
+        && order.iter().all(|&row_group| {
+            metadata
+                .row_groups()
+                .get(row_group)
+                .and_then(|group| group.columns().get(index))
+                .is_some_and(|chunk| {
+                    let values = u64::try_from(chunk.num_values()).unwrap_or(u64::MAX);
+                    chunk
+                        .statistics()
+                        .and_then(parquet::file::statistics::Statistics::null_count_opt)
+                        .is_some_and(|nulls| values > 0 && nulls >= values)
+                })
+        })
 }
 
 /// Yields only the first data page of a column chunk (and the dictionary
@@ -1598,9 +1778,98 @@ mod tests {
 
     use super::header::PageHeader;
     use super::{
-        COALESCE_MAX, Codec, Request, brotli_window_is_standard, coalesce, file_need, inflate,
-        row_group_order,
+        COALESCE_MAX, Codec, Request, brotli_window_is_standard, coalesce, file_need, hint_name,
+        inflate, row_group_order,
     };
+
+    /// Every leaf of `schema` (a message type) with the name its hint is
+    /// read from.
+    fn hint_names(schema: &str) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+        let root = std::sync::Arc::new(parquet::schema::parser::parse_message_type(schema)?);
+        let descriptor = parquet::schema::types::SchemaDescriptor::new(root);
+        Ok((0..descriptor.num_columns())
+            .map(|index| {
+                let column = descriptor.column(index);
+                (
+                    column.path().string(),
+                    hint_name(descriptor.root_schema(), &column).to_owned(),
+                )
+            })
+            .collect())
+    }
+
+    /// FHIR as `DuckDB` writes it (the experiment's Synthea patients), the
+    /// legacy list forms, and maps.
+    #[test]
+    fn a_hint_is_read_from_the_leaf_behind_list_and_map_wrappers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = "
+            message patient {
+                optional binary id (STRING);
+                optional group billing { optional binary email (STRING); }
+                optional group name (LIST) {
+                    repeated group list {
+                        optional group element {
+                            optional binary family (STRING);
+                            optional group given (LIST) {
+                                repeated group list { optional binary element (STRING); }
+                            }
+                        }
+                    }
+                }
+                optional group telecom (LIST) {
+                    repeated group list {
+                        optional group element {
+                            optional binary system (STRING);
+                            optional binary value (STRING);
+                        }
+                    }
+                }
+                optional group emails (LIST) { repeated binary array (STRING); }
+                optional group phones (LIST) {
+                    repeated group phones_tuple { optional binary number (STRING); }
+                }
+                optional group contacts (LIST) {
+                    repeated group array { optional binary mobile (STRING); }
+                }
+                optional group attrs (MAP) {
+                    repeated group key_value {
+                        required binary key (STRING);
+                        optional binary value (STRING);
+                    }
+                }
+                optional group people (MAP) {
+                    repeated group key_value {
+                        required binary key (STRING);
+                        optional group value { optional binary surname (STRING); }
+                    }
+                }
+                repeated binary tags (STRING);
+            }";
+        let expected = [
+            ("id", "id"),
+            ("billing.email", "email"),
+            ("name.list.element.family", "family"),
+            ("name.list.element.given.list.element", "given"),
+            ("telecom.list.element.system", "system"),
+            ("telecom.list.element.value", "value"),
+            ("emails.array", "emails"),
+            ("phones.phones_tuple.number", "number"),
+            ("contacts.array.mobile", "mobile"),
+            ("attrs.key_value.key", "attrs"),
+            ("attrs.key_value.value", "attrs"),
+            ("people.key_value.key", "people"),
+            ("people.key_value.value.surname", "surname"),
+            ("tags", "tags"),
+        ];
+        let got = hint_names(schema)?;
+        let want: Vec<(String, String)> = expected
+            .iter()
+            .map(|&(path, name)| (path.to_owned(), name.to_owned()))
+            .collect();
+        assert_eq!(got, want);
+        Ok(())
+    }
 
     fn request(slot: usize, start: u64, end: u64) -> Request {
         Request {
@@ -1665,7 +1934,7 @@ mod tests {
 
     #[test]
     fn one_file_s_need_covers_both_read_paths() {
-        // ~103 MiB at the default whole-file maximum: partial reads
+        // ~108 MiB at the default whole-file maximum: partial reads
         // dominate; at 64 MiB, whole reads do.
         assert!(file_need(8 << 20) < 110 << 20);
         assert!(file_need(8 << 20) > 90 << 20);
@@ -1683,6 +1952,7 @@ mod tests {
             uncompressed: u64::try_from(uncompressed).unwrap_or(u64::MAX),
             compressed: 0,
             dictionary_values: 0,
+            data_values: 0,
             levels,
             values_compressed,
             len: 0,
@@ -1725,7 +1995,7 @@ mod tests {
 
     #[test]
     fn v2_levels_are_copied_and_only_the_values_decompressed() -> std::io::Result<()> {
-        let values = b"person.1@example.com".repeat(10);
+        let values = b"person.1@mail.example".repeat(10);
         let mut body = vec![1, 2, 3];
         body.extend(gzip(&values)?);
         let out = inflate(Codec::Gzip, &body, &page(3 + values.len(), 3, true));
