@@ -38,6 +38,7 @@ use crate::model::{ObjectMeta, StorageClass};
 /// one level of a virtual hierarchy).
 pub struct S3Source {
     client: aws_sdk_s3::Client,
+    sts: aws_sdk_sts::Client,
     bucket: String,
     prefix: Option<String>,
 }
@@ -88,6 +89,7 @@ impl S3Source {
 
         Ok(Self {
             client: aws_sdk_s3::Client::from_conf(s3_config),
+            sts: aws_sdk_sts::Client::new(&config),
             bucket: bucket.into(),
             prefix,
         })
@@ -101,6 +103,13 @@ impl S3Source {
     #[must_use]
     pub fn client(&self) -> aws_sdk_s3::Client {
         self.client.clone()
+    }
+
+    /// A handle on an STS client built from the same configuration, for
+    /// the credential check that runs before the listing.
+    #[must_use]
+    pub fn sts_client(&self) -> aws_sdk_sts::Client {
+        self.sts.clone()
     }
 }
 
@@ -273,7 +282,7 @@ fn hex_digit_value(byte: u8) -> Option<u8> {
 /// when the response has no such header or it is not a plausible region
 /// name. The value is printed, so anything but lowercase letters, digits
 /// and `-` is refused rather than echoed to a terminal.
-fn bucket_region(err: &SdkError<ListObjectsV2Error, HttpResponse>) -> Option<String> {
+pub(crate) fn bucket_region<E>(err: &SdkError<E, HttpResponse>) -> Option<String> {
     let region = err.raw_response()?.headers().get("x-amz-bucket-region")?;
     let plausible = !region.is_empty()
         && region.len() <= 32

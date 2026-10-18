@@ -105,6 +105,7 @@ pub mod cli;
 pub mod content;
 pub mod error;
 pub mod model;
+pub mod preflight;
 pub mod report;
 pub mod rules;
 pub mod scanner;

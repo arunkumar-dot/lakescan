@@ -366,6 +366,7 @@ What to notice:
 
 ```text
 $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii > pii-summary.txt
+lakescan: --pii requires s3:GetObject on arn:aws:s3:::lakescan-pii/*; add kms:Decrypt if the bucket uses SSE-KMS. Access-denied errors on individual files will appear in the report.
 lakescan: 3 of 11 eligible Parquet files could not be content-scanned and are not documented (not-parquet=1, unreadable=1, no-column-examined=1)
 lakescan: to accept a file that cannot be scanned, document it in --config with a content-not-scanned suppression: rule, key or prefix, reason, and optionally expires
 VERDICT
@@ -497,6 +498,7 @@ reason = "A CSV export misnamed .parquet; no personal data, reviewed 2026-10-16"
 
 ```text
 $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --config demo.toml > documented-1.txt
+lakescan: --pii requires s3:GetObject on arn:aws:s3:::lakescan-pii/*; add kms:Decrypt if the bucket uses SSE-KMS. Access-denied errors on individual files will appear in the report.
 lakescan: 2 of 11 eligible Parquet files could not be content-scanned and are not documented (unreadable=1, no-column-examined=1)
 ...
 COVERAGE
@@ -551,6 +553,7 @@ reason = "Oversized test pages; reviewed, no production data"
 
 ```text
 $ lakescan scan s3://lakescan-pii --endpoint-url http://localhost:5001 --pii --config demo.toml --inventory documented.csv > documented-2.txt
+lakescan: --pii requires s3:GetObject on arn:aws:s3:::lakescan-pii/*; add kms:Decrypt if the bucket uses SSE-KMS. Access-denied errors on individual files will appear in the report.
 COVERAGE
   parquet files:  11
   scanned:        8 (72.7%)

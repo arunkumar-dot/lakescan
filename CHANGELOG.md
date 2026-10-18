@@ -6,6 +6,15 @@ exit codes, the rule codes and the JSON summary's `schema_version`.
 
 ## [Unreleased]
 
+### Preflight checks (M14)
+
+Before the first listing, `lakescan scan` calls `sts:GetCallerIdentity` and
+`s3:HeadBucket`. Unusable credentials or a denied bucket exit 3; a missing
+bucket or one in another region exits 2, naming the `--region` to use. With
+`--pii` (and not `--quiet`) stderr gets a one-line hint about `s3:GetObject`
+and `kms:Decrypt`. `LAKESCAN_DEBUG=1` logs the caller's ARN. Scans now need
+`sts:GetCallerIdentity` too (README, Permissions).
+
 Detection fixes from real public datasets (M12; see
 [docs/experiments/real-data.md](docs/experiments/real-data.md)). Exit
 codes and rule codes are unchanged; the JSON summary gains fields and one

@@ -25,3 +25,4 @@ mod s3_source;
 
 pub use page_source::{PAGE_SIZE, PageSource, Scanner};
 pub use s3_source::S3Source;
+pub(crate) use s3_source::bucket_region;

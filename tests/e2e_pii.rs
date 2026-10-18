@@ -615,7 +615,15 @@ fn a_mixed_lake_fails_closed_until_its_unscannable_files_are_documented() -> Tes
         &["--pii"],
     )?;
     assert_eq!(documented.code, Some(1), "stderr: {}", documented.stderr);
-    assert_eq!(documented.stderr, "");
+    // Nothing but the M14 permission hint: no warnings once documented.
+    assert_eq!(
+        documented.stderr,
+        format!(
+            "lakescan: --pii requires s3:GetObject on arn:aws:s3:::{PII_BUCKET}/*; add \
+             kms:Decrypt if the bucket uses SSE-KMS. Access-denied errors on individual \
+             files will appear in the report.\n"
+        )
+    );
     assert_eq!(
         documented
             .summary

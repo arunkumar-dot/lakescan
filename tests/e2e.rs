@@ -266,6 +266,39 @@ fn a_nonexistent_bucket_exits_two() -> TestResult {
     assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.starts_with("lakescan: usage: "), "stderr: {stderr}");
     assert_eq!(stderr.lines().count(), 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("bucket s3://lakescan-e2e-no-such-bucket does not exist"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs a seeded S3-compatible server; see this file's header"]
+fn a_scan_without_credentials_exits_three() -> TestResult {
+    let endpoint = endpoint()?;
+    // Every source of credentials is removed: the environment, the shared
+    // files, and the instance metadata service. Only the region remains.
+    let output = Command::new(env!("CARGO_BIN_EXE_lakescan"))
+        .args(["scan", &format!("s3://{BUCKET}"), "--endpoint-url"])
+        .arg(endpoint)
+        .arg("--quiet")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env("AWS_CONFIG_FILE", "/dev/null")
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_REGION", "us-east-1")
+        .output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(output.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.starts_with("lakescan: auth: credentials are missing, expired, or invalid"),
+        "stderr: {stderr}"
+    );
+    assert!(output.stdout.is_empty(), "no summary before the preflight");
     Ok(())
 }
 

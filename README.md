@@ -192,14 +192,31 @@ the endpoint, and check `docker ps` for `lakescan-moto`.
 
 ## Permissions
 
-A metadata scan needs `s3:ListBucket` on the bucket. `--pii` also needs
-`s3:GetObject` on the objects it reads, and `kms:Decrypt` when those objects
-use SSE-KMS. This policy lists one prefix and reads objects under it:
+Before listing anything, LakeScan checks that your credentials work
+(`sts:GetCallerIdentity`) and that the bucket is reachable (`s3:HeadBucket`,
+authorised by `s3:ListBucket`). A failure there exits with code 3 (access) or
+2 (missing bucket or wrong region) and a message saying what to fix. The
+permissions, in full:
+
+| Action | Resource | Needed |
+|---|---|---|
+| `s3:ListBucket` | `arn:aws:s3:::<bucket>` | always |
+| `s3:GetObject` | `arn:aws:s3:::<bucket>/*` | with `--pii` |
+| `kms:Decrypt` | the KMS key ARN | with `--pii`, when the objects use SSE-KMS |
+| `sts:GetCallerIdentity` | `*` | always (the credential check) |
+
+This policy lists one prefix and reads objects under it:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
+    {
+      "Sid": "CheckCredentials",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
     {
       "Sid": "ListThePrefix",
       "Effect": "Allow",

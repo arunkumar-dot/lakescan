@@ -39,6 +39,7 @@ use crate::content::{
 };
 use crate::error::{ExitCode, LakeScanError};
 use crate::model::{RuleId, Severity};
+use crate::preflight::{self, AwsProbe};
 use crate::report::Format;
 use crate::scanner::PageSource;
 use crate::scanner::S3Source;
@@ -363,6 +364,19 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         args.endpoint_url,
     )
     .await?;
+
+    // Before any listing: unusable credentials or a wrong bucket fail here
+    // with a message that says what to fix.
+    let probe = AwsProbe::new(source.sts_client(), source.client(), &target.bucket);
+    let mut stderr_log = io::stderr();
+    let debug = std::env::var_os("LAKESCAN_DEBUG")
+        .is_some()
+        .then_some(&mut stderr_log as &mut dyn Write);
+    preflight::check(&probe, &target.bucket, debug).await?;
+    if args.pii && !args.quiet {
+        // Best effort: a hint that cannot be printed changes nothing.
+        let _ = writeln!(io::stderr(), "{}", preflight::pii_hint(&target.bucket));
+    }
 
     // Opened before the scan, so a bad path fails in a second rather than
     // after a long listing. Files are written beside their destination and
