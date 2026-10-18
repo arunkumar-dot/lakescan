@@ -6,6 +6,8 @@ exit codes, the rule codes and the JSON summary's `schema_version`.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-18
+
 ### Preflight checks (M14)
 
 Before the first listing, `lakescan scan` calls `sts:GetCallerIdentity` and
