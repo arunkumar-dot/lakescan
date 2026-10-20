@@ -13,30 +13,63 @@ never the values themselves, and exits with a code your CI can act on.
 
 A discovery aid, not a compliance assessment: no finding does not prove there is no personal data.
 
-**Quick install (macOS, Apple silicon):**
+**Quick install (macOS Apple silicon, or Linux x86_64):**
 
 ```bash
-VERSION=0.1.0
-gh release download v0.1.0 --repo arunkumar-dot/lakescan
-shasum -a 256 --check --ignore-missing SHA256SUMS
-tar -xzf "lakescan-$VERSION-aarch64-apple-darwin.tar.gz"
-cd "lakescan-$VERSION-aarch64-apple-darwin"
-xattr -d com.apple.quarantine ./lakescan 2>/dev/null || true
-./lakescan --version
+VERSION=0.1.1
+TARGET=aarch64-apple-darwin   # Linux x86_64: x86_64-unknown-linux-gnu
+BASE=https://github.com/arunkumar-dot/lakescan/releases/download/v$VERSION
+curl -fsSLO "$BASE/lakescan-$VERSION-$TARGET.tar.gz"
+curl -fsSLO "$BASE/SHA256SUMS"
+shasum -a 256 --check --ignore-missing SHA256SUMS   # Linux: sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "lakescan-$VERSION-$TARGET.tar.gz"
+cd "lakescan-$VERSION-$TARGET" && ./lakescan --version
 ```
 
-Other platforms: see [Run the release binary](#run-the-release-binary) below.
+To run it as plain `lakescan`, as the rest of this page does, copy it onto
+your `PATH`:
 
-Where the product is headed, and why, is in [docs/PRODUCT.md](docs/PRODUCT.md).
+```bash
+mkdir -p ~/.local/bin && cp lakescan ~/.local/bin/
+lakescan --version
+```
 
-Memory use does not grow with the bucket. Every stage has a fixed budget: one
-listing page in flight, fixed-size summaries, and a streaming writer. Scanning
-ten objects or ten billion uses the same memory.
+If that prints `command not found`, `~/.local/bin` is not on your `PATH`: add
+`export PATH="$HOME/.local/bin:$PATH"` to your `~/.zshrc` or `~/.bashrc` and
+open a new terminal.
+
+The other two targets (macOS Intel, Linux arm64) are in the table under
+[Run the release binary](#run-the-release-binary) below.
+
+**More:**
+
+- [docs/TUTORIAL.md](docs/TUTORIAL.md): a worked walkthrough
+- [docs/PRODUCT.md](docs/PRODUCT.md): where the product is headed, and why
+- [docs/experiments/](docs/experiments/): the measurements behind the claims
+- [CHANGELOG.md](CHANGELOG.md): what changed in each release
+- [CONTRIBUTING.md](CONTRIBUTING.md): building and contributing
+
+Memory is bounded by design and does not grow with the number of objects:
+fixed budgets (one listing page in flight, fixed-size summaries, and a
+streaming writer), checked by tests, not by a run on a very large bucket.
+
+**Tested on.** We ran `--pii` on seven public datasets (687 MB of Parquet),
+after assigning the expected answer for each column from its name and the
+dataset's published description. LakeScan reported 17 columns, and 16 of
+them matched the columns we had listed as personal data for these datasets
+(precision 16 of 17). Of the 21 listed columns of the kinds LakeScan claims
+to detect, it found 16 (recall 16 of 21). The detectors were tuned on these same seven datasets, so treat these
+figures as an upper bound, not a prediction for other data. These scans ran
+against a local S3 fake (moto), not real S3. The one real-S3 run used the
+repository's 18 test-fixture objects (14.7 MiB, ap-south-1) and produced the
+same findings as moto in every content scan. It was made from a laptop on a home connection, so it
+says nothing about speed inside AWS, and speed numbers elsewhere in this
+README come from a simulated S3. See [docs/experiments/](docs/experiments/).
 
 ## Getting started
 
-1. Download and install the binary for your platform
-   (see [Run the release binary](#run-the-release-binary) below).
+1. Install the binary with the quick install above, or for
+   another platform see [Run the release binary](#run-the-release-binary).
 
 2. Make sure your AWS credentials are configured:
    ```bash
@@ -49,7 +82,7 @@ ten objects or ten billion uses the same memory.
    lakescan scan s3://your-bucket-name
    ```
    Exit 0: no findings at or above `--fail-on` (default: High).
-   Exit 1: findings were found — read the summary.
+   Exit 1: findings at or above `--fail-on` were found — read the summary.
    Exit 6: a file could not be scanned and is not documented —
    read the summary before trusting it.
 
@@ -103,7 +136,7 @@ install from source with `cargo install` as shown below.
 Verify the download against `SHA256SUMS`, then unpack it:
 
 ```sh
-VERSION=0.1.0
+VERSION=0.1.1
 TARGET=x86_64-unknown-linux-gnu   # or one of the others above
 sha256sum --check --ignore-missing SHA256SUMS   # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
 tar -xzf "lakescan-$VERSION-$TARGET.tar.gz"
@@ -134,7 +167,7 @@ Installing from source, with Rust 1.94.1 or newer, is the other way to get
 the same binary:
 
 ```sh
-cargo install --locked --git https://github.com/arunkumar-dot/lakescan.git --tag v0.1.0
+cargo install --locked --git https://github.com/arunkumar-dot/lakescan.git --tag v0.1.1
 lakescan --version
 ```
 
@@ -588,8 +621,8 @@ below that is a usage error, since that file could never start. Files
 share the budget so that none can wait forever: each in-flight file may
 hold an equal share freely, and one file at a time may go beyond it. On
 top of the budget, each in-flight file holds a few kilobytes of state and
-up to ~0.8 MiB of page locations. A bigger budget lets more files run at
-full speed at high `--concurrency`: with 512 MiB, a whole-file read fits
+up to ~0.8 MiB of page locations. A bigger budget lets more files proceed at
+once without waiting for memory at high `--concurrency`: with 512 MiB, a whole-file read fits
 in each file's share at the default concurrency of 16. A file that goes
 past its share takes the one overflow lane and gives it back as soon as
 what it holds drops to its share, so the next file can use it. A wait
@@ -601,8 +634,8 @@ each round's page reads (the first pages of every column in row group 0,
 then of the columns that need more) are sorted and merged when they are at
 most `--coalesce-gap` apart (1 MiB by default; merged reads stay within 8
 MiB), and up to 4 are fetched at once. The bytes between merged ranges are
-read too. That pays off for files with small row groups, and does little
-for files with a few large ones. S3 bills per request, and egress per byte
+read too. That is meant to help files with small row groups, and should do little
+for files with a few large ones (measured only on a simulated S3). S3 bills per request, and egress per byte
 outside its region: where egress costs more than requests and time, set
 `--coalesce-gap 0`. Simulated measurements, and their limits, are in
 [docs/experiments/scan-speed.md](docs/experiments/scan-speed.md).
@@ -611,8 +644,9 @@ outside its region: where egress costs more than requests and time, set
 
 With `--pii`, the summary ends its content sections with COVERAGE and PII
 INVENTORY: where personal data lives, by table and column, and whether each
-location is documented. It is the report a privacy team hands to an
-auditor, a customer or a regulator.
+location is documented. It is an inventory a privacy
+team can use as one input to its own review. It is not an audit report or a
+compliance certificate.
 
 ```text
 COVERAGE
@@ -628,9 +662,9 @@ COVERAGE
 PII INVENTORY
   4 tables with PII, 31 PII columns: 30 undocumented (24 confirmed, 6 likely, 0 possible), 1 documented. Action needed on the undocumented. 2 tables with files not scanned (0 documented), 0 with columns not examined.
   Tables are inferred from object paths. Documented means your team recorded a reason: an operational exception, not a compliance approval.
-  bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 undocumented); files dated 2026-10-16 to 2026-10-16
+  bad  files: 0 scanned, 2 not scanned (not-parquet=1 documented, unreadable=1 undocumented); files dated 2026-10-20 to 2026-10-20
     not scanned: PII unknown
-  lake/customers  files: 4 scanned, 0 not scanned; files dated 2026-10-16 to 2026-10-16
+  lake/customers  files: 4 scanned, 0 not scanned; files dated 2026-10-20 to 2026-10-20
     example: lake/customers/dt=2026-01-01/part-0.parquet
     aadhaar_no  pii-in-aadhaar  confirmed  evidence=values  4 files confirmed  UNDOCUMENTED
     full_name  pii-person-name  likely  evidence=column-name  4 files likely  UNDOCUMENTED
@@ -994,10 +1028,13 @@ v0.1.0: `largest_objects` entries no longer carry `severity`, which was always
   sampled and produces no finding. `coverage.sampling.exhaustive` is
   `false` on every run.
 - **One listing stream.** Listing is sequential (one `ListObjectsV2` page
-  at a time), so for very large buckets, and for scans without `--pii`, it
-  becomes the bottleneck. Scan big buckets by prefix, in parallel runs.
-- **Speed is measured on a simulated S3 only.** See
-  [docs/experiments/scan-speed.md](docs/experiments/scan-speed.md).
+  at a time), so on very large buckets, and in scans without `--pii`, listing itself can
+  take a long time. Scan big buckets by prefix, in parallel runs.
+- **Speed is measured on a simulated S3, plus one real-S3 run from a
+  laptop.** That run, over a home connection, was bound by the network, so
+  it does not show speed inside AWS. See
+  [docs/experiments/scan-speed.md](docs/experiments/scan-speed.md) and
+  [real-s3.md](docs/experiments/real-s3.md).
 - **Tables are guessed from keys.** The inventory groups files by directory,
   minus Hive partitions and an Iceberg `data/` directory. It does not read
   Glue, Hive, Iceberg or Delta metadata, so a table laid out differently is

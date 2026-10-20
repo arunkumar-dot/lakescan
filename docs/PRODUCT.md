@@ -8,7 +8,7 @@ Mid-size companies with a real S3 data lake and real legal exposure, but too sma
 
 ## Why they choose it
 - Cost: it runs in their own AWS account, so they pay only for compute and S3 requests (well under $1 per terabyte inside AWS) instead of Macie's ~$1 per GB inspected.
-- Speed: on large files it reads under 10% of the data (0.8-8.1% in tests), so whole-lake scans stay fast, and stay cheap even outside AWS, where S3 egress costs ~$0.09 per GB.
+- Speed: on large files it reads under 10% of the data (0.8-8.1% in tests), and aims to keep whole-lake scans cheap even outside AWS, where S3 egress costs ~$0.09 per GB.
 - Compliance evidence: a personal-data inventory they can show an auditor, customer or regulator.
 - Data never leaves their account: it runs on their own infrastructure with read-only access.
 - CI-friendly: frozen exit codes, JSON output, suppressions with reasons and expiry dates.
