@@ -452,7 +452,8 @@ mod tests {
     use crate::content::{ColumnFinding, FileOutcome, FileScan, FileStats};
     use crate::error::{ExitCode, LakeScanError};
     use crate::model::{
-        ColumnDetail, Confidence, Detail, Evidence, Finding, ObjectMeta, PiiType, StorageClass,
+        ColumnDetail, Confidence, Detail, Evidence, Finding, NotScannedReason, ObjectMeta, PiiType,
+        StorageClass,
     };
     use crate::report::fixture;
     use crate::report::write_html;
@@ -605,6 +606,87 @@ mod tests {
         ))?;
         assert_eq!(on_disk, include_str!("dashboard.html"));
         Ok(())
+    }
+
+    #[test]
+    fn a_run_that_missed_one_file_in_3000_reports_99_9_not_100() -> Result<(), LakeScanError> {
+        let mut aggregates = Aggregates::new(fixture::now());
+        aggregates.enable_content();
+        for index in 0..3000 {
+            let object = ObjectMeta {
+                key: format!("lake/t/part-{index}.parquet"),
+                size: 10,
+                last_modified: fixture::now(),
+                etag: "e".to_owned(),
+                storage_class: StorageClass::Standard,
+            };
+            let outcome = if index == 0 {
+                FileOutcome::NotScanned(NotScannedReason::Unreadable)
+            } else {
+                FileOutcome::ScannedWhole
+            };
+            let scan = FileScan {
+                outcome,
+                columns: Vec::new(),
+                not_examined: Vec::new(),
+                stats: FileStats::default(),
+            };
+            aggregates.observe_content(&object, &scan, false);
+        }
+        let page = page(
+            &fixture::scan_info(),
+            &aggregates,
+            ExitCode::ContentNotScanned,
+        )?;
+        let json = data_json(&page).ok_or_else(|| {
+            LakeScanError::Report(io::Error::other("no DATA line in the rendered page"))
+        })?;
+        let value: serde_json::Value = serde_json::from_str(json).map_err(|err| {
+            LakeScanError::Report(io::Error::new(io::ErrorKind::InvalidData, err))
+        })?;
+        let pct = value
+            .pointer("/summary/coveragePct")
+            .and_then(serde_json::Value::as_f64);
+        assert_eq!(pct.map(f64::to_bits), Some(99.9_f64.to_bits()), "{json}");
+        let eligible = value
+            .pointer("/coverage/eligible")
+            .and_then(serde_json::Value::as_u64);
+        assert_eq!(eligible, Some(3000));
+        Ok(())
+    }
+
+    /// The dashboard's script must show the percentage Rust already rounded
+    /// down. Recomputing it in JS, or painting a decimal tile through
+    /// `Math.round`, would turn 99.9 into 100 for a run that missed a file.
+    #[test]
+    fn the_dashboard_never_recomputes_or_rounds_coverage_up() {
+        let source = include_str!("dashboard.html");
+        assert!(
+            !source.contains("function coveragePct"),
+            "coverage must come from DATA.summary.coveragePct, not a JS recompute"
+        );
+        assert!(
+            source.contains("var pct = DATA.summary.coveragePct;"),
+            "the coverage tile must read DATA.summary.coveragePct"
+        );
+        for forbidden in ["* 100)", "* 100;", "100 * ", "Math.round(value * 10)"] {
+            assert!(
+                !source.contains(forbidden),
+                "the dashboard script contains {forbidden:?}: percentages must be floored"
+            );
+        }
+        let count_up = source
+            .split_once("function countUp")
+            .and_then(|(_, rest)| rest.split_once("function readHash"))
+            .map_or("", |(body, _)| body);
+        assert!(
+            count_up.contains("toFixed(decimals)"),
+            "a decimal tile must be painted with toFixed(decimals)"
+        );
+        assert!(
+            !count_up.contains("String(Math.round(value)) + suffix"),
+            "countUp paints a decimal tile with Math.round"
+        );
     }
 
     #[test]

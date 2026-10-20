@@ -6,6 +6,16 @@ exit codes, the rule codes and the JSON summary's `schema_version`.
 
 ## [Unreleased]
 
+### HTML dashboard
+
+- Coverage figures no longer round up. The coverage tile showed 73% for
+  72.7%, and could have shown 100% for 2999 of 3000 files. The tile, the
+  coverage bar and its legend now use the same rounded-down value as the
+  text report and the JSON summary (`coveragePct`).
+- When every unscanned file is documented, the "Files not scanned" section
+  now says so ("N files not scanned are documented in your config.")
+  instead of showing an empty table.
+
 ## [0.1.1] - 2026-10-18
 
 ### Preflight checks (M14)

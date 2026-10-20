@@ -647,7 +647,7 @@ footer p { margin: 0; }
 (function () {
   // Replace DATA with a real LakeScan JSON summary of this shape.
   // Escape "<" as \u003c inside this script so a name cannot close the script tag.
-  const DATA = { tool: { name: "LakeScan", version: "0.1.0" }, scan: { bucket: "s3://lakescan-pii", startedAt: "2023-11-14T22:13:20Z", elapsedSeconds: 28.1, config: "lakescan.toml" }, exit: { code: 6, name: "ContentNotScanned", meaning: "At least one Parquet file could not be content-scanned and no suppression documents it." }, coverage: { eligible: 11, scannedWhole: 6, scannedPartial: 2, notScannedDocumented: 2, notScannedUndocumented: 1, columnsExamined: 107, columnsSkipped: { repeated: 7, unsupportedType: 9, pageTooLarge: 1, unreadable: 0, unsupportedCodec: 0 }, caveat: "Inspection is sampled: up to 3 row groups, up to 2,000 values per column per row group. A finding means personal data was detected in the sample. No finding means none was detected in the sample, not that none exists." }, columns: [ { table: "lake/customers", column: "aadhaar_no", rule: "pii-in-aadhaar", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "billing.email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "card_number", rule: "pii-card-number", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "contact", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "dob", rule: "pii-date-of-birth", confidence: "likely", evidence: "column-name", files: 4, status: "undocumented" }, { table: "lake/customers", column: "full_name", rule: "pii-person-name", confidence: "likely", evidence: "column-name", files: 4, status: "undocumented" }, { table: "lake/customers", column: "last_login_ip", rule: "pii-ip-address", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "mobile_no", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "pan", rule: "pii-in-pan", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 4, status: "documented", reason: "Consented marketing contacts, DPA-12", expires: "2027-06-30" }, { table: "lake/customers_brotli", column: "aadhaar_no", rule: "pii-in-aadhaar", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "billing.email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "card_number", rule: "pii-card-number", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "contact", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "dob", rule: "pii-date-of-birth", confidence: "likely", evidence: "column-name", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "full_name", rule: "pii-person-name", confidence: "likely", evidence: "column-name", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "last_login_ip", rule: "pii-ip-address", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "mobile_no", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "pan", rule: "pii-in-pan", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_gzip", column: "aadhaar_no", rule: "pii-in-aadhaar", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "billing.email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "card_number", rule: "pii-card-number", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "contact", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "dob", rule: "pii-date-of-birth", confidence: "likely", evidence: "column-name", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "full_name", rule: "pii-person-name", confidence: "likely", evidence: "column-name", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "last_login_ip", rule: "pii-ip-address", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "mobile_no", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "pan", rule: "pii-in-pan", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/events", column: "contact_email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" } ], unscanned: [ { key: "bad/not_parquet.parquet", reasonCode: "not-parquet", status: "documented", reason: "A CSV export misnamed .parquet; no personal data, reviewed 2026-10-16" }, { key: "bad/truncated.parquet", reasonCode: "unreadable", status: "documented", reason: "Known-corrupt partial upload, kept for the incident record" }, { key: "skipped/too_large.parquet", reasonCode: "no-column-examined", status: "undocumented" } ], metadataRules: [ { rule: "sensitive-key", title: "Key looks like a credential or secret file", count: 0, severity: "high" }, { rule: "reduced-redundancy", title: "Object uses the deprecated REDUCED_REDUNDANCY storage class", count: 0, severity: "medium" }, { rule: "stale-standard", title: "Large STANDARD object has gone unmodified for a long time", count: 0, severity: "medium" }, { rule: "small-object-cold-tier", title: "Small object sits in a cold storage tier that bills a size minimum", count: 0, severity: "low" }, { rule: "zero-byte-object", title: "Zero-byte object that is not a folder marker", count: 0, severity: "info" }, { rule: "unknown-storage-class", title: "Object reports a storage class this build of LakeScan does not recognize", count: 0, severity: "info" } ] };
+  const DATA = { tool: { name: "LakeScan", version: "0.1.0" }, scan: { bucket: "s3://lakescan-pii", startedAt: "2023-11-14T22:13:20Z", elapsedSeconds: 28.1, config: "lakescan.toml" }, exit: { code: 6, name: "ContentNotScanned", meaning: "At least one Parquet file could not be content-scanned and no suppression documents it." }, coverage: { eligible: 11, scannedWhole: 6, scannedPartial: 2, notScannedDocumented: 2, notScannedUndocumented: 1, columnsExamined: 107, columnsSkipped: { repeated: 7, unsupportedType: 9, pageTooLarge: 1, unreadable: 0, unsupportedCodec: 0 }, caveat: "Inspection is sampled: up to 3 row groups, up to 2,000 values per column per row group. A finding means personal data was detected in the sample. No finding means none was detected in the sample, not that none exists." }, summary: { undocumented: 30, undocumentedConfirmed: 24, undocumentedLikely: 6, undocumentedPossible: 0, documented: 1, tablesWithPii: 4, tablesTotal: 4, coveragePct: 72.7, notScanned: 3, notScannedDocumented: 2, notScannedUndocumented: 1 }, columns: [ { table: "lake/customers", column: "aadhaar_no", rule: "pii-in-aadhaar", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "billing.email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "card_number", rule: "pii-card-number", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "contact", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "dob", rule: "pii-date-of-birth", confidence: "likely", evidence: "column-name", files: 4, status: "undocumented" }, { table: "lake/customers", column: "full_name", rule: "pii-person-name", confidence: "likely", evidence: "column-name", files: 4, status: "undocumented" }, { table: "lake/customers", column: "last_login_ip", rule: "pii-ip-address", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "mobile_no", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "pan", rule: "pii-in-pan", confidence: "confirmed", evidence: "values", files: 4, status: "undocumented" }, { table: "lake/customers", column: "email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 4, status: "documented", reason: "Consented marketing contacts, DPA-12", expires: "2027-06-30" }, { table: "lake/customers_brotli", column: "aadhaar_no", rule: "pii-in-aadhaar", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "billing.email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "card_number", rule: "pii-card-number", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "contact", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "dob", rule: "pii-date-of-birth", confidence: "likely", evidence: "column-name", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "full_name", rule: "pii-person-name", confidence: "likely", evidence: "column-name", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "last_login_ip", rule: "pii-ip-address", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "mobile_no", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_brotli", column: "pan", rule: "pii-in-pan", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" }, { table: "lake/customers_gzip", column: "aadhaar_no", rule: "pii-in-aadhaar", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "billing.email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "card_number", rule: "pii-card-number", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "contact", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "dob", rule: "pii-date-of-birth", confidence: "likely", evidence: "column-name", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "full_name", rule: "pii-person-name", confidence: "likely", evidence: "column-name", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "last_login_ip", rule: "pii-ip-address", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "mobile_no", rule: "pii-phone", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/customers_gzip", column: "pan", rule: "pii-in-pan", confidence: "confirmed", evidence: "values", files: 2, status: "undocumented" }, { table: "lake/events", column: "contact_email", rule: "pii-email", confidence: "confirmed", evidence: "values", files: 1, status: "undocumented" } ], unscanned: [ { key: "bad/not_parquet.parquet", reasonCode: "not-parquet", status: "documented", reason: "A CSV export misnamed .parquet; no personal data, reviewed 2026-10-16" }, { key: "bad/truncated.parquet", reasonCode: "unreadable", status: "documented", reason: "Known-corrupt partial upload, kept for the incident record" }, { key: "skipped/too_large.parquet", reasonCode: "no-column-examined", status: "undocumented" } ], metadataRules: [ { rule: "sensitive-key", title: "Key looks like a credential or secret file", count: 0, severity: "high" }, { rule: "reduced-redundancy", title: "Object uses the deprecated REDUCED_REDUNDANCY storage class", count: 0, severity: "medium" }, { rule: "stale-standard", title: "Large STANDARD object has gone unmodified for a long time", count: 0, severity: "medium" }, { rule: "small-object-cold-tier", title: "Small object sits in a cold storage tier that bills a size minimum", count: 0, severity: "low" }, { rule: "zero-byte-object", title: "Zero-byte object that is not a folder marker", count: 0, severity: "info" }, { rule: "unknown-storage-class", title: "Object reports a storage class this build of LakeScan does not recognize", count: 0, severity: "info" } ] };
 
   var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var state = { status: "all", rule: null, table: null };
@@ -734,13 +734,19 @@ footer p { margin: 0; }
     return DATA.coverage.scannedWhole + DATA.coverage.scannedPartial;
   }
 
-  function coveragePct() {
-    if (!DATA.coverage.eligible) return 0;
-    return (scanned() / DATA.coverage.eligible) * 100;
+  // Percentages never round up: a run that missed a file must not read 100.0.
+  // The scanned figure comes from DATA.summary.coveragePct (rounded down in
+  // Rust). The other shares use integer arithmetic: count * 1000 is exact, and
+  // the loop undoes the rare float quotient that lands on the next integer.
+  function floorPct(count, total) {
+    if (!total) return 0;
+    var tenths = Math.floor(count * 1000 / total);
+    while (tenths > 0 && tenths * total > count * 1000) tenths -= 1;
+    return tenths / 10;
   }
 
   function formatPct(value) {
-    return (Math.round(value * 10) / 10).toFixed(1);
+    return value.toFixed(1);
   }
 
   function evidenceLabel(value) {
@@ -763,7 +769,7 @@ footer p { margin: 0; }
   function countUp(node, target, delay, decimals, suffix) {
     suffix = suffix || "";
     function paint(value) {
-      node.textContent = String(Math.round(value)) + suffix;
+      node.textContent = (decimals > 0 ? value.toFixed(decimals) : String(Math.round(value))) + suffix;
     }
     if (reduceMotion) { paint(target); return; }
     var duration = 600;
@@ -772,7 +778,7 @@ footer p { margin: 0; }
       if (now < startAt) { requestAnimationFrame(frame); return; }
       var t = Math.min(1, (now - startAt) / duration);
       var eased = 1 - Math.pow(1 - t, 3);
-      paint(target * eased);
+      paint(t < 1 ? target * eased : target);
       if (t < 1) requestAnimationFrame(frame);
     }
     paint(0);
@@ -1001,7 +1007,7 @@ footer p { margin: 0; }
   function render() {
     readHash();
     var c = counts();
-    var pct = coveragePct();
+    var pct = DATA.summary.coveragePct;
     var filesNot = DATA.coverage.notScannedDocumented + DATA.coverage.notScannedUndocumented;
     var fileStrip = DATA.coverage.notScannedUndocumented > 0 ? "var(--danger)" : "var(--muted)";
     hideTip();
@@ -1177,25 +1183,26 @@ footer p { margin: 0; }
         render();
       }
     }));
-    var eligible = DATA.coverage.eligible || 1;
-    var scannedN = scanned();
+    var eligible = DATA.coverage.eligible;
     var gapDoc = DATA.coverage.notScannedDocumented;
     var gapUndoc = DATA.coverage.notScannedUndocumented;
+    var gapDocPct = floorPct(gapDoc, eligible);
+    var gapUndocPct = floorPct(gapUndoc, eligible);
     var bar = el("div", { class: "coverage-bar", role: "img", "aria-label": "File coverage " + formatPct(pct) + " percent" }, [
       el("span"), el("span"), el("span")
     ]);
     var parts = bar.querySelectorAll("span");
-    parts[0].style.width = (100 * scannedN / eligible) + "%";
+    parts[0].style.width = pct + "%";
     parts[0].style.background = "var(--bar-doc)";
-    parts[1].style.width = (100 * gapDoc / eligible) + "%";
+    parts[1].style.width = gapDocPct + "%";
     parts[1].style.background = "var(--bar-gap-doc)";
-    parts[2].style.width = (100 * gapUndoc / eligible) + "%";
+    parts[2].style.width = gapUndocPct + "%";
     parts[2].style.background = "var(--bar-undoc)";
     tableChart.appendChild(bar);
     tableChart.appendChild(el("div", { class: "legend" }, [
-      el("span", { text: "Scanned " + formatPct(100 * scannedN / eligible) + "%" }),
-      el("span", { text: "Documented gap " + formatPct(100 * gapDoc / eligible) + "%" }),
-      el("span", { text: "Undocumented gap " + formatPct(100 * gapUndoc / eligible) + "%" })
+      el("span", { text: "Scanned " + formatPct(pct) + "%" }),
+      el("span", { text: "Documented gap " + formatPct(gapDocPct) + "%" }),
+      el("span", { text: "Undocumented gap " + formatPct(gapUndocPct) + "%" })
     ]));
     var legendBits = tableChart.querySelectorAll(".legend span");
     ["var(--bar-doc)", "var(--bar-gap-doc)", "var(--bar-undoc)"].forEach(function (color, index) {
@@ -1310,6 +1317,10 @@ footer p { margin: 0; }
 
     var files = el("section", { id: "not-scanned", class: "section", role: "region", "aria-label": "Files not scanned" });
     files.appendChild(el("h2", { text: "Files not scanned" }));
+    if (!DATA.unscanned.length && DATA.coverage.notScannedDocumented > 0) {
+      var documentedCount = DATA.coverage.notScannedDocumented;
+      files.appendChild(el("p", { class: "note", text: documentedCount + (documentedCount === 1 ? " file not scanned is" : " files not scanned are") + " documented in your config." }));
+    }
     var fileBody = el("tbody");
     DATA.unscanned.forEach(function (file) {
       var status = el("td");

@@ -734,13 +734,19 @@ footer p { margin: 0; }
     return DATA.coverage.scannedWhole + DATA.coverage.scannedPartial;
   }
 
-  function coveragePct() {
-    if (!DATA.coverage.eligible) return 0;
-    return (scanned() / DATA.coverage.eligible) * 100;
+  // Percentages never round up: a run that missed a file must not read 100.0.
+  // The scanned figure comes from DATA.summary.coveragePct (rounded down in
+  // Rust). The other shares use integer arithmetic: count * 1000 is exact, and
+  // the loop undoes the rare float quotient that lands on the next integer.
+  function floorPct(count, total) {
+    if (!total) return 0;
+    var tenths = Math.floor(count * 1000 / total);
+    while (tenths > 0 && tenths * total > count * 1000) tenths -= 1;
+    return tenths / 10;
   }
 
   function formatPct(value) {
-    return (Math.round(value * 10) / 10).toFixed(1);
+    return value.toFixed(1);
   }
 
   function evidenceLabel(value) {
@@ -763,7 +769,7 @@ footer p { margin: 0; }
   function countUp(node, target, delay, decimals, suffix) {
     suffix = suffix || "";
     function paint(value) {
-      node.textContent = String(Math.round(value)) + suffix;
+      node.textContent = (decimals > 0 ? value.toFixed(decimals) : String(Math.round(value))) + suffix;
     }
     if (reduceMotion) { paint(target); return; }
     var duration = 600;
@@ -772,7 +778,7 @@ footer p { margin: 0; }
       if (now < startAt) { requestAnimationFrame(frame); return; }
       var t = Math.min(1, (now - startAt) / duration);
       var eased = 1 - Math.pow(1 - t, 3);
-      paint(target * eased);
+      paint(t < 1 ? target * eased : target);
       if (t < 1) requestAnimationFrame(frame);
     }
     paint(0);
@@ -1001,7 +1007,7 @@ footer p { margin: 0; }
   function render() {
     readHash();
     var c = counts();
-    var pct = coveragePct();
+    var pct = DATA.summary.coveragePct;
     var filesNot = DATA.coverage.notScannedDocumented + DATA.coverage.notScannedUndocumented;
     var fileStrip = DATA.coverage.notScannedUndocumented > 0 ? "var(--danger)" : "var(--muted)";
     hideTip();
@@ -1177,25 +1183,26 @@ footer p { margin: 0; }
         render();
       }
     }));
-    var eligible = DATA.coverage.eligible || 1;
-    var scannedN = scanned();
+    var eligible = DATA.coverage.eligible;
     var gapDoc = DATA.coverage.notScannedDocumented;
     var gapUndoc = DATA.coverage.notScannedUndocumented;
+    var gapDocPct = floorPct(gapDoc, eligible);
+    var gapUndocPct = floorPct(gapUndoc, eligible);
     var bar = el("div", { class: "coverage-bar", role: "img", "aria-label": "File coverage " + formatPct(pct) + " percent" }, [
       el("span"), el("span"), el("span")
     ]);
     var parts = bar.querySelectorAll("span");
-    parts[0].style.width = (100 * scannedN / eligible) + "%";
+    parts[0].style.width = pct + "%";
     parts[0].style.background = "var(--bar-doc)";
-    parts[1].style.width = (100 * gapDoc / eligible) + "%";
+    parts[1].style.width = gapDocPct + "%";
     parts[1].style.background = "var(--bar-gap-doc)";
-    parts[2].style.width = (100 * gapUndoc / eligible) + "%";
+    parts[2].style.width = gapUndocPct + "%";
     parts[2].style.background = "var(--bar-undoc)";
     tableChart.appendChild(bar);
     tableChart.appendChild(el("div", { class: "legend" }, [
-      el("span", { text: "Scanned " + formatPct(100 * scannedN / eligible) + "%" }),
-      el("span", { text: "Documented gap " + formatPct(100 * gapDoc / eligible) + "%" }),
-      el("span", { text: "Undocumented gap " + formatPct(100 * gapUndoc / eligible) + "%" })
+      el("span", { text: "Scanned " + formatPct(pct) + "%" }),
+      el("span", { text: "Documented gap " + formatPct(gapDocPct) + "%" }),
+      el("span", { text: "Undocumented gap " + formatPct(gapUndocPct) + "%" })
     ]));
     var legendBits = tableChart.querySelectorAll(".legend span");
     ["var(--bar-doc)", "var(--bar-gap-doc)", "var(--bar-undoc)"].forEach(function (color, index) {
@@ -1310,6 +1317,10 @@ footer p { margin: 0; }
 
     var files = el("section", { id: "not-scanned", class: "section", role: "region", "aria-label": "Files not scanned" });
     files.appendChild(el("h2", { text: "Files not scanned" }));
+    if (!DATA.unscanned.length && DATA.coverage.notScannedDocumented > 0) {
+      var documentedCount = DATA.coverage.notScannedDocumented;
+      files.appendChild(el("p", { class: "note", text: documentedCount + (documentedCount === 1 ? " file not scanned is" : " files not scanned are") + " documented in your config." }));
+    }
     var fileBody = el("tbody");
     DATA.unscanned.forEach(function (file) {
       var status = el("td");
