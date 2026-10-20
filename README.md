@@ -16,7 +16,7 @@ A discovery aid, not a compliance assessment: no finding does not prove there is
 **Quick install (macOS Apple silicon, or Linux x86_64):**
 
 ```bash
-VERSION=0.1.1
+VERSION=0.1.2
 TARGET=aarch64-apple-darwin   # Linux x86_64: x86_64-unknown-linux-gnu
 BASE=https://github.com/arunkumar-dot/lakescan/releases/download/v$VERSION
 curl -fsSLO "$BASE/lakescan-$VERSION-$TARGET.tar.gz"
@@ -136,7 +136,7 @@ install from source with `cargo install` as shown below.
 Verify the download against `SHA256SUMS`, then unpack it:
 
 ```sh
-VERSION=0.1.1
+VERSION=0.1.2
 TARGET=x86_64-unknown-linux-gnu   # or one of the others above
 sha256sum --check --ignore-missing SHA256SUMS   # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
 tar -xzf "lakescan-$VERSION-$TARGET.tar.gz"
@@ -167,7 +167,7 @@ Installing from source, with Rust 1.94.1 or newer, is the other way to get
 the same binary:
 
 ```sh
-cargo install --locked --git https://github.com/arunkumar-dot/lakescan.git --tag v0.1.1
+cargo install --locked --git https://github.com/arunkumar-dot/lakescan.git --tag v0.1.2
 lakescan --version
 ```
 
