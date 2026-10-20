@@ -1,6 +1,6 @@
 [package]
 name = "lakescan"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.94.1"
 description = "Finds personal data (PII) in S3 data lakes, starting with Parquet, and audits buckets from their object listing"

@@ -6,6 +6,8 @@ exit codes, the rule codes and the JSON summary's `schema_version`.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-20
+
 ### HTML dashboard
 
 - Coverage figures no longer round up. The coverage tile showed 73% for

@@ -255,7 +255,7 @@ What to notice:
 
 ```text
 $ lakescan scan s3://lakescan-demo --endpoint-url http://localhost:5001
-lakescan 0.1.0
+lakescan 0.1.2
 s3://lakescan-demo
 settings: pii=off fail-on=high prefix=(none) config=(none)
 started:  2026-10-16T16:52:42Z
@@ -323,7 +323,7 @@ $ pretty-print summary.json | head -45
   "schema_version": 1,
   "tool": {
     "name": "lakescan",
-    "version": "0.1.0"
+    "version": "0.1.2"
   },
   "scan": {
     "bucket": "lakescan-demo",
