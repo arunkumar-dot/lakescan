@@ -18,7 +18,9 @@
 //! cause, so walking the source chain as well would print it twice.
 
 mod driver;
+mod progress;
 mod target;
+mod term;
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -28,8 +30,11 @@ use std::path::{Path, PathBuf};
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use self::driver::{Content, Outputs};
+use self::driver::{Content, Outputs, RunFacts};
 use self::target::Target;
+use self::term::{
+    ColorChoice, TermEnv, Written, opener, result_block, style_for, summary_is_compact,
+};
 use std::sync::Arc;
 
 use crate::content::{
@@ -40,7 +45,7 @@ use crate::content::{
 use crate::error::{ExitCode, LakeScanError};
 use crate::model::{RuleId, Severity};
 use crate::preflight::{self, AwsProbe};
-use crate::report::Format;
+use crate::report::{Format, Style};
 use crate::scanner::PageSource;
 use crate::scanner::S3Source;
 use crate::suppress::Config;
@@ -61,25 +66,30 @@ enum Command {
     Rules,
 }
 
+/// Shown after the flags of `lakescan scan -h` and `--help`.
+const SCAN_EXAMPLES: &str = "\
+Examples:
+  lakescan scan s3://my-bucket
+      Audit the bucket from its object listing; no object is read.
+  lakescan scan s3://my-bucket/lake/ --pii --html report.html
+      Also scan Parquet files for personal data and write a dashboard.
+  lakescan scan s3://my-bucket --pii --config lakescan.toml --fail-on none
+      Document known findings in a config file; never fail on findings.
+  lakescan scan s3://my-bucket --format json --quiet > summary.json
+      Machine-readable summary for scripts; nothing extra on stderr.
+  lakescan scan s3://my-bucket --endpoint-url http://localhost:5000
+      Scan an S3-compatible store such as MinIO or moto.
+
+Exit codes: 0 ok, 1 findings at or above --fail-on, 2 usage, 3 auth, 4 transport,
+5 report, 6 Parquet files not scanned and not documented. See the README.";
+
 #[derive(Args, Debug)]
+#[command(after_help = SCAN_EXAMPLES)]
 struct ScanArgs {
     // An explicit `help` rather than a doc comment, which rustdoc lints
     // would want to turn into a link.
     #[arg(help = "What to scan: s3://bucket or s3://bucket/prefix")]
     target: String,
-
-    /// Summary format.
-    #[arg(long, value_enum, default_value_t = FormatArg::Text)]
-    format: FormatArg,
-
-    /// Write the summary to PATH instead of stdout.
-    #[arg(long, value_name = "PATH")]
-    output: Option<PathBuf>,
-
-    /// Also stream every finding as JSON Lines to PATH ("-" for stdout,
-    /// which requires --output to name a file).
-    #[arg(long, value_name = "PATH")]
-    findings: Option<PathBuf>,
 
     /// Exit 1 when the worst finding is at or above LEVEL; "none" never
     /// fails on findings.
@@ -98,21 +108,61 @@ struct ScanArgs {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// No progress output and no suppression warnings.
-    #[arg(long)]
+    /// Summary format.
+    #[arg(help_heading = "Output", long, value_enum, default_value_t = FormatArg::Text)]
+    format: FormatArg,
+
+    /// Write the summary to PATH instead of stdout.
+    #[arg(help_heading = "Output", long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Also stream every finding as JSON Lines to PATH ("-" for stdout,
+    /// which requires --output to name a file).
+    #[arg(help_heading = "Output", long, value_name = "PATH")]
+    findings: Option<PathBuf>,
+
+    /// With --pii, also write the PII inventory as CSV to PATH ("-" is
+    /// stdout; see the README for the conflicts).
+    #[arg(help_heading = "Output", long, value_name = "PATH", requires = "pii")]
+    inventory: Option<PathBuf>,
+
+    /// Also write a self-contained HTML report to PATH ("-" for stdout,
+    /// which requires every other output to go to a file).
+    #[arg(help_heading = "Output", long, value_name = "PATH")]
+    html: Option<PathBuf>,
+
+    /// No progress line, result block or suppression warnings.
+    #[arg(help_heading = "Output", long)]
     quiet: bool,
 
-    /// Also scan Parquet files for personal data: keys ending in .parquet
-    /// or .parq, and (see --pii-sniff) objects without such an extension
-    /// that turn out to be Parquet. Reads object contents: needs
-    /// s3:GetObject.
-    #[arg(long)]
+    /// Show every section of the text summary on a terminal, where it is
+    /// compact by default.
+    #[arg(long, help_heading = "Output")]
+    full: bool,
+
+    // An explicit `help` rather than a doc comment, which lints would want
+    // to fill with backticks that --help would then print.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "WHEN",
+        default_value_t = ColorChoice::Auto,
+        help_heading = "Output",
+        help = "When to colour LakeScan's own output, the text summary on stdout and the \
+                result block on stderr: auto (a terminal, unless NO_COLOR is set or TERM is \
+                dumb), always (overrides NO_COLOR) or never. Not --help, which follows the \
+                terminal and NO_COLOR"
+    )]
+    color: ColorChoice,
+
+    /// Also scan Parquet (.parquet, .parq, or sniffed) for personal data;
+    /// needs s3:GetObject. See the README.
+    #[arg(help_heading = "PII scanning", long)]
     pii: bool,
 
-    /// With --pii, which objects without a .parquet or .parq extension to
-    /// sniff for the Parquet magic, one 8-byte ranged GET each: "unknown"
-    /// (no extension, or one not known to be another format) or "none".
-    #[arg(
+    /// With --pii, sniff objects lacking a .parquet/.parq extension (one
+    /// 8-byte GET each): "unknown" or "none". See the README.
+    #[arg(help_heading = "PII scanning", 
         long,
         value_enum,
         value_name = "WHICH",
@@ -123,7 +173,7 @@ struct ScanArgs {
 
     /// With --pii, read Parquet files of at most BYTES whole, in one
     /// request; larger ones are read partially. 0 to 67108864 (64 MiB).
-    #[arg(
+    #[arg(help_heading = "Performance", 
         long,
         value_name = "BYTES",
         default_value_t = DEFAULT_WHOLE_FILE_MAX,
@@ -132,7 +182,7 @@ struct ScanArgs {
     pii_whole_file_max: u64,
 
     /// With --pii, scan up to N Parquet files at once. 1 to 256.
-    #[arg(
+    #[arg(help_heading = "Performance", 
         long,
         value_name = "N",
         default_value_t = DEFAULT_CONCURRENCY_FLAG,
@@ -141,10 +191,9 @@ struct ScanArgs {
     )]
     concurrency: u16,
 
-    /// With --pii, the most BYTES in-flight file scans may hold at once.
-    /// Must cover the most one file can need (see the README); at most
-    /// 68719476736 (64 GiB).
-    #[arg(
+    /// With --pii, the most BYTES in-flight scans may hold; must cover one
+    /// file's need, at most 64 GiB. See the README.
+    #[arg(help_heading = "Performance", 
         long,
         value_name = "BYTES",
         default_value_t = DEFAULT_MEMORY_BUDGET,
@@ -154,24 +203,13 @@ struct ScanArgs {
 
     /// With --pii, read page ranges of a file at most BYTES apart as one
     /// request (each at most 8 MiB). 0 reads each range alone.
-    #[arg(
+    #[arg(help_heading = "Performance", 
         long,
         value_name = "BYTES",
         default_value_t = DEFAULT_COALESCE_GAP,
         requires = "pii"
     )]
     coalesce_gap: u64,
-
-    /// With --pii, also write the PII inventory as CSV to PATH, one row
-    /// per (table, column, rule) ("-" for stdout, which requires --output
-    /// to name a file and --findings not to be "-").
-    #[arg(long, value_name = "PATH", requires = "pii")]
-    inventory: Option<PathBuf>,
-
-    /// Also write a self-contained HTML report to PATH ("-" for stdout,
-    /// which requires every other output to go to a file).
-    #[arg(long, value_name = "PATH")]
-    html: Option<PathBuf>,
 }
 
 /// `--concurrency`'s default, as the flag's type; equal to
@@ -264,6 +302,8 @@ where
 /// file being scanned, and no scanned value may reach any output.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        // Not over a live progress line.
+        progress::clear_if_shown();
         let at = info
             .location()
             .map(|location| format!(" at {}:{}", location.file(), location.line()))
@@ -291,7 +331,7 @@ where
     };
 
     match cli.command {
-        Command::Scan(args) => scan(*args).await,
+        Command::Scan(args) => Box::pin(scan(*args)).await,
         Command::Rules => {
             write_rules(out)?;
             Ok(ExitCode::Ok)
@@ -336,6 +376,7 @@ fn clap_outcome<W: Write>(
 }
 
 async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
+    let human = Human::of(&args);
     let target: Target = args.target.parse()?;
     let config = args
         .config
@@ -373,7 +414,9 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         .is_some()
         .then_some(&mut stderr_log as &mut dyn Write);
     preflight::check(&probe, &target.bucket, debug).await?;
-    if args.pii && !args.quiet {
+    // A person at a terminal sees the permissions named if files are
+    // refused (see `driver::write_not_scanned`); the hint is for logs.
+    if args.pii && !args.quiet && !io::stderr().is_terminal() {
         // Best effort: a hint that cannot be printed changes nothing.
         let _ = writeln!(io::stderr(), "{}", preflight::pii_hint(&target.bucket));
     }
@@ -398,9 +441,9 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         .map(|path| open_destination(Some(path)))
         .transpose()?;
 
-    let stderr = io::stderr();
-    let progress = (!args.quiet && stderr.is_terminal()).then_some(io::stderr());
+    let progress = (human.screen == Screen::Live).then_some(io::stderr());
     let warnings = (!args.quiet).then_some(io::stderr());
+    let mut facts = None;
     let content = args.pii.then(|| Content {
         reader: S3ObjectReader::new(&source.client(), &target.bucket),
         options: ScanOptions {
@@ -425,8 +468,12 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
             inventory: inventory.as_mut(),
             html: html.as_mut(),
             progress,
+            facts: Some(&mut facts),
+            style: human.summary_style,
+            compact: human.compact,
+            terminal: human.stderr_is_terminal,
             warnings,
-            errors: stderr,
+            errors: io::stderr(),
         },
     )
     .await?;
@@ -438,7 +485,89 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
     {
         destination.commit()?;
     }
+    if let Some(facts) = &facts {
+        human.print_result(facts);
+    }
     Ok(code)
+}
+
+/// What `scan` shows a person on stderr besides its plain lines.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    /// Nothing: stderr is not a terminal, or `--quiet`.
+    Off,
+    /// The result block only: a terminal that cannot redraw a line
+    /// (`TERM=dumb`).
+    BlockOnly,
+    /// The live progress line, then the result block.
+    Live,
+}
+
+/// What `scan` adds for a person at a terminal, decided once from the
+/// arguments and the environment. All of it is for stderr when it is a
+/// terminal and `--quiet` is not given; none of it changes any other
+/// output.
+struct Human {
+    /// What to show on stderr while and after the scan.
+    screen: Screen,
+    /// The block's style.
+    block_style: Style,
+    /// The text summary's style: colour only where it goes to stdout,
+    /// never into a file.
+    summary_style: Style,
+    /// Whether the text summary is the compact one: it goes to a terminal
+    /// and `--full` was not given.
+    compact: bool,
+    /// Whether stderr is a terminal.
+    stderr_is_terminal: bool,
+    /// The files written, for the block's next steps.
+    written: Written,
+}
+
+impl Human {
+    /// Prints the result block on stderr, if this is a terminal run.
+    fn print_result(&self, facts: &RunFacts) {
+        if self.screen == Screen::Off {
+            return;
+        }
+        // The summary may be on this terminal too: it goes first.
+        let _ = io::stdout().flush();
+        let block = result_block(facts, &self.written, self.block_style, opener());
+        // Best effort: the exit code carries the verdict regardless.
+        let _ = write!(io::stderr(), "{block}");
+    }
+
+    fn of(args: &ScanArgs) -> Self {
+        let env = TermEnv::from_env();
+        let stderr_is_terminal = io::stderr().is_terminal();
+        let stdout_is_terminal = io::stdout().is_terminal();
+        let to_stdout = args.output.as_deref().is_none_or(is_stdout);
+        let summary_style = if to_stdout {
+            style_for(args.color, stdout_is_terminal, env)
+        } else {
+            Style::PLAIN
+        };
+        Self {
+            screen: match (!args.quiet && stderr_is_terminal, env.dumb) {
+                (false, _) => Screen::Off,
+                (true, true) => Screen::BlockOnly,
+                (true, false) => Screen::Live,
+            },
+            block_style: style_for(args.color, stderr_is_terminal, env),
+            summary_style,
+            stderr_is_terminal,
+            compact: summary_is_compact(to_stdout, stdout_is_terminal, args.full),
+            written: Written {
+                html: args.html.clone().filter(|path| !is_stdout(path)),
+                files: [&args.output, &args.findings, &args.inventory, &args.html]
+                    .into_iter()
+                    .flatten()
+                    .filter(|path| !is_stdout(path))
+                    .cloned()
+                    .collect(),
+            },
+        }
+    }
 }
 
 /// At most one output may go to stdout. The summary does unless
@@ -618,6 +747,10 @@ where
             inventory: None,
             html: None,
             progress: None::<io::Sink>,
+            facts: None,
+            style: Style::PLAIN,
+            compact: false,
+            terminal: false,
             warnings: None::<io::Sink>,
             errors: io::sink(),
         },

@@ -6,6 +6,54 @@ exit codes, the rule codes and the JSON summary's `schema_version`.
 
 ## [Unreleased]
 
+### Terminal experience
+
+Everything below is for a person at a terminal. Output when not writing to a
+terminal is unchanged: exit codes, JSON, CSV, the HTML report, the findings
+stream, and the summary and stderr lines of any redirected or piped run are
+byte for byte what they were.
+
+- A live progress line on stderr (terminal only, not with `--quiet`) now
+  redraws in place on a timer: a spinner, objects listed, files checked
+  (with `--pii`) or findings so far (without it), and elapsed time. No
+  percentage and no ETA. "Checked" counts a file whose check ended, whatever
+  the outcome. It is cleared when the scan ends, on an error, and before a
+  panic message. With `--pii` it shows no findings count, which would lag the
+  real one. `TERM=dumb` gets no live line.
+- A result block on stderr after the run (terminal only, not with
+  `--quiet`): the exit code and what it means, undocumented PII columns by
+  confidence, coverage with a note that inspection is sampled, and next
+  steps (opening the HTML report, the Suppressions section, files written).
+  It never calls a scan clean.
+- `--color auto|always|never` (default `auto`) colours the text summary on
+  stdout and the result block. `auto` colours a terminal unless `NO_COLOR`
+  is set or `TERM=dumb`. Only LakeScan's own words are coloured, never keys,
+  table or column names or reasons, and never a file. Colour is sparse:
+  headings and `UNDOCUMENTED` are bold, `documented` is green, and red
+  appears once in the summary (the worst severity, when high or critical) and
+  once in the result block (the exit 6 verdict). `--help` keeps its own
+  colouring.
+- `lakescan scan --help` groups the flags (Output, PII scanning,
+  Performance) and ends with examples and the exit codes. The descriptions of
+  `--pii`, `--pii-sniff`, `--memory-budget` and `--inventory` are shorter and
+  point to the README.
+- `--quiet` now reads "No progress line, result block or suppression
+  warnings."
+- The text summary is compact on a terminal: when it goes to stdout and
+  stdout is a terminal, the SAMPLES, LARGEST OBJECTS, SIZE HISTOGRAM, AGE
+  HISTOGRAM and DISTINCT CONTENT sections are left out and a last line says
+  so. New `--full` shows everything. Findings, coverage, the PII inventory
+  and files not scanned are always shown. A redirected or piped stdout and
+  `--output` always get the full summary.
+- With `--pii`, the up-front `--pii requires s3:GetObject …` line on stderr
+  is no longer printed when stderr is a terminal; it is still printed when
+  stderr is redirected or piped. On a terminal, the exit 6 explanation now
+  names `s3:GetObject` (and `kms:Decrypt` for SSE-KMS objects) whenever any
+  undocumented unscanned file was access-denied, not only when most were;
+  off a terminal it is unchanged.
+- The result block now reads "31 PII columns are undocumented (25
+  confirmed, 6 likely, 0 possible)."
+
 ## [0.1.2] - 2026-10-20
 
 ### HTML dashboard

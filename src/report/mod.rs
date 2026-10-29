@@ -382,13 +382,16 @@ mod human_size;
 mod json;
 mod rfc3339;
 mod sink;
+mod style;
 mod text;
 
 use std::io::Write;
 use std::time::{Duration, SystemTime};
 
+pub(crate) use escape::escaped;
 pub use findings::FindingsWriter;
 use sink::Sink;
+pub use style::Style;
 
 use crate::aggregate::{Aggregates, Status};
 use crate::content::{MAX_ROW_GROUPS, MAX_VALUES_PER_ROW_GROUP, Sniff};
@@ -526,9 +529,30 @@ pub fn write_summary<W: Write>(
     info: &ScanInfo,
     aggregates: &Aggregates,
 ) -> Result<(), LakeScanError> {
+    write_summary_styled(out, format, info, aggregates, Style::PLAIN, false)
+}
+
+/// [`write_summary`] with `style` applied to the text format's own words
+/// (headings, severity words, the `UNDOCUMENTED` / `documented` labels).
+/// Bucket-derived text is never styled, and [`Format::Json`] ignores
+/// `style` and `compact`: a machine-readable summary has no colour and is
+/// always complete. With `compact`, the text format leaves out its samples,
+/// largest objects, histograms and duplicate estimate, and says so in one
+/// line; findings, coverage and the PII inventory are always written.
+///
+/// # Errors
+/// As [`write_summary`].
+pub fn write_summary_styled<W: Write>(
+    out: W,
+    format: Format,
+    info: &ScanInfo,
+    aggregates: &Aggregates,
+    style: Style,
+    compact: bool,
+) -> Result<(), LakeScanError> {
     let mut sink = Sink::new(out);
     match format {
-        Format::Text => text::write(&mut sink, info, aggregates)?,
+        Format::Text => text::write(&mut sink, info, aggregates, style, compact)?,
         Format::Json => json::write(&mut sink, info, aggregates)?,
     }
     sink.flush().map_err(LakeScanError::Report)
