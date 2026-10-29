@@ -26,6 +26,7 @@ use std::io::Write;
 use super::escape::write_escaped;
 use super::human_size::human_bytes;
 use super::rfc3339::format_rfc3339;
+use super::style::Style;
 use super::{SAMPLING_METHOD, ScanInfo, TOOL_NAME, TOOL_VERSION, expiry_of, status_of};
 use crate::aggregate::{
     Aggregates, InventoryEntry, MAX_ENTRIES, MAX_TABLES, Sample, SampleDetail, Table, TableStatus,
@@ -85,10 +86,14 @@ fn write_header<W: Write>(out: &mut W, info: &ScanInfo) -> Result<(), LakeScanEr
     wl_empty!(out)
 }
 
-fn write_verdict<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
-    wl!(out, "VERDICT")?;
+fn write_verdict<W: Write>(
+    out: &mut W,
+    aggregates: &Aggregates,
+    style: Style,
+) -> Result<(), LakeScanError> {
+    wl!(out, "{}", style.heading("VERDICT"))?;
     match aggregates.worst_severity() {
-        Some(severity) => wl!(out, "  worst severity: {}", severity.code())?,
+        Some(severity) => wl!(out, "  worst severity: {}", style.worst_severity(severity))?,
         None => wl!(out, "  no findings")?,
     }
     if let Some(inventory) = aggregates.pii_inventory()
@@ -234,8 +239,12 @@ pub(super) fn undocumented_split(summary: &crate::aggregate::InventorySummary) -
     )
 }
 
-fn write_inventory<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
-    wl!(out, "INVENTORY")?;
+fn write_inventory<W: Write>(
+    out: &mut W,
+    aggregates: &Aggregates,
+    style: Style,
+) -> Result<(), LakeScanError> {
+    wl!(out, "{}", style.heading("INVENTORY"))?;
     wl!(out, "  objects:     {}", aggregates.total_objects())?;
     wl!(
         out,
@@ -264,8 +273,12 @@ fn write_inventory<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(),
     wl_empty!(out)
 }
 
-fn write_findings<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
-    wl!(out, "FINDINGS")?;
+fn write_findings<W: Write>(
+    out: &mut W,
+    aggregates: &Aggregates,
+    style: Style,
+) -> Result<(), LakeScanError> {
+    wl!(out, "{}", style.heading("FINDINGS"))?;
 
     let rows: Vec<RuleId> = RuleId::ALL
         .into_iter()
@@ -349,11 +362,15 @@ fn write_entry<W: Write>(out: &mut W, entry: &Entry) -> Result<(), LakeScanError
     wl_empty!(out)
 }
 
-fn write_content<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
+fn write_content<W: Write>(
+    out: &mut W,
+    aggregates: &Aggregates,
+    style: Style,
+) -> Result<(), LakeScanError> {
     let Some(content) = aggregates.content() else {
         return Ok(());
     };
-    wl!(out, "CONTENT")?;
+    wl!(out, "{}", style.heading("CONTENT"))?;
     wl!(out, "  parquet files:      {}", content.files_eligible)?;
     wl!(out, "    downloaded whole:  {}", content.scanned_whole)?;
     wl!(out, "    read partially:    {}", content.scanned_partially)?;
@@ -398,11 +415,15 @@ fn write_content<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), L
     wl_empty!(out)
 }
 
-fn write_coverage<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
+fn write_coverage<W: Write>(
+    out: &mut W,
+    aggregates: &Aggregates,
+    style: Style,
+) -> Result<(), LakeScanError> {
     let Some(coverage) = aggregates.coverage() else {
         return Ok(());
     };
-    wl!(out, "COVERAGE")?;
+    wl!(out, "{}", style.heading("COVERAGE"))?;
     wl!(out, "  parquet files:  {}", coverage.files_eligible)?;
     let percent = coverage
         .percent
@@ -551,6 +572,7 @@ fn write_entry_row<W: Write>(
     out: &mut W,
     info: &ScanInfo,
     entry: &InventoryEntry,
+    style: Style,
 ) -> Result<(), LakeScanError> {
     w!(out, "    ")?;
     write_escaped(out, entry.column()).map_err(LakeScanError::Report)?;
@@ -565,7 +587,12 @@ fn write_entry_row<W: Write>(
         (status, Some(reason)) => {
             // Documented: every file's finding was suppressed, so the
             // count is all of them.
-            w!(out, "{}, {status}", files(entry.files()))?;
+            w!(
+                out,
+                "{}, {}",
+                files(entry.files()),
+                style.documented(status)
+            )?;
             if let Some(expires) = expiry_of(entry.status(), &info.suppressions) {
                 w!(out, " until {expires}")?;
             }
@@ -573,7 +600,12 @@ fn write_entry_row<W: Write>(
             write_escaped(out, reason).map_err(LakeScanError::Report)?;
             wl_empty!(out)
         }
-        (status, None) => wl!(out, "{}  {status}", undocumented_counts(entry)),
+        (status, None) => wl!(
+            out,
+            "{}  {}",
+            undocumented_counts(entry),
+            style.undocumented(status)
+        ),
     }
 }
 
@@ -581,11 +613,12 @@ fn write_pii_inventory<W: Write>(
     out: &mut W,
     info: &ScanInfo,
     aggregates: &Aggregates,
+    style: Style,
 ) -> Result<(), LakeScanError> {
     let Some(inventory) = aggregates.pii_inventory() else {
         return Ok(());
     };
-    wl!(out, "PII INVENTORY")?;
+    wl!(out, "{}", style.heading("PII INVENTORY"))?;
     let summary = inventory.summary();
     let action = if summary.undocumented > 0 {
         " Action needed on the undocumented."
@@ -624,7 +657,7 @@ fn write_pii_inventory<W: Write>(
         match table.status() {
             TableStatus::PiiFound => {
                 for entry in table.entries_for_review() {
-                    write_entry_row(out, info, entry)?;
+                    write_entry_row(out, info, entry, style)?;
                 }
             }
             // Never "no PII" about files that were not read, columns that
@@ -663,12 +696,16 @@ fn write_pii_inventory<W: Write>(
     wl_empty!(out)
 }
 
-fn write_suppressions<W: Write>(out: &mut W, info: &ScanInfo) -> Result<(), LakeScanError> {
+fn write_suppressions<W: Write>(
+    out: &mut W,
+    info: &ScanInfo,
+    style: Style,
+) -> Result<(), LakeScanError> {
     let outcome = &info.suppressions;
     if outcome.expired.is_empty() && outcome.unused.is_empty() {
         return Ok(());
     }
-    wl!(out, "SUPPRESSIONS")?;
+    wl!(out, "{}", style.heading("SUPPRESSIONS"))?;
     for (heading, entries) in [("expired", &outcome.expired), ("unused", &outcome.unused)] {
         if entries.is_empty() {
             continue;
@@ -681,8 +718,12 @@ fn write_suppressions<W: Write>(out: &mut W, info: &ScanInfo) -> Result<(), Lake
     wl_empty!(out)
 }
 
-fn write_samples<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), LakeScanError> {
-    wl!(out, "SAMPLES")?;
+fn write_samples<W: Write>(
+    out: &mut W,
+    aggregates: &Aggregates,
+    style: Style,
+) -> Result<(), LakeScanError> {
+    wl!(out, "{}", style.heading("SAMPLES"))?;
     let mut any = false;
     for rule in RuleId::ALL {
         let samples = aggregates.samples_for(rule);
@@ -729,8 +770,9 @@ fn write_samples<W: Write>(out: &mut W, aggregates: &Aggregates) -> Result<(), L
 fn write_largest_objects<W: Write>(
     out: &mut W,
     aggregates: &Aggregates,
+    style: Style,
 ) -> Result<(), LakeScanError> {
-    wl!(out, "LARGEST OBJECTS")?;
+    wl!(out, "{}", style.heading("LARGEST OBJECTS"))?;
     let largest = aggregates.largest_objects();
     if largest.is_empty() {
         wl!(out, "  (none)")?;
@@ -754,8 +796,9 @@ fn write_largest_objects<W: Write>(
 fn write_size_histogram<W: Write>(
     out: &mut W,
     aggregates: &Aggregates,
+    style: Style,
 ) -> Result<(), LakeScanError> {
-    wl!(out, "SIZE HISTOGRAM")?;
+    wl!(out, "{}", style.heading("SIZE HISTOGRAM"))?;
     let mut any = false;
     for index in 0..aggregates.size_bucket_count() {
         let cell = aggregates.size_bucket(index);
@@ -785,8 +828,9 @@ fn write_size_histogram<W: Write>(
 fn write_age_histogram<W: Write>(
     out: &mut W,
     aggregates: &Aggregates,
+    style: Style,
 ) -> Result<(), LakeScanError> {
-    wl!(out, "AGE HISTOGRAM")?;
+    wl!(out, "{}", style.heading("AGE HISTOGRAM"))?;
     let mut any = false;
     for index in 0..aggregates.age_bucket_count() {
         let cell = aggregates.age_bucket(index);
@@ -820,8 +864,9 @@ fn write_age_histogram<W: Write>(
 fn write_distinct_content<W: Write>(
     out: &mut W,
     aggregates: &Aggregates,
+    style: Style,
 ) -> Result<(), LakeScanError> {
-    wl!(out, "DISTINCT CONTENT")?;
+    wl!(out, "{}", style.heading("DISTINCT CONTENT"))?;
     w!(
         out,
         "  ~{:.0} distinct (etag, size) values across {} objects; ",
@@ -846,31 +891,50 @@ fn write_distinct_content<W: Write>(
     )
 }
 
+/// The last line of a compact summary.
+const COMPACT_HINT: &str = "Hidden on a terminal: samples, largest objects, histograms, duplicate \
+     estimate. Use --full to show them.";
+
 /// Writes the plain-text summary to `out`.
+///
+/// With `compact`, the SAMPLES, LARGEST OBJECTS, SIZE HISTOGRAM, AGE
+/// HISTOGRAM and DISTINCT CONTENT sections are left out and one line says
+/// so. Everything that bears on a verdict (findings, coverage, the PII
+/// inventory, files not scanned) is always written.
+///
+/// `style` colours only `LakeScan`'s own words (headings, severity words and
+/// the `UNDOCUMENTED` / `documented` labels); bucket-derived text goes
+/// through [`write_escaped`] unstyled.
 pub(super) fn write<W: Write>(
     out: &mut W,
     info: &ScanInfo,
     aggregates: &Aggregates,
+    style: Style,
+    compact: bool,
 ) -> Result<(), LakeScanError> {
     write_header(out, info)?;
-    write_verdict(out, aggregates)?;
-    write_inventory(out, aggregates)?;
-    write_findings(out, aggregates)?;
-    write_content(out, aggregates)?;
-    write_coverage(out, aggregates)?;
-    write_pii_inventory(out, info, aggregates)?;
-    write_suppressions(out, info)?;
-    write_samples(out, aggregates)?;
-    write_largest_objects(out, aggregates)?;
-    write_size_histogram(out, aggregates)?;
-    write_age_histogram(out, aggregates)?;
-    write_distinct_content(out, aggregates)
+    write_verdict(out, aggregates, style)?;
+    write_inventory(out, aggregates, style)?;
+    write_findings(out, aggregates, style)?;
+    write_content(out, aggregates, style)?;
+    write_coverage(out, aggregates, style)?;
+    write_pii_inventory(out, info, aggregates, style)?;
+    write_suppressions(out, info, style)?;
+    if compact {
+        return wl!(out, "{COMPACT_HINT}");
+    }
+    write_samples(out, aggregates, style)?;
+    write_largest_objects(out, aggregates, style)?;
+    write_size_histogram(out, aggregates, style)?;
+    write_age_histogram(out, aggregates, style)?;
+    write_distinct_content(out, aggregates, style)
 }
 
 #[cfg(test)]
 mod tests {
     use super::write;
     use crate::report::fixture;
+    use crate::report::style::Style;
 
     /// Golden file: the fixture, rendered as text, compared byte-for-byte
     /// to `tests/golden/summary.txt`. `include_str!` resolves relative to
@@ -907,6 +971,14 @@ mod tests {
 
     /// Renders the PII INVENTORY section for `files`, observed directly.
     fn inventory_section(files: &[TestFile<'_>]) -> Result<String, Box<dyn std::error::Error>> {
+        inventory_section_styled(files, Style::PLAIN)
+    }
+
+    /// [`inventory_section`] with `style` applied.
+    fn inventory_section_styled(
+        files: &[TestFile<'_>],
+        style: Style,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         use crate::model::{ColumnDetail, Detail, Evidence, Finding, ObjectMeta, RuleId, Severity};
         let now = fixture::now();
         let mut aggregates = crate::aggregate::Aggregates::new(now);
@@ -961,7 +1033,7 @@ mod tests {
         let mut info = fixture::scan_info();
         info.suppressions.reasons = vec!["Consented, DPA-12".to_owned()];
         let mut buf = Vec::new();
-        super::write_pii_inventory(&mut buf, &info, &aggregates)?;
+        super::write_pii_inventory(&mut buf, &info, &aggregates, style)?;
         Ok(String::from_utf8(buf)?)
     }
 
@@ -1045,10 +1117,178 @@ mod tests {
         let golden = include_str!("../../tests/golden/summary.txt");
 
         let mut buf = Vec::new();
-        write(&mut buf, &fixture::scan_info(), &fixture::aggregates())?;
+        write(
+            &mut buf,
+            &fixture::scan_info(),
+            &fixture::aggregates(),
+            Style::PLAIN,
+            false,
+        )?;
         let actual = String::from_utf8(buf).unwrap_or_default();
 
         assert_eq!(actual, golden);
+        Ok(())
+    }
+
+    /// `text` without `LakeScan`'s own SGR sequences (`ESC [ digits/; m`).
+    fn without_sgr(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' && chars.peek() == Some(&'[') {
+                let mut code = String::new();
+                for next in chars.by_ref() {
+                    if next == 'm' {
+                        break;
+                    }
+                    code.push(next);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn without_colour_the_summary_has_no_escape_bytes() -> Result<(), crate::error::LakeScanError> {
+        let mut buf = Vec::new();
+        write(
+            &mut buf,
+            &fixture::scan_info(),
+            &fixture::aggregates(),
+            Style::PLAIN,
+            false,
+        )?;
+        assert!(!buf.contains(&0x1b));
+        Ok(())
+    }
+
+    #[test]
+    fn colour_marks_lakescan_s_words_and_leaves_the_rest_byte_identical()
+    -> Result<(), crate::error::LakeScanError> {
+        let (mut plain, mut coloured) = (Vec::new(), Vec::new());
+        let (info, aggregates) = (fixture::scan_info(), fixture::aggregates());
+        write(&mut plain, &info, &aggregates, Style::PLAIN, false)?;
+        write(&mut coloured, &info, &aggregates, Style::new(true), false)?;
+        let coloured = String::from_utf8(coloured).unwrap_or_default();
+        assert!(coloured.contains("\x1b[1mVERDICT\x1b[0m"));
+        assert!(coloured.contains("\x1b[31mhigh\x1b[0m"));
+        assert_eq!(
+            without_sgr(&coloured),
+            String::from_utf8(plain).unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_hostile_column_name_stays_escaped_in_coloured_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::content::FileOutcome::ScannedWhole;
+        use crate::model::Confidence::Confirmed;
+        let files: [TestFile<'_>; 2] = [
+            ("unchecked/a.parquet", ScannedWhole, false, &[]),
+            (
+                "pii/a.parquet",
+                ScannedWhole,
+                false,
+                &[("\u{1b}[2J", Confirmed, None)],
+            ),
+        ];
+        let coloured = inventory_section_styled(&files, Style::new(true))?;
+        // The name arrives as text, not as a control sequence: the only
+        // real ESC bytes are LakeScan's own colour codes.
+        assert!(coloured.contains("\\u{001b}[31mphone"), "{coloured:?}");
+        assert!(coloured.contains("\\u{001b}[2J"), "{coloured:?}");
+        assert!(
+            coloured.contains("\x1b[1mUNDOCUMENTED\x1b[0m"),
+            "{coloured:?}"
+        );
+        assert!(!without_sgr(&coloured).contains('\x1b'), "{coloured:?}");
+        Ok(())
+    }
+
+    /// Section headings: lines that are all capitals and spaces, unindented.
+    fn headings(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|line| {
+                !line.is_empty() && line.chars().all(|c| c.is_ascii_uppercase() || c == ' ')
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compact_keeps_every_section_but_the_five_long_tail_ones()
+    -> Result<(), crate::error::LakeScanError> {
+        let (info, aggregates) = (fixture::scan_info(), fixture::aggregates());
+        let (mut full, mut compact) = (Vec::new(), Vec::new());
+        write(&mut full, &info, &aggregates, Style::PLAIN, false)?;
+        write(&mut compact, &info, &aggregates, Style::PLAIN, true)?;
+        let (full, compact) = (
+            String::from_utf8(full).unwrap_or_default(),
+            String::from_utf8(compact).unwrap_or_default(),
+        );
+
+        let hidden = [
+            "SAMPLES",
+            "LARGEST OBJECTS",
+            "SIZE HISTOGRAM",
+            "AGE HISTOGRAM",
+            "DISTINCT CONTENT",
+        ];
+        let expected: Vec<&str> = headings(&full)
+            .into_iter()
+            .filter(|heading| !hidden.contains(heading))
+            .collect();
+        assert!(expected.len() >= 5, "{expected:?}");
+        assert_eq!(headings(&compact), expected);
+        for heading in hidden {
+            assert!(headings(&full).contains(&heading), "{heading} not in full");
+        }
+
+        let hint = "Hidden on a terminal: samples, largest objects, histograms, duplicate \
+                    estimate. Use --full to show them.\n";
+        assert!(compact.ends_with(hint), "{compact:?}");
+        // Everything before the hint is the start of the full text, byte
+        // for byte: nothing was changed, only cut.
+        assert!(full.starts_with(&compact[..compact.len() - hint.len()]));
+        assert!(!full.contains("Hidden on a terminal"));
+        Ok(())
+    }
+
+    #[test]
+    fn full_text_is_the_golden_text() -> Result<(), crate::error::LakeScanError> {
+        // --full on a terminal is `compact == false`: the same bytes as a
+        // redirected run, which the golden file pins.
+        let mut buf = Vec::new();
+        write(
+            &mut buf,
+            &fixture::scan_info(),
+            &fixture::aggregates(),
+            Style::PLAIN,
+            false,
+        )?;
+        assert_eq!(
+            String::from_utf8(buf).unwrap_or_default(),
+            include_str!("../../tests/golden/summary.txt")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_coloured_summary_has_at_most_one_red_sequence() -> Result<(), crate::error::LakeScanError>
+    {
+        let mut buf = Vec::new();
+        write(
+            &mut buf,
+            &fixture::scan_info(),
+            &fixture::aggregates(),
+            Style::new(true),
+            false,
+        )?;
+        let text = String::from_utf8(buf).unwrap_or_default();
+        let red = text.matches("\x1b[31m").count() + text.matches("\x1b[1;31m").count();
+        assert!(red <= 1, "{text:?}");
         Ok(())
     }
 }

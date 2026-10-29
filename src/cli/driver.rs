@@ -12,10 +12,12 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime};
 
+use super::progress::{Live, Progress, with_progress};
 use super::target::Target;
-use crate::aggregate::{Aggregates, ContentSummary};
+use crate::aggregate::{Aggregates, ContentSummary, Coverage, InventorySummary, PiiInventory};
 use crate::aggregate::{MAX_ENTRIES, MAX_TABLES};
 use crate::content::{
     self, FileOutcome, FileScan, MemoryBudget, ObjectReader, ScanOptions, Scope, Sniff,
@@ -23,14 +25,10 @@ use crate::content::{
 use crate::error::{ExitCode, LakeScanError};
 use crate::model::RuleId;
 use crate::model::{Finding, NotScannedReason, ObjectMeta, Severity};
-use crate::report::{self, FindingsWriter, Format, PiiSettings, ScanInfo, ScanSettings};
+use crate::report::{self, FindingsWriter, Format, PiiSettings, ScanInfo, ScanSettings, Style};
 use crate::rules::{self, EvalContext};
 use crate::scanner::{PageSource, Scanner};
 use crate::suppress::{Config, Date, Entry, Outcome, Suppressor};
-
-/// Clears the current terminal line: carriage return, then ANSI "erase
-/// entire line".
-const CLEAR_LINE: &str = "\r\x1b[2K";
 
 /// Content scanning for one run: where object contents come from, how
 /// files are read, how many at once, and the memory they share.
@@ -53,8 +51,36 @@ pub(crate) struct Content<R> {
 /// the bucket.
 const LOOKAHEAD: usize = 1024;
 
+/// What a finished run found, for the result block the caller prints on a
+/// terminal once every file is in place. Taken from the same aggregates as
+/// the summary, so its numbers are the summary's.
+pub(crate) struct RunFacts {
+    /// The run's exit code.
+    pub(crate) code: ExitCode,
+    /// `--fail-on`, or `None` for `none`.
+    pub(crate) fail_on: Option<Severity>,
+    /// The worst unsuppressed finding's severity, if any.
+    pub(crate) worst: Option<Severity>,
+    /// The PII inventory's counts; `None` without `--pii`.
+    pub(crate) pii: Option<InventorySummary>,
+    /// Content coverage; `None` without `--pii`.
+    pub(crate) coverage: Option<Coverage>,
+}
+
+impl RunFacts {
+    fn of(code: ExitCode, fail_on: Option<Severity>, aggregates: &Aggregates) -> Self {
+        Self {
+            code,
+            fail_on,
+            worst: aggregates.worst_severity(),
+            pii: aggregates.pii_inventory().map(PiiInventory::summary),
+            coverage: aggregates.coverage(),
+        }
+    }
+}
+
 /// Where one scan's output goes.
-pub(crate) struct Outputs<O, F, P, D, E> {
+pub(crate) struct Outputs<'a, O, F, P, D, E> {
     /// The summary destination, written once after the scan.
     pub(crate) summary: O,
     /// The JSON Lines findings stream, if one was requested.
@@ -68,6 +94,17 @@ pub(crate) struct Outputs<O, F, P, D, E> {
     /// The caller decides (terminal or not, `--quiet` or not); the driver
     /// only writes to it.
     pub(crate) progress: Option<P>,
+    /// Where to leave the run's [`RunFacts`] when it completes, or `None`
+    /// if the caller has no use for them.
+    pub(crate) facts: Option<&'a mut Option<RunFacts>>,
+    /// How the text summary is styled: [`Style::PLAIN`] unless it goes to
+    /// a terminal with colour on.
+    pub(crate) style: Style,
+    /// Whether the text summary leaves out its long-tail sections.
+    pub(crate) compact: bool,
+    /// Whether stderr is a terminal, where the exit 6 explanation names the
+    /// permissions as soon as any file was refused.
+    pub(crate) terminal: bool,
     /// Where to warn about expired and unused suppression entries after
     /// the scan, or `None` (`--quiet`) for no warnings.
     pub(crate) warnings: Option<D>,
@@ -101,8 +138,9 @@ pub(crate) struct Outputs<O, F, P, D, E> {
 /// matrix, not the verdict, not the findings stream.
 ///
 /// The findings stream is finished before the summary is written, and the
-/// progress line is cleared before either, whether the scan succeeded or
-/// not. Suppression warnings follow the summary.
+/// progress line is cleared before either (and before anything else is
+/// printed), whether the scan succeeded or not. Suppression warnings follow
+/// the summary.
 ///
 /// # Errors
 /// Returns whatever the scanner returns for a failed listing, and
@@ -115,7 +153,7 @@ pub(crate) async fn scan<S, R, O, F, P, D, E>(
     format: Format,
     fail_on: Option<Severity>,
     mut content: Option<Content<R>>,
-    outputs: Outputs<O, F, P, D, E>,
+    outputs: Outputs<'_, O, F, P, D, E>,
 ) -> Result<ExitCode, LakeScanError>
 where
     S: PageSource,
@@ -153,11 +191,17 @@ where
         findings,
         inventory,
         html,
-        mut progress,
+        progress,
+        facts,
+        style,
+        compact,
+        terminal,
         warnings,
         mut errors,
     } = outputs;
     let mut findings = findings.map(FindingsWriter::new);
+    let live = Live::default();
+    let mut progress = progress.map(|out| Progress::new(out, content.is_some()));
 
     let listed = walk(
         &mut Scanner::new(source),
@@ -167,17 +211,14 @@ where
             aggregates: &mut aggregates,
             suppressor: &mut suppressor,
             findings: findings.as_mut(),
-            finding_count: 0,
+            live: &live,
         },
         progress.as_mut(),
     )
     .await;
-    if let Some(out) = progress.as_mut() {
-        // Best effort: a progress line that cannot be cleared is cosmetic,
-        // not a reason to fail a scan that otherwise succeeded.
-        let _ = out
-            .write_all(CLEAR_LINE.as_bytes())
-            .and_then(|()| out.flush());
+    // Before anything else is printed, success or not.
+    if let Some(progress) = progress.as_mut() {
+        progress.clear();
     }
     let object_count = listed?;
     let elapsed = clock.elapsed();
@@ -197,7 +238,10 @@ where
     // Decided before any report is written, so the HTML report can state
     // it; a report that then fails to write still ends the run with 5.
     let code = decide(&aggregates, fail_on);
-    report::write_summary(summary, format, &info, &aggregates)?;
+    if let Some(facts) = facts {
+        *facts = Some(RunFacts::of(code, fail_on, &aggregates));
+    }
+    report::write_summary_styled(summary, format, &info, &aggregates, style, compact)?;
     if let Some(out) = inventory {
         report::write_inventory_csv(out, &info, &aggregates)?;
     }
@@ -213,15 +257,7 @@ where
         && inventory.truncated()
     {
         // Always, `--quiet` or not: it changes how every output reads.
-        let _ = writeln!(
-            errors,
-            "lakescan: warning: the PII inventory is truncated: {} files and {} findings were \
-             left out over its caps ({MAX_TABLES} tables, {MAX_ENTRIES} entries), so its tables \
-             and the --inventory CSV are incomplete; scan narrower prefixes",
-            inventory.left_out_files(),
-            inventory.left_out_findings()
-        )
-        .and_then(|()| errors.flush());
+        let _ = write_truncated(&mut errors, inventory);
     }
 
     if object_count == 0 {
@@ -234,7 +270,7 @@ where
         && let Some(content) = aggregates.content()
     {
         // Best effort: the exit code carries the verdict regardless.
-        let _ = write_not_scanned(&mut errors, content);
+        let _ = write_not_scanned(&mut errors, content, terminal);
     }
     Ok(code)
 }
@@ -247,6 +283,19 @@ fn decide(aggregates: &Aggregates, fail_on: Option<Severity>) -> ExitCode {
         Some(coverage) if coverage.not_scanned_unsuppressed > 0 => ExitCode::ContentNotScanned,
         _ => verdict(aggregates.worst_severity(), fail_on),
     }
+}
+
+/// Warns that the PII inventory dropped files and findings over its caps.
+fn write_truncated<E: Write>(out: &mut E, inventory: &PiiInventory) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "lakescan: warning: the PII inventory is truncated: {} files and {} findings were \
+         left out over its caps ({MAX_TABLES} tables, {MAX_ENTRIES} entries), so its tables \
+         and the --inventory CSV are incomplete; scan narrower prefixes",
+        inventory.left_out_files(),
+        inventory.left_out_findings()
+    )?;
+    out.flush()
 }
 
 /// Warns that the listing returned no objects, naming the target.
@@ -263,7 +312,15 @@ fn write_nothing_listed<E: Write>(out: &mut E, info: &ScanInfo) -> std::io::Resu
 /// Explains [`ExitCode::ContentNotScanned`]: the undocumented files by
 /// reason, how to document them, and, when most were refused, the
 /// permissions content scanning needs.
-fn write_not_scanned<E: Write>(out: &mut E, content: &ContentSummary) -> std::io::Result<()> {
+///
+/// The permissions are named when most of the undocumented files were
+/// refused; on a `terminal`, when any was, since there is no up-front hint
+/// there to say it first.
+fn write_not_scanned<E: Write>(
+    out: &mut E,
+    content: &ContentSummary,
+    terminal: bool,
+) -> std::io::Result<()> {
     let coverage = content.coverage();
     let reasons: Vec<String> = NotScannedReason::ALL
         .into_iter()
@@ -291,7 +348,8 @@ fn write_not_scanned<E: Write>(out: &mut E, content: &ContentSummary) -> std::io
         RuleId::ContentNotScanned.code()
     )?;
     let denied = content.not_scanned_unsuppressed(NotScannedReason::AccessDenied);
-    if denied.saturating_mul(2) > coverage.not_scanned_unsuppressed {
+    let mostly = denied.saturating_mul(2) > coverage.not_scanned_unsuppressed;
+    if mostly || (terminal && denied > 0) {
         writeln!(
             out,
             "lakescan: reading Parquet content requires s3:GetObject on the objects, and \
@@ -337,7 +395,9 @@ struct Sinks<'a, F: Write> {
     aggregates: &'a mut Aggregates,
     suppressor: &'a mut Suppressor,
     findings: Option<&'a mut FindingsWriter<F>>,
-    finding_count: u64,
+    /// Counts each finding that gets past the suppressor, for the progress
+    /// line.
+    live: &'a Live,
 }
 
 impl<F: Write> Sinks<'_, F> {
@@ -351,7 +411,7 @@ impl<F: Write> Sinks<'_, F> {
         if let Some(writer) = self.findings.as_deref_mut() {
             writer.write(finding)?;
         }
-        self.finding_count = self.finding_count.saturating_add(1);
+        self.live.findings.fetch_add(1, Ordering::Relaxed);
         Ok(false)
     }
 }
@@ -359,16 +419,16 @@ impl<F: Write> Sinks<'_, F> {
 /// Pulls every page from `scanner`, feeding each object into the
 /// aggregates and each finding it raises (listing rules, then, for an
 /// eligible Parquet object, content scanning) through `sinks`, in listing
-/// order, and rewrites the progress line after every page. Eligible files
-/// are scanned as tasks, at most `concurrency` at once, their buffers held
-/// only under the shared memory budget. Returns how many objects were
-/// listed.
+/// order, and redraws the progress line after every page and on every
+/// timer tick while it waits. Eligible files are scanned as tasks, at most
+/// `concurrency` at once, their buffers held only under the shared memory
+/// budget. Returns how many objects were listed.
 async fn walk<S, R, F, P>(
     scanner: &mut Scanner<S>,
     ctx: &EvalContext,
     content: Option<&mut Content<R>>,
     sinks: &mut Sinks<'_, F>,
-    mut progress: Option<&mut P>,
+    mut progress: Option<&mut Progress<P>>,
 ) -> Result<u64, LakeScanError>
 where
     S: PageSource,
@@ -376,10 +436,15 @@ where
     F: Write,
     P: Write,
 {
+    let live = sinks.live;
     let mut object_count: u64 = 0;
     let mut window = Window::default();
 
-    while let Some(page) = scanner.next_page().await? {
+    while let Some(page) = with_progress(progress.as_deref_mut(), live, scanner.next_page()).await?
+    {
+        let listed = u64::try_from(page.len()).unwrap_or(u64::MAX);
+        object_count = object_count.saturating_add(listed);
+        live.objects.store(object_count, Ordering::Relaxed);
         for object in page {
             let Some(content) = content.as_deref() else {
                 // No content scanning: nothing to wait for, so no window.
@@ -389,9 +454,10 @@ where
             match content::scope_of(object, content.sniff) {
                 scope @ (Scope::Parquet | Scope::Sniff) => {
                     while window.scanning >= content.concurrency {
-                        window.apply_front(ctx, sinks).await?;
+                        let apply = window.apply_front(ctx, sinks);
+                        with_progress(progress.as_deref_mut(), live, apply).await?;
                     }
-                    window.push_scan(object, content, scope == Scope::Sniff);
+                    window.push_scan(object, content, scope == Scope::Sniff, live);
                 }
                 scope => {
                     sinks.aggregates.observe_out_of_scope(&scope);
@@ -399,28 +465,18 @@ where
                 }
             }
             while window.slots.len() > content.concurrency + LOOKAHEAD {
-                window.apply_front(ctx, sinks).await?;
+                let apply = window.apply_front(ctx, sinks);
+                with_progress(progress.as_deref_mut(), live, apply).await?;
             }
         }
-        object_count = object_count.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX));
 
-        if let Some(out) = progress.as_deref_mut() {
-            let files = if content.is_some() {
-                format!(", {} parquet files", window.files_done)
-            } else {
-                String::new()
-            };
-            // Best effort, as above.
-            let _ = write!(
-                out,
-                "{CLEAR_LINE}scanned {object_count} objects{files}, {} findings",
-                sinks.finding_count
-            )
-            .and_then(|()| out.flush());
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.draw(live);
         }
     }
     while !window.slots.is_empty() {
-        window.apply_front(ctx, sinks).await?;
+        let apply = window.apply_front(ctx, sinks);
+        with_progress(progress.as_deref_mut(), live, apply).await?;
     }
 
     Ok(object_count)
@@ -452,8 +508,6 @@ struct Window {
     slots: VecDeque<Slot>,
     /// Scans in the window.
     scanning: usize,
-    /// Scans applied.
-    files_done: u64,
 }
 
 impl Window {
@@ -468,17 +522,24 @@ impl Window {
         object: &ObjectMeta,
         content: &Content<R>,
         sniff: bool,
+        live: &Live,
     ) {
         let reader = content.reader.clone();
         let file = object.clone();
         let options = content.options;
         let budget = content.budget.for_file();
+        let scanned = Arc::clone(&live.files_scanned);
         let task = tokio::spawn(async move {
-            if sniff {
+            let scan = if sniff {
                 content::sniff_and_scan(reader, &file, options, budget).await
             } else {
                 content::scan_file(reader, &file, options, budget).await
-            }
+            };
+            // Counted when the scan finishes, not when its result reaches
+            // the front of the window, so the progress line never trails
+            // behind one slow file.
+            scanned.fetch_add(1, Ordering::Relaxed);
+            scan
         });
         self.scanning += 1;
         self.slots
@@ -520,7 +581,6 @@ impl Window {
                     stats: content::FileStats::default(),
                 });
                 self.scanning -= 1;
-                self.files_done += 1;
                 // Whether the file's content-not-scanned finding, if any,
                 // was suppressed: that decides the exit code.
                 let mut suppressed = false;
@@ -553,7 +613,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    use super::{CLEAR_LINE, Content, Outputs, scan, verdict};
+    use super::{Content, Outputs, scan, verdict};
+    use crate::cli::progress::CLEAR_LINE;
     use crate::cli::target::Target;
     use crate::content::testing::{
         Layout, MemoryReader, Values, aadhaars, emails, mobiles, parquet_file,
@@ -561,7 +622,7 @@ mod tests {
     use crate::content::{MemoryBudget, ScanOptions};
     use crate::error::{ExitCode, LakeScanError};
     use crate::model::{NotScannedReason, ObjectMeta, Severity, StorageClass};
-    use crate::report::Format;
+    use crate::report::{Format, Style};
     use crate::scanner::PageSource;
     use crate::suppress::Config;
 
@@ -671,6 +732,10 @@ mod tests {
                 inventory: None,
                 html: None,
                 progress: None::<Vec<u8>>,
+                facts: None,
+                style: Style::PLAIN,
+                compact: false,
+                terminal: false,
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
             },
@@ -723,6 +788,10 @@ mod tests {
                     inventory: None,
                     html: None,
                     progress: None::<Vec<u8>>,
+                    facts: None,
+                    style: Style::PLAIN,
+                    compact: false,
+                    terminal: false,
                     warnings: None::<Vec<u8>>,
                     errors: Vec::<u8>::new(),
                 },
@@ -750,6 +819,10 @@ mod tests {
                 inventory: None,
                 html: None,
                 progress: Some(&mut progress),
+                facts: None,
+                style: Style::PLAIN,
+                compact: false,
+                terminal: false,
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
             },
@@ -760,8 +833,8 @@ mod tests {
         assert_eq!(
             progress,
             format!(
-                "{CLEAR_LINE}scanned 2 objects, 1 findings\
-                 {CLEAR_LINE}scanned 3 objects, 2 findings\
+                "{CLEAR_LINE}| listed 2 objects, 1 findings, 0s\
+                 {CLEAR_LINE}/ listed 3 objects, 2 findings, 0s\
                  {CLEAR_LINE}"
             )
         );
@@ -792,6 +865,10 @@ mod tests {
                     inventory: None,
                     html: None,
                     progress: None::<Vec<u8>>,
+                    facts: None,
+                    style: Style::PLAIN,
+                    compact: false,
+                    terminal: false,
                     warnings: None::<Vec<u8>>,
                     errors: &mut errors,
                 },
@@ -821,6 +898,10 @@ mod tests {
                 inventory: None,
                 html: None,
                 progress: None::<Vec<u8>>,
+                facts: None,
+                style: Style::PLAIN,
+                compact: false,
+                terminal: false,
                 warnings: None::<Vec<u8>>,
                 errors: &mut errors,
             },
@@ -853,6 +934,10 @@ mod tests {
                 inventory: None,
                 html: None,
                 progress: Some(&mut progress),
+                facts: None,
+                style: Style::PLAIN,
+                compact: false,
+                terminal: false,
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
             },
@@ -862,6 +947,116 @@ mod tests {
         assert!(matches!(result, Err(LakeScanError::Transport(_))));
         assert_eq!(summary, Vec::<u8>::new());
         assert!(progress.ends_with(CLEAR_LINE.as_bytes()));
+    }
+
+    /// A source whose pages each take 350 ms to arrive.
+    struct SlowSource(FakeSource);
+
+    impl PageSource for SlowSource {
+        fn fetch_page(
+            &mut self,
+            continuation: Option<String>,
+            out: &mut Vec<ObjectMeta>,
+        ) -> impl Future<Output = Result<Option<String>, LakeScanError>> + Send {
+            let inner = self.0.fetch_page(continuation, out);
+            async move {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                inner.await
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_line_is_redrawn_on_the_timer_while_a_page_is_awaited()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut progress = Vec::new();
+        scan(
+            SlowSource(two_pages()),
+            target(),
+            Config::default(),
+            Format::Text,
+            None,
+            None::<Content<MemoryReader>>,
+            Outputs {
+                summary: Vec::new(),
+                findings: None::<Vec<u8>>,
+                inventory: None,
+                html: None,
+                progress: Some(&mut progress),
+                facts: None,
+                style: Style::PLAIN,
+                compact: false,
+                terminal: false,
+                warnings: None::<Vec<u8>>,
+                errors: Vec::<u8>::new(),
+            },
+        )
+        .await?;
+
+        let progress = String::from_utf8(progress)?;
+        // Two pages of 350 ms at a 100 ms tick: several redraws that show
+        // no new objects, not just one per page.
+        let redraws = progress.matches("listed 0 objects").count();
+        assert!(redraws >= 3, "{progress:?}");
+        assert!(progress.ends_with(CLEAR_LINE), "{progress:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_pii_the_line_counts_files_and_never_findings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut progress = Vec::new();
+        let budget = Arc::new(
+            MemoryBudget::new(
+                crate::content::DEFAULT_MEMORY_BUDGET,
+                2,
+                crate::content::file_need(8 * 1024 * 1024),
+            )
+            .map_err(|_| "budget too small")?,
+        );
+        scan(
+            source(vec![Step::Page(
+                vec![
+                    object("a.parquet", 10, StorageClass::Standard),
+                    object("b.parquet", 10, StorageClass::Standard),
+                ],
+                None,
+            )]),
+            target(),
+            Config::default(),
+            Format::Text,
+            None,
+            Some(Content {
+                reader: MemoryReader::new(crate::content::Latency::NONE),
+                options: ScanOptions {
+                    whole_file_max: 8 * 1024 * 1024,
+                    coalesce_gap: crate::content::DEFAULT_COALESCE_GAP,
+                },
+                concurrency: 2,
+                budget,
+                sniff: crate::content::Sniff::Unknown,
+            }),
+            Outputs {
+                summary: Vec::new(),
+                findings: None::<Vec<u8>>,
+                inventory: None,
+                html: None,
+                progress: Some(&mut progress),
+                facts: None,
+                style: Style::PLAIN,
+                compact: false,
+                terminal: false,
+                warnings: None::<Vec<u8>>,
+                errors: Vec::<u8>::new(),
+            },
+        )
+        .await?;
+
+        let progress = String::from_utf8(progress)?;
+        assert!(progress.contains("listed 2 objects"), "{progress:?}");
+        assert!(progress.contains("files checked"), "{progress:?}");
+        assert!(!progress.contains("findings"), "{progress:?}");
+        Ok(())
     }
 
     /// What one content scan wrote: exit code, summary, findings stream,
@@ -979,6 +1174,10 @@ mod tests {
                 inventory: Some(&mut inventory),
                 html: Some(&mut html),
                 progress: None::<Vec<u8>>,
+                facts: None,
+                style: Style::PLAIN,
+                compact: false,
+                terminal: false,
                 warnings: Some(&mut warnings),
                 errors: &mut errors,
             },
@@ -1413,6 +1612,10 @@ mod tests {
                 inventory: None,
                 html: None,
                 progress: None::<Vec<u8>>,
+                facts: None,
+                style: Style::PLAIN,
+                compact: false,
+                terminal: false,
                 warnings: None::<Vec<u8>>,
                 errors: Vec::<u8>::new(),
             },
@@ -1473,12 +1676,51 @@ mod tests {
         summary.observe_content(&file, &scan(NotScannedReason::Encrypted), true);
         let mut out = Vec::new();
         if let Some(content) = summary.content() {
-            super::write_not_scanned(&mut out, content)?;
+            super::write_not_scanned(&mut out, content, false)?;
         }
         let out = String::from_utf8_lossy(&out);
         assert!(out.contains("not-parquet=1, access-denied=2"), "{out}");
         assert!(out.contains("s3:GetObject"), "{out}");
         assert!(out.contains("kms:Decrypt"), "{out}");
+        Ok(())
+    }
+
+    /// The exit 6 explanation for one refused file among three undocumented
+    /// unscanned ones: a minority.
+    fn minority_refused_explanation(terminal: bool) -> std::io::Result<String> {
+        let mut summary = crate::aggregate::Aggregates::new(SystemTime::UNIX_EPOCH);
+        let scan = |reason| crate::content::FileScan {
+            outcome: crate::content::FileOutcome::NotScanned(reason),
+            columns: Vec::new(),
+            not_examined: Vec::new(),
+            stats: crate::content::FileStats::default(),
+        };
+        let file = object("t/a.parquet", 10, StorageClass::Standard);
+        summary.observe_content(&file, &scan(NotScannedReason::AccessDenied), false);
+        summary.observe_content(&file, &scan(NotScannedReason::NotParquet), false);
+        summary.observe_content(&file, &scan(NotScannedReason::Unreadable), false);
+        let mut out = Vec::new();
+        if let Some(content) = summary.content() {
+            super::write_not_scanned(&mut out, content, terminal)?;
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    #[test]
+    fn on_a_terminal_any_refused_file_names_the_permissions() -> std::io::Result<()> {
+        let out = minority_refused_explanation(true)?;
+        assert!(out.contains("access-denied=1"), "{out}");
+        assert!(out.contains("s3:GetObject"), "{out}");
+        assert!(out.contains("kms:Decrypt"), "{out}");
+        Ok(())
+    }
+
+    #[test]
+    fn off_a_terminal_a_minority_of_refused_files_does_not_name_them() -> std::io::Result<()> {
+        // Unchanged from before: two lines, no permissions.
+        let out = minority_refused_explanation(false)?;
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(!out.contains("s3:GetObject"), "{out}");
         Ok(())
     }
 
@@ -1872,6 +2114,10 @@ reason = "Never matches anything in this scan"
                 inventory: None,
                 html: None,
                 progress: None::<Vec<u8>>,
+                facts: None,
+                style: Style::PLAIN,
+                compact: false,
+                terminal: false,
                 warnings: Some(&mut warnings),
                 errors: Vec::<u8>::new(),
             },

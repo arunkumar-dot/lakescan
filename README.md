@@ -304,7 +304,9 @@ container or instance credentials.
 | `--region <REGION>` | from config | Overrides the configured AWS region. |
 | `--endpoint-url <URL>` | AWS | An S3-compatible endpoint (`http://` or `https://`). Implies path-style addressing. |
 | `--config <PATH>` | none | A suppression file (see [Suppressions](#suppressions)). Only used when given; never discovered automatically. |
-| `--quiet` | off | No progress line and no suppression warnings on stderr. |
+| `--quiet` | off | No progress line, no result block and no suppression warnings on stderr. |
+| `--full` | off | Show every section of the text summary on a terminal. There, when the summary goes to stdout, it is compact by default: the SAMPLES, LARGEST OBJECTS, SIZE HISTOGRAM, AGE HISTOGRAM and DISTINCT CONTENT sections are left out and the last line says so. Findings, coverage, the PII inventory and the files not scanned are never left out. Redirected or piped stdout, and `--output`, always get the full summary, so `--full` changes nothing there. |
+| `--color auto\|always\|never` | `auto` | When to colour `lakescan`'s own output: the text summary on stdout and the result block on stderr. `auto` colours a terminal, unless `NO_COLOR` is set (to a non-empty value) or `TERM` is `dumb`. `always` overrides `NO_COLOR`. Colour is sparse: headings and `UNDOCUMENTED` are bold, `documented` is green, and red appears once in the summary (the worst severity in VERDICT, when it is high or critical) and once in the result block (the exit 6 verdict). Colour is never written into a file (`--output`, `--findings`, `--inventory`, `--html`) and never applied to anything derived from a bucket (keys, table and column names, reasons). `--help` is coloured by its own rules (a terminal, no `NO_COLOR`) and ignores this flag. |
 | `--pii` | off | Also scan Parquet for structured personal data, including extensionless Parquet found by sniffing. Sampled inspection, list and map columns included; free text and other formats are skipped. See [PII content scanning](#pii-content-scanning). Without it, no object is read. |
 | `--pii-sniff unknown\|none` | `unknown` | With `--pii`: which objects without a `.parquet` or `.parq` extension to sniff. `unknown` (default) sniffs a key with no extension, or an extension not on the known non-Parquet list, with one ranged GET of the last 8 bytes, and checks the `PAR1` magic. `none` sniffs nothing. Folder markers and zero-byte objects are never candidates. Each sniff is one small GET, counted in the GET totals. Requires `--pii`. |
 | `--pii-whole-file-max <BYTES>` | `8388608` (8 MiB) | With `--pii`: Parquet files of at most `BYTES` are downloaded whole, in one request, and still sampled. Larger ones are read partially. `0` to `67108864` (64 MiB). Requires `--pii`. |
@@ -314,8 +316,29 @@ container or instance credentials.
 | `--html <PATH>` | off | Also write an interactive [HTML dashboard](#html-report) to `PATH`. `-` means stdout, which then requires every other output to go to a file. Works with or without `--pii`. Open the file in any browser; it works offline and makes no network requests. |
 | `--inventory <PATH>` | off | With `--pii`: also write the [PII inventory](#pii-inventory-and-coverage) as CSV to `PATH`, one row per table, column and rule. `-` means stdout, which then requires `--output` to name a file, and `--findings` not to be `-`. Requires `--pii`. |
 
-A progress line (`scanned N objects, M findings`) is shown on stderr only when
-stderr is a terminal. Errors print one line to stderr, `lakescan: <error>`.
+When stderr is a terminal (and `--quiet` is not given), `lakescan scan` shows
+one line that updates in place while it runs, for example
+`| listed 2413 objects, 11 files checked, 7s`: a spinner, the objects
+listed so far, the files whose check has finished (with `--pii`) or the
+findings so far (without it), and the elapsed time. "Checked" means the
+check ended, whatever its outcome: a file that could not be scanned, or an
+object that was sniffed and is not Parquet, counts too. The summary and the
+result block say "scanned" only for files that were actually scanned. There is no percentage and
+no ETA, because the listing streams and the total is not known. With `--pii` it
+shows no findings count: content findings are only known once files are
+applied in listing order, and a count that lagged the real one would mislead.
+The line is erased when the scan ends. On a terminal that cannot redraw a line
+(`TERM=dumb`) there is no live line. When the run completes, a short result
+block follows the summary on stderr: the exit code and what it means, the
+number of undocumented PII columns, how many Parquet files were scanned (and
+that inspection is sampled), and next steps. It is only ever printed to a
+terminal; when stderr is redirected or piped nothing of this is written, so
+scripts see exactly the lines described below. For the same reason, the
+`--pii` permissions hint (`lakescan: --pii requires s3:GetObject …`) is only
+printed when stderr is not a terminal; the exit 6 explanation names the
+permissions whenever any undocumented file was refused (off a terminal, only
+when most were). Errors print one line to
+stderr, `lakescan: <error>`.
 A listing that returns no objects still exits 0, but prints `lakescan: no
 objects found under s3://<bucket>/<prefix>; check that the prefix is correct`
 to stderr, `--quiet` or not, so a mistyped prefix does not pass silently. When
