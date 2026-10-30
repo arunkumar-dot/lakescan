@@ -16,8 +16,11 @@ categories = ["command-line-utilities", "development-tools"]
 thiserror = "2"
 # sync (the memory budget's semaphore) and time (the simulated store's
 # latency) were already enabled through the AWS SDK; declared so the code
-# that uses them doesn't depend on that.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# that uses them doesn't depend on that. signal (SIGINT and SIGTERM
+# handling, so an interrupted run can remove its temporary files) adds no
+# crate to Cargo.lock: signal-hook-registry, libc and mio are already in the
+# build through the features the AWS SDK enables.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 # Already in the build through aws-config; declared directly for the

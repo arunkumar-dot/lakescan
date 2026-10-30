@@ -51,6 +51,16 @@ byte for byte what they were.
   names `s3:GetObject` (and `kms:Decrypt` for SSE-KMS objects) whenever any
   undocumented unscanned file was access-denied, not only when most were;
   off a terminal it is unchanged.
+- Ctrl-C (SIGINT) and SIGTERM now end a `lakescan scan` cleanly: the progress
+  line is erased, every temporary output file (`.lakescan-tmp`) is removed,
+  an earlier output file is left untouched, nothing is printed, and the exit
+  status is 130 (SIGINT) or 143 (SIGTERM). No summary and no result block.
+  Before, an interrupt left the last progress line on screen and the
+  temporary files on disk. This uses tokio's `signal` feature, which adds no
+  crate to `Cargo.lock`.
+- On a terminal, the line `Checking credentials and bucket access` is shown
+  from the start until the first listing frame (and is erased before any
+  error), instead of a blank screen.
 - The result block now reads "31 PII columns are undocumented (25
   confirmed, 6 likely, 0 possible)."
 

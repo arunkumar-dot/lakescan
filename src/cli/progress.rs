@@ -1,5 +1,10 @@
 //! The live progress line: one line on stderr, redrawn in place.
 //!
+//! Everything that draws a line goes through [`Line`], which owns "is my
+//! line on the screen" and a process-wide lock on the screen. An interrupt
+//! takes that lock for good (see [`take_screen`]), so nothing draws over
+//! its clean-up.
+//!
 //! Only numbers that are live and true are shown: objects listed, files
 //! whose check has finished (with `--pii`; whatever the outcome, so a file
 //! that could not be scanned, or a sniffed object that is not Parquet,
@@ -11,8 +16,8 @@
 
 use std::future::Future;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use tokio::time::{Interval, MissedTickBehavior};
@@ -27,19 +32,102 @@ const TICK: Duration = Duration::from_millis(100);
 /// The spinner's frames; plain ASCII, so any terminal draws them.
 const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
 
-/// Whether a progress line is currently on the screen, for the panic hook
-/// to clear before it prints. Each [`Progress`] also tracks its own line.
+/// What `lakescan scan` shows before the first listing frame, while
+/// credentials and bucket access are checked. Constant on purpose: it never
+/// names the bucket or anything else derived from one.
+pub(crate) const CHECKING: &str = "Checking credentials and bucket access";
+
+/// Whether any line is currently on the screen, for the panic hook to clear
+/// before it prints. Each [`Line`] also tracks its own.
 static LINE_SHOWN: AtomicBool = AtomicBool::new(false);
 
-/// Clears the progress line if one is on the screen. For the panic hook,
-/// which must not print over it.
+/// The screen lock. `true` once an interrupt has taken the screen: after
+/// that no line is drawn.
+static SCREEN: Mutex<bool> = Mutex::new(false);
+
+fn lock_screen() -> MutexGuard<'static, bool> {
+    SCREEN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write_clear() {
+    let mut stderr = std::io::stderr();
+    // Best effort: nothing is left to report to.
+    let _ = stderr
+        .write_all(CLEAR_LINE.as_bytes())
+        .and_then(|()| stderr.flush());
+}
+
+/// Clears the line if one is on the screen. For the panic hook, which must
+/// not print over it; it never waits for the screen lock, since the panic
+/// may have happened while this thread held it.
 pub(crate) fn clear_if_shown() {
+    let free = match SCREEN.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    };
+    if free.is_none_or(|guard| !*guard) && LINE_SHOWN.swap(false, Ordering::SeqCst) {
+        write_clear();
+    }
+}
+
+/// Takes the screen for an interrupt: clears whatever line is showing and
+/// stops every [`Line`] from drawing again. The guard is held until the
+/// process exits.
+pub(crate) fn take_screen() -> MutexGuard<'static, bool> {
+    let mut guard = lock_screen();
+    *guard = true;
     if LINE_SHOWN.swap(false, Ordering::SeqCst) {
-        let mut stderr = std::io::stderr();
-        // Best effort: nothing is left to report to.
-        let _ = stderr
+        write_clear();
+    }
+    guard
+}
+
+/// One line on a terminal: drawn in place, erased when done or dropped, so
+/// every exit path leaves the terminal clean.
+pub(crate) struct Line<P: Write> {
+    out: P,
+    shown: bool,
+}
+
+impl<P: Write> Line<P> {
+    pub(crate) fn new(out: P) -> Self {
+        Self { out, shown: false }
+    }
+
+    /// Replaces the line with `text`.
+    pub(crate) fn draw(&mut self, text: &str) {
+        let taken = lock_screen();
+        if *taken {
+            return;
+        }
+        self.shown = true;
+        LINE_SHOWN.store(true, Ordering::SeqCst);
+        // Best effort: a line that cannot be drawn is cosmetic.
+        let _ = write!(self.out, "{CLEAR_LINE}{text}").and_then(|()| self.out.flush());
+    }
+
+    /// Erases the line, if it is on the screen. Safe to call twice.
+    pub(crate) fn clear(&mut self) {
+        if !self.shown {
+            return;
+        }
+        self.shown = false;
+        let taken = lock_screen();
+        if *taken {
+            return;
+        }
+        LINE_SHOWN.store(false, Ordering::SeqCst);
+        let _ = self
+            .out
             .write_all(CLEAR_LINE.as_bytes())
-            .and_then(|()| stderr.flush());
+            .and_then(|()| self.out.flush());
+    }
+}
+
+impl<P: Write> Drop for Line<P> {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -57,14 +145,12 @@ pub(crate) struct Live {
 
 /// The progress line's writer, its redraw timer and its spinner.
 pub(crate) struct Progress<P: Write> {
-    out: P,
+    line: Line<P>,
     /// Whether `--pii` is on: files instead of findings are shown.
     pii: bool,
     started: Instant,
     frame: usize,
     timer: Interval,
-    /// Whether this line is on the screen now.
-    shown: bool,
 }
 
 impl<P: Write> Progress<P> {
@@ -74,16 +160,15 @@ impl<P: Write> Progress<P> {
         // A slow write must not be followed by a burst of redraws.
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
-            out,
+            line: Line::new(out),
             pii,
             started: Instant::now(),
             frame: 0,
             timer,
-            shown: false,
         }
     }
 
-    /// Redraws the line from `live`.
+    /// Redraws the line from `counters`.
     pub(crate) fn draw(&mut self, counters: &Live) {
         let text = render(
             self.frame,
@@ -96,30 +181,12 @@ impl<P: Write> Progress<P> {
             },
         );
         self.frame = self.frame.wrapping_add(1);
-        self.shown = true;
-        LINE_SHOWN.store(true, Ordering::SeqCst);
-        // Best effort: a progress line that cannot be drawn is cosmetic.
-        let _ = write!(self.out, "{CLEAR_LINE}{text}").and_then(|()| self.out.flush());
+        self.line.draw(&text);
     }
 
     /// Erases the line, if it is on the screen. Safe to call twice.
     pub(crate) fn clear(&mut self) {
-        if self.shown {
-            self.shown = false;
-            LINE_SHOWN.store(false, Ordering::SeqCst);
-            let _ = self
-                .out
-                .write_all(CLEAR_LINE.as_bytes())
-                .and_then(|()| self.out.flush());
-        }
-    }
-}
-
-impl<P: Write> Drop for Progress<P> {
-    /// A scan that ends early (an error, a dropped future) still leaves the
-    /// terminal clean.
-    fn drop(&mut self) {
-        self.clear();
+        self.line.clear();
     }
 }
 
@@ -188,7 +255,7 @@ fn elapsed_text(elapsed: Duration) -> String {
 mod tests {
     use std::time::Duration;
 
-    use super::{Counted, elapsed_text, render};
+    use super::{CHECKING, CLEAR_LINE, Counted, Line, elapsed_text, render};
 
     #[test]
     fn elapsed_time_is_whole_units() {
@@ -216,5 +283,51 @@ mod tests {
     fn the_line_has_no_percentage_and_no_estimate() {
         let line = render(2, Duration::from_secs(70), 10, Counted::Findings(0));
         assert!(!line.contains('%') && !line.contains("ETA"), "{line}");
+    }
+
+    #[test]
+    fn the_checking_frame_names_nothing_from_a_bucket() {
+        assert_eq!(CHECKING, "Checking credentials and bucket access");
+        let mut out = Vec::new();
+        {
+            let mut line = Line::new(&mut out);
+            line.draw(CHECKING);
+        }
+        // Drawn, then erased when the line is dropped.
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            format!("{CLEAR_LINE}{CHECKING}{CLEAR_LINE}")
+        );
+    }
+
+    /// A stand-in for a preflight that fails: the early return must still
+    /// leave the terminal clean.
+    fn fails_while_checking(out: &mut Vec<u8>) -> Result<(), &'static str> {
+        let mut line = Line::new(out);
+        line.draw(CHECKING);
+        Err("auth")?;
+        line.clear();
+        Ok(())
+    }
+
+    #[test]
+    fn an_error_while_checking_clears_the_line_before_it_is_reported() {
+        let mut out = Vec::new();
+        assert_eq!(fails_while_checking(&mut out), Err("auth"));
+        assert!(
+            String::from_utf8_lossy(&out).ends_with(CLEAR_LINE),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn clearing_twice_erases_once() {
+        let mut out = Vec::new();
+        let mut line = Line::new(&mut out);
+        line.draw("x");
+        line.clear();
+        line.clear();
+        drop(line);
+        assert_eq!(String::from_utf8_lossy(&out).matches(CLEAR_LINE).count(), 2);
     }
 }
