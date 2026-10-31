@@ -12,12 +12,14 @@
 //! [`run`] is the whole program; `main.rs` only collects the arguments and
 //! hands back what this returns. Every exit goes through [`ExitCode`]:
 //! clap's parse errors become [`LakeScanError::Usage`], `--help` and
-//! `--version` succeed, and nothing calls `std::process::exit`. A failed run
+//! `--version` succeed, and nothing calls `std::process::exit` except the
+//! interrupt handler (see `interrupt`), which leaves with 130 or 143. A failed run
 //! prints exactly one line to stderr, `lakescan: <error>`, using only the
 //! error's `Display`: every [`LakeScanError`] variant already includes its
 //! cause, so walking the source chain as well would print it twice.
 
 mod driver;
+mod interrupt;
 mod progress;
 mod target;
 mod term;
@@ -376,6 +378,7 @@ fn clap_outcome<W: Write>(
 }
 
 async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
+    interrupt::install();
     let human = Human::of(&args);
     let target: Target = args.target.parse()?;
     let config = args
@@ -398,6 +401,7 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         let _ = writeln!(io::stderr(), "{warning}");
     }
 
+    let checking = human.checking_line();
     let source = S3Source::new(
         target.bucket.clone(),
         target.prefix.clone(),
@@ -414,6 +418,7 @@ async fn scan(args: ScanArgs) -> Result<ExitCode, LakeScanError> {
         .is_some()
         .then_some(&mut stderr_log as &mut dyn Write);
     preflight::check(&probe, &target.bucket, debug).await?;
+    drop(checking);
     // A person at a terminal sees the permissions named if files are
     // refused (see `driver::write_not_scanned`); the hint is for logs.
     if args.pii && !args.quiet && !io::stderr().is_terminal() {
@@ -525,6 +530,18 @@ struct Human {
 }
 
 impl Human {
+    /// The "checking credentials" line, drawn now, for the first seconds of
+    /// a run. Dropping it erases it, so every way out of the preflight
+    /// leaves the terminal clean before an error is reported. Not with
+    /// `LAKESCAN_DEBUG`, whose lines would land on it.
+    fn checking_line(&self) -> Option<progress::Line<io::Stderr>> {
+        (self.screen == Screen::Live && std::env::var_os("LAKESCAN_DEBUG").is_none()).then(|| {
+            let mut line = progress::Line::new(io::stderr());
+            line.draw(progress::CHECKING);
+            line
+        })
+    }
+
     /// Prints the result block on stderr, if this is a terminal run.
     fn print_result(&self, facts: &RunFacts) {
         if self.screen == Screen::Off {
@@ -847,6 +864,7 @@ impl AtomicFile {
             ));
             match OpenOptions::new().write(true).create_new(true).open(&temp) {
                 Ok(file) => {
+                    interrupt::register(&temp);
                     return Ok(Self {
                         file: Some(file),
                         temp,
@@ -871,7 +889,8 @@ impl AtomicFile {
         if let Some(file) = self.file.take() {
             file.sync_all().map_err(|err| report(err, &self.path))?;
         }
-        std::fs::rename(&self.temp, &self.path).map_err(|err| report(err, &self.path))?;
+        interrupt::rename_into_place(&self.temp, &self.path)
+            .map_err(|err| report(err, &self.path))?;
         // In place: nothing for `Drop` to remove.
         self.temp = PathBuf::new();
         Ok(())
@@ -898,8 +917,7 @@ impl Drop for AtomicFile {
     fn drop(&mut self) {
         drop(self.file.take());
         if !self.temp.as_os_str().is_empty() {
-            // Best effort: nothing left to report to.
-            let _ = std::fs::remove_file(&self.temp);
+            interrupt::discard(&self.temp);
         }
     }
 }

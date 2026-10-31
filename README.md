@@ -328,7 +328,9 @@ no ETA, because the listing streams and the total is not known. With `--pii` it
 shows no findings count: content findings are only known once files are
 applied in listing order, and a count that lagged the real one would mislead.
 The line is erased when the scan ends. On a terminal that cannot redraw a line
-(`TERM=dumb`) there is no live line. When the run completes, a short result
+(`TERM=dumb`) there is no live line. Before the first listing frame, while
+credentials and bucket access are checked, the line reads `Checking
+credentials and bucket access`; it never names the bucket. When the run completes, a short result
 block follows the summary on stderr: the exit code and what it means, the
 number of undocumented PII columns, how many Parquet files were scanned (and
 that inspection is sampled), and next steps. It is only ever printed to a
@@ -349,8 +351,11 @@ redirect response.
 
 Every file output (`--output`, `--findings`, `--inventory`, `--html`) is
 written to a temporary file in the same directory and renamed into place
-only when the run finishes. A failed run removes the temporary file and
-leaves any previous file untouched. Stdout is written directly, with no
+only when the run finishes. A failed or interrupted run removes the
+temporary files (named `.<name>.<pid>.<n>.lakescan-tmp`) and leaves any
+previous file untouched. The renames happen one after another at the very
+end, so an interrupt in that last instant can leave the files already
+renamed in place, complete, and the rest absent. Stdout is written directly, with no
 temporary file. `-` means stdout.
 
 | Flag | Writes | Stdout |
@@ -406,6 +411,11 @@ esac
 ```
 
 A closed pipe (`lakescan ... | head`) is not an error.
+
+Ctrl-C and `kill` are outside this contract too. SIGINT (Ctrl-C) exits 130
+and SIGTERM exits 143, the usual shell convention. The run prints nothing,
+erases its progress line, removes its temporary output files, and writes no
+summary and no result block. A file already renamed into place stays.
 
 Exit status 101 is outside this contract. It means an internal error: a bug
 in LakeScan itself, which panicked. stderr then names the source location

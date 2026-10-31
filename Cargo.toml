@@ -16,13 +16,20 @@ categories = ["command-line-utilities", "development-tools"]
 thiserror = "2"
 # sync (the memory budget's semaphore) and time (the simulated store's
 # latency) were already enabled through the AWS SDK; declared so the code
-# that uses them doesn't depend on that.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# that uses them doesn't depend on that. signal (SIGINT and SIGTERM
+# handling, so an interrupted run can remove its temporary files) adds no
+# crate to Cargo.lock: signal-hook-registry, libc and mio are already in the
+# build through the features the AWS SDK enables.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
+# default-features = false on the two SDK clients drops only their default
+# `rustls` feature, which switches on the legacy TLS connector (hyper 0.14,
+# rustls 0.21, rustls-webpki 0.101.7). Every other default feature is listed.
+# The HTTP client is the `default-https-client` one (rustls 0.23).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 # Already in the build through aws-config; declared directly for the
 # preflight credential check (sts:GetCallerIdentity).
-aws-sdk-sts = "1"
+aws-sdk-sts = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4.6.7", features = ["derive"] }

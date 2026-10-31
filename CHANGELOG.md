@@ -6,6 +6,21 @@ exit codes, the rule codes and the JSON summary's `schema_version`.
 
 ## [Unreleased]
 
+### Dependencies
+
+- The legacy TLS stack is gone from the build: `rustls 0.21`,
+  `rustls-webpki 0.101.7`, `hyper-rustls 0.24`, `tokio-rustls 0.24`,
+  `hyper 0.14` and five small crates (11 packages in all). It came in through
+  the default `rustls` feature of `aws-sdk-s3` and `aws-sdk-sts`, which
+  enables the SDK's old connector; LakeScan always used the SDK's default
+  HTTPS client (`rustls 0.23` with `aws-lc-rs`), so the old code was linked
+  but not used. Removing it clears three Dependabot alerts on
+  `rustls-webpki` 0.101.7 (GHSA-82j2-j2ch-gfr8, GHSA-xgp8-3hg3-c2mh,
+  GHSA-965h-392x-2mh5), for which no fix exists in that version line, and
+  shrinks the release binary by about 1.3 MB. The change is dependency
+  features only (`default-features = false` with the other defaults listed,
+  in `Cargo.toml`): no version changes, no packages added, no code changes.
+
 ### Terminal experience
 
 Everything below is for a person at a terminal. Output when not writing to a
@@ -51,6 +66,16 @@ byte for byte what they were.
   names `s3:GetObject` (and `kms:Decrypt` for SSE-KMS objects) whenever any
   undocumented unscanned file was access-denied, not only when most were;
   off a terminal it is unchanged.
+- Ctrl-C (SIGINT) and SIGTERM now end a `lakescan scan` cleanly: the progress
+  line is erased, every temporary output file (`.lakescan-tmp`) is removed,
+  an earlier output file is left untouched, nothing is printed, and the exit
+  status is 130 (SIGINT) or 143 (SIGTERM). No summary and no result block.
+  Before, an interrupt left the last progress line on screen and the
+  temporary files on disk. This uses tokio's `signal` feature, which adds no
+  crate to `Cargo.lock`.
+- On a terminal, the line `Checking credentials and bucket access` is shown
+  from the start until the first listing frame (and is erased before any
+  error), instead of a blank screen.
 - The result block now reads "31 PII columns are undocumented (25
   confirmed, 6 likely, 0 possible)."
 
