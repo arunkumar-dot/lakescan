@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "lakescan"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",

@@ -980,7 +980,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         for (args, expected) in [
             (["lakescan", "--help"].as_slice(), "Usage: lakescan"),
-            (&["lakescan", "--version"], "lakescan 0.1.2"),
+            (&["lakescan", "--version"], "lakescan 0.1.3"),
             (&["lakescan", "scan", "--help"], "--config <PATH>"),
         ] {
             let mut out = Vec::new();
