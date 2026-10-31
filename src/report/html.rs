@@ -459,7 +459,7 @@ mod tests {
     use crate::report::write_html;
 
     const FIXTURE_DATA: &str = r#"{
-                "tool": { "name": "lakescan", "version": "0.1.2" },
+                "tool": { "name": "lakescan", "version": "0.1.3" },
                 "scan": {
                     "bucket": "example-bucket",
                     "prefix": "logs/",
